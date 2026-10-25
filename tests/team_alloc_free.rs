@@ -70,4 +70,45 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
     })
     .unwrap();
     assert!(sink.load(Ordering::Relaxed) > 0);
+
+    // Team-minted tokens: fork / for_ranges / broadcast / team, warm and
+    // right after members parked (unpark must not allocate either).
+    let pool = Pool::builder()
+        .threads(4)
+        .idle_spin(Duration::from_millis(1))
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let team = pool.reserve(4).unwrap();
+    let mut exec = team.exec(4);
+    let grain = std::num::NonZeroUsize::MIN;
+    let mut phases = |exec: &mut Exec<'_>| {
+        exec.reborrow().fork(7, |i, child| {
+            sink.fetch_add(i, Ordering::Relaxed);
+            child.fork(2, |_, _| {});
+        });
+        exec.reborrow().for_ranges(100, grain, |r| {
+            sink.fetch_add(r.len(), Ordering::Relaxed);
+        });
+        exec.reborrow()
+            .broadcast(|i| {
+                sink.fetch_add(i, Ordering::Relaxed);
+            })
+            .unwrap();
+        exec.reborrow().team(|t| t.run(|_, _| {})).unwrap();
+    };
+    for _ in 0..50 {
+        phases(&mut exec);
+    }
+    for round in 0..20 {
+        assert_eq!(allocs_in(|| phases(&mut exec)), 0, "warm round {round}");
+    }
+    for round in 0..5 {
+        std::thread::sleep(Duration::from_millis(30)); // members park
+        assert_eq!(
+            allocs_in(|| phases(&mut exec)),
+            0,
+            "after park, round {round}"
+        );
+    }
 }

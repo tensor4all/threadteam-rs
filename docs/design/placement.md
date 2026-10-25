@@ -251,7 +251,11 @@ callback and hands the callback exclusive authority, `TeamExec<'team>`, over
 the team: the calling thread (participant 0, the leader) plus `budget - 1`
 members. It exists for barrier-bearing kernels that need all participants on
 distinct threads, and for nested teams, without a per-section Rayon dispatch.
-`fork`, `for_ranges`, `broadcast` and `external` are unchanged and independent.
+A token without team authority behaves exactly as described in the rest of this
+document. Two ways to hold a team exist and share one implementation of sections
+and dispatch: a scoped acquisition per call (`Exec::team`, for pools that are not
+owned by one engine) and a persistent reservation owned by the engine (`Team`,
+below), whose tokens carry the authority into the ordinary `Exec` methods.
 
 ```rust
 impl Exec<'_> {
@@ -321,8 +325,9 @@ closure, the participant count, a padded completion counter, a sense-reversing
 barrier, a cancellation flag and an atomic cell for the first panic payload.
 The leader stores the section address and the participant index into each
 member slot and bumps its `gen` counter with release ordering; members spin on
-`gen` and `state` (pure spin for a while, then `yield_now` between polls),
-run their share and decrement the completion counter. The leader runs
+`gen` and `state` (pure spin, then `yield_now` between polls) and run their
+share and decrement the completion counter. After the reservation's park delay
+(the effective `idle_spin`) without work, a member parks (see below). The leader runs
 share 0, then waits for the counter. Nothing is allocated and nobody is woken
 (`tests/team_alloc_free.rs`; acquisition allocates a small `Vec` and, for
 members not already awake, the claim jobs).
@@ -335,6 +340,71 @@ slots for the child leader's sections; no slot is shared between children.
 When the dispatch returns, all children finished and the members are the
 parent's again. Members the sizes leave over stay parked.
 
+### Persistent reservation: `Team` and team tokens
+
+```rust
+impl Pool {
+    pub fn reserve(&self, width: usize) -> Result<Team<'_>, Refused>;
+    pub fn reserve_with(&self, width: usize, over: WaitOverride) -> Result<Team<'_>, Refused>;
+}
+impl<'p> Team<'p> {                       // Drop returns the members to Rayon
+    pub fn size(&self) -> NonZeroUsize;
+    pub fn exec(&self, budget: usize) -> Exec<'_>;                     // blocks; panics on re-entry
+    pub fn try_exec(&self, budget: usize) -> Result<Exec<'_>, Refused>; // Err(Refused::Busy)
+}
+```
+
+An owner that has its pool to itself (tenferro's engine) reserves `width - 1`
+members once, with the same acquisition and acknowledgement rendezvous as
+`Exec::team`, and keeps the `Team` for its lifetime. `Team` borrows the `Pool`
+(the pool joins its threads after the team was dropped). `exec(budget)` mints a
+root token, `budget` clamped to `1..=size`, that carries `TeamAuth`: the token's
+members, a slice of the team's with `ids.len() + 1 == budget`. The slice stays
+consistent through `limit` (narrowed), `reborrow` (copied) and `fork` (the sub-slice
+of the child's share).
+
+On a token with team authority the `Exec` methods dispatch through the same
+`section` function as `TeamExec`:
+
+| Method | Behaviour |
+| --- | --- |
+| `fork(jobs, f)` | `tasks = min(jobs, budget)`; task `k` runs on the first member of its index range of the same even plan as `split`, with the share of `split::share`; the child token carries that range's sub-team; more jobs than tasks pull from the shared counter as before |
+| `for_ranges` | the leader and the first `tasks - 1` members run the chunks; no Rayon entry |
+| `broadcast` | every participant of the budget at once on the reserved members; never refused (a `fork` child owns its members too), `can_broadcast` is true |
+| `team(f)` / `team_with` | hands out the carried (sub)team at once, no acquisition |
+| `external(f)` | unchanged: enters the pool and hands the width. Members spin or park, so the library runs on the pool's other workers only |
+| `limit`, `reborrow`, `budget`, `is_serial` | as on any token |
+
+Budget conservation and the ledger hold as on plain tokens: the same bodies
+count each participant as a live task for the time it runs a share, the leader
+is released while it waits, and `tests/team_ledger.rs` runs nested forks,
+for_ranges and broadcasts on team tokens against the budget. A token with a
+budget of one runs inline.
+
+**One leader at a time.** The calling thread leads every section, so minting
+serializes callers: `Team::exec` blocks on a mutex and condition variable until
+the previous root token and everything lent from it (`reborrow`) was dropped, then
+takes leadership; `try_exec` returns `Refused::Busy` instead. A thread that still
+holds a token and mints again would wait for itself, so `exec` panics. The guard
+lives in the root token and releases on drop; consuming entries (`fork(self)`)
+release it when they return, so a caller that needs the team across several
+entries keeps the token and lends it with `reborrow`. No thread-local state is
+involved (the owner's thread id is stored in the team).
+
+**Parking.** A reserved member that finds no new section for the park delay
+(the effective `idle_spin` of the reservation: the pool default or the
+`reserve_with` / `team_with` override) parks in `std::thread::park` and stays
+reserved. The protocol is a Dekker pair on sequentially consistent atomics: the
+member raises `parked`, re-checks `gen` and `state`, and parks only if neither
+changed; the leader bumps `gen` (or releasing stores `IDLE`), then reads `parked`
+and, when set, calls `unpark` on the member's thread. The `Thread` handle is a
+`OnceLock` in the member's slot, set once by the worker (a slot index is one
+worker thread for the life of the pool). No allocation happens on the dispatch
+path; the first dispatch after a park pays one `unpark` per parked member, a
+warm dispatch only the `parked` load. Spurious wake-ups loop. Dropping the
+team stores `IDLE` with a zero idle spin and unparks, so the members return to
+Rayon at once.
+
 ### Waiting policy
 
 `PoolBuilder::idle_spin` (default 200 ms, may be zero) and
@@ -345,8 +415,8 @@ scope. Children inherit the effective policy and may override it for their own
 scope. The root reservation's effective policy is stored in its members' slots
 when it ends and governs the idle interval that follows; the interval starts
 when the reservation ends, not when the member last computed. A reserved member
-never leaves on a timeout and never runs an unrelated Rayon job, whatever the
-policy, so an override cannot weaken a reservation, and a child's override
+never leaves on a timeout and never runs an unrelated Rayon job (it parks, still
+reserved, after the park delay), whatever the policy, so an override cannot weaken a reservation, and a child's override
 expires when the child returns and cannot release its parent's members.
 With `idle_runs_rayon`, an idle member calls `rayon::yield_now`, whose job runs
 to completion before the member is claimable again. Without it, an idle member

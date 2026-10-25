@@ -1,11 +1,13 @@
 //! The splittable placement token.
 
+use crate::awake::Awake;
 use crate::error::{Error, Refused};
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
+use crate::reserve::LeaderGuard;
 use crate::sched;
 use crate::split;
-use crate::team::TeamExec;
+use crate::team::{split_raw, spread_raw, Plan, TeamExec};
 use crate::track::Track;
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -76,6 +78,18 @@ pub struct Exec<'p> {
     /// Produced by `fork` (directly or through `reborrow`).
     child: bool,
     track: Track,
+    /// Authority over reserved members, for tokens minted from a [`Team`](crate::Team).
+    team: Option<TeamAuth<'p>>,
+    /// Held by the root token of a `Team`: one leader at a time.
+    _leader: Option<LeaderGuard<'p>>,
+}
+
+/// The reserved members a token may dispatch to; `ids.len() + 1 == budget`.
+#[derive(Clone, Copy)]
+pub(crate) struct TeamAuth<'p> {
+    pub(crate) awake: &'p Awake,
+    pub(crate) ids: &'p [usize],
+    pub(crate) policy: WaitPolicy,
 }
 
 impl Exec<'static> {
@@ -99,6 +113,8 @@ impl Exec<'static> {
             budget: NonZeroUsize::MIN,
             child: false,
             track: Track::NONE,
+            team: None,
+            _leader: None,
         }
     }
 }
@@ -130,7 +146,26 @@ impl<'p> Exec<'p> {
             budget: budget.min(pool.width()),
             child: false,
             track: Track::root(),
+            team: None,
+            _leader: None,
         })
+    }
+
+    /// A root token of a [`Team`](crate::Team): `budget` is already clamped and
+    /// `ids.len() + 1 == budget`.
+    pub(crate) fn from_team(
+        pool: &'p Pool,
+        auth: TeamAuth<'p>,
+        guard: LeaderGuard<'p>,
+    ) -> Exec<'p> {
+        Exec {
+            pool: Some(pool),
+            budget: NonZeroUsize::new(auth.ids.len() + 1).unwrap_or(NonZeroUsize::MIN),
+            child: false,
+            track: Track::root(),
+            team: Some(auth),
+            _leader: Some(guard),
+        }
     }
 
     /// The number of slots this token stands for.
@@ -178,8 +213,13 @@ impl<'p> Exec<'p> {
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn limit(self, max: NonZeroUsize) -> Exec<'p> {
+        let budget = self.budget.min(max);
         Exec {
-            budget: self.budget.min(max),
+            budget,
+            team: self.team.map(|t| TeamAuth {
+                ids: &t.ids[..budget.get() - 1],
+                ..t
+            }),
             ..self
         }
     }
@@ -208,6 +248,8 @@ impl<'p> Exec<'p> {
             budget: self.budget,
             child: self.child,
             track: self.track.alias(),
+            team: self.team,
+            _leader: None,
         }
     }
 
@@ -248,7 +290,7 @@ impl<'p> Exec<'p> {
         let _released = self.track.release();
         let next = AtomicUsize::new(0);
         let this = &self;
-        let body = |k: usize| {
+        let body = |k: usize, team_ids: Option<&[usize]>| {
             let _live = this.track.task();
             let share = split::share(budget, tasks, k);
             let child = || Exec {
@@ -257,6 +299,11 @@ impl<'p> Exec<'p> {
                 budget: NonZeroUsize::new(share).unwrap_or(NonZeroUsize::MIN),
                 child: true,
                 track: this.track.child(),
+                team: this
+                    .team
+                    .zip(team_ids)
+                    .map(|(t, ids)| TeamAuth { ids, ..t }),
+                _leader: None,
             };
             if jobs <= tasks {
                 f(k, child());
@@ -270,11 +317,20 @@ impl<'p> Exec<'p> {
                 }
             }
         };
-        match self.pool {
-            Some(pool) if tasks > 1 => sched::run_tasks(pool, tasks, &self.track, body),
+        match (self.team, self.pool) {
+            (Some(t), _) if tasks > 1 => {
+                let plan = Plan::Even {
+                    size: budget,
+                    children: tasks,
+                };
+                split_raw(Some(t.awake), t.ids, &plan, |k, ids| body(k, Some(ids)));
+            }
+            (None, Some(pool)) if tasks > 1 => {
+                sched::run_tasks(pool, tasks, &self.track, |k| body(k, None));
+            }
             _ => {
                 for k in 0..tasks {
-                    body(k);
+                    body(k, self.team.map(|t| t.ids));
                 }
             }
         }
@@ -316,8 +372,9 @@ impl<'p> Exec<'p> {
             let _live = track.task();
             f(split::chunk_range(len, chunk, k));
         };
-        match self.pool {
-            Some(pool) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
+        match (self.team, self.pool) {
+            (Some(t), _) if tasks > 1 => spread_raw(Some(t.awake), t.ids, tasks, body),
+            (None, Some(pool)) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
             _ => {
                 for k in 0..tasks {
                     body(k);
@@ -377,6 +434,17 @@ impl<'p> Exec<'p> {
         if let Some(refused) = self.refusal() {
             return Err(refused);
         }
+        if let Some(t) = self.team {
+            // Reserved members are exclusively this token's: every participant
+            // runs at once, also for a child produced by `fork`.
+            let _released = self.track.release();
+            let track = &self.track;
+            spread_raw(Some(t.awake), t.ids, self.budget.get(), |i| {
+                let _live = track.task();
+                f(i);
+            });
+            return Ok(());
+        }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
             _ => {
@@ -429,6 +497,9 @@ impl<'p> Exec<'p> {
 
     /// The single refusal rule shared by `broadcast` and `can_broadcast`.
     fn refusal(&self) -> Option<Refused> {
+        if self.team.is_some() {
+            return None;
+        }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
             _ => return None,
@@ -535,6 +606,15 @@ impl<'p> Exec<'p> {
         over: WaitOverride,
         f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
     ) -> Result<R, Refused> {
+        if let Some(t) = self.team {
+            // Carried members: the (sub)team is available without acquisition.
+            return Ok(f(TeamExec {
+                awake: Some(t.awake),
+                ids: t.ids,
+                policy: t.policy.with(over),
+                track: self.track.alias(),
+            }));
+        }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
             _ => {
@@ -548,7 +628,9 @@ impl<'p> Exec<'p> {
             }
         };
         let policy = pool.wait_policy().with(over);
-        let reservation = pool.awake.acquire(pool, self.budget.get() - 1, policy)?;
+        let reservation =
+            pool.awake
+                .acquire(pool, self.budget.get() - 1, policy, policy.idle_spin())?;
         let mut team = TeamExec {
             awake: Some(&pool.awake),
             ids: &reservation.ids,
@@ -588,6 +670,7 @@ impl fmt::Debug for Exec<'_> {
             .field("budget", &self.budget)
             .field("pooled", &self.pool.is_some())
             .field("child", &self.child)
+            .field("team", &self.team.is_some())
             .finish()
     }
 }

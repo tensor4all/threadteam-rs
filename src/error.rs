@@ -63,4 +63,8 @@ pub enum Refused {
     /// barrier-free path.
     #[error("the team members could not all be reserved without waiting for a running Rayon job")]
     Unavailable,
+    /// [`Team::try_exec`](crate::Team::try_exec): another thread holds the
+    /// team's leader token.
+    #[error("another thread is the leader of this team")]
+    Busy,
 }

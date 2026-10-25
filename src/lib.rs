@@ -47,6 +47,7 @@ mod exec;
 pub mod ledger;
 mod policy;
 mod pool;
+mod reserve;
 mod sched;
 mod split;
 mod team;
@@ -56,6 +57,7 @@ pub use error::{Error, Refused};
 pub use exec::Exec;
 pub use policy::{WaitOverride, WaitPolicy};
 pub use pool::{Pool, PoolBuilder};
+pub use reserve::Team;
 pub use team::{Cancelled, Participant, TeamExec};
 
 #[cfg(test)]

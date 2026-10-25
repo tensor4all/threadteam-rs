@@ -137,5 +137,86 @@ fn main() {
             cpu.as_secs_f64() * 1e3
         );
     }
+    println!();
+    println!("persistent Team tokens: median ns per call (spin 2 ms, park after 2 ms idle)");
+    println!(
+        "{:>6} {:>12} {:>14} {:>14} {:>14}",
+        "width", "fork(team)", "fork(plain)", "warm section", "first after park"
+    );
+    for w in [2usize, 6, 12, 18] {
+        let pool = Pool::builder()
+            .threads(w)
+            .idle_spin(Duration::from_millis(2))
+            .acquire_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        if pool.width().get() < w {
+            continue;
+        }
+        let team = pool.reserve(w).expect("team");
+        let mut tok = team.exec(w);
+        let fork_team = per_call_ns(7, 100_000, || {
+            tok.reborrow().fork(w, |_, _| {
+                black_box(());
+            });
+        });
+        let warm = per_call_ns(7, 100_000, || {
+            tok.reborrow()
+                .for_ranges(w, std::num::NonZeroUsize::MIN, |_| {
+                    black_box(());
+                });
+        });
+        // First dispatch after the members parked: sleep, then time one call.
+        let mut after = Vec::new();
+        for _ in 0..60 {
+            std::thread::sleep(Duration::from_millis(12));
+            let t = Instant::now();
+            tok.reborrow()
+                .for_ranges(w, std::num::NonZeroUsize::MIN, |_| {
+                    black_box(());
+                });
+            after.push(t.elapsed().as_nanos() as f64);
+        }
+        let after = median(after);
+        drop(tok);
+        drop(team);
+        let mut plain = Exec::new(&pool, w).unwrap();
+        let fork_plain = per_call_ns(7, 5_000, || {
+            plain.reborrow().fork(w, |_, _| {
+                black_box(());
+            });
+        });
+        println!("{w:>6} {fork_team:>12.0} {fork_plain:>14.0} {warm:>14.0} {after:>14.0}");
+    }
+
+    println!();
+    println!("CPU time after a Team of 6 went idle (600 ms wall window, whole process)");
+    println!("{:>12} {:>14}", "idle_spin", "cpu ms");
+    for spin in [
+        Duration::ZERO,
+        Duration::from_millis(2),
+        Duration::from_millis(200),
+    ] {
+        let pool = Pool::builder()
+            .threads(6)
+            .idle_spin(spin)
+            .acquire_timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let team = pool.reserve(6).expect("team");
+        team.exec(6).fork(6, |_, _| {});
+        let (c0, t0) = (cpu_time(), Instant::now());
+        while t0.elapsed() < Duration::from_millis(600) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let cpu = cpu_time() - c0;
+        println!(
+            "{:>12} {:>14.1}",
+            format!("{spin:?}"),
+            cpu.as_secs_f64() * 1e3
+        );
+        drop(team);
+    }
+
     println!("\nhost load average at end {:?}", load());
 }

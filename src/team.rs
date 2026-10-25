@@ -180,13 +180,13 @@ pub struct TeamExec<'team> {
 }
 
 /// How the members of a split are divided.
-enum Plan<'a> {
+pub(crate) enum Plan<'a> {
     Sizes(&'a [usize]),
     Even { size: usize, children: usize },
 }
 
 impl Plan<'_> {
-    fn children(&self) -> usize {
+    pub(crate) fn children(&self) -> usize {
         match self {
             Plan::Sizes(s) => s.len(),
             Plan::Even { children, .. } => *children,
@@ -318,7 +318,8 @@ impl<'team> TeamExec<'team> {
             f(p);
         };
         let ids = self.ids;
-        self.section(
+        section(
+            self.awake,
             ids.iter().enumerate().map(|(j, &id)| (id, j + 1)),
             ids.len(),
             ids.len() + 1,
@@ -414,25 +415,16 @@ impl<'team> TeamExec<'team> {
         let track = &self.track;
         let _released = track.release();
         let (awake, ids, policy) = (self.awake, self.ids, self.policy);
-        let body = |p: &Participant<'_>| {
-            let c = p.index();
-            let (start, size) = plan.child(c);
+        split_raw(awake, ids, plan, |c, child_ids| {
             let _live = track.task();
             let child = TeamExec {
                 awake,
-                ids: &ids[start..start + size - 1],
+                ids: child_ids,
                 policy,
                 track: track.child(),
             };
             f(c, child);
-        };
-        let n = plan.children();
-        self.section(
-            (1..n).map(|c| (ids[plan.child(c).0 - 1], c)),
-            n - 1,
-            ids.len() + 1,
-            &body,
-        );
+        });
     }
 
     /// Rendezvous of every participant on its own thread.
@@ -445,42 +437,85 @@ impl<'team> TeamExec<'team> {
             let _ = p.barrier();
         });
     }
+}
 
-    /// Publishes `body` to `targets`, runs participant 0 here, joins.
-    fn section<B>(
-        &self,
-        targets: impl Iterator<Item = (usize, usize)>,
-        dispatched: usize,
-        size: usize,
-        body: &B,
-    ) where
-        B: Fn(&Participant<'_>) + Sync,
-    {
-        unsafe fn call<B: Fn(&Participant<'_>)>(data: *const (), sec: &Section, index: usize) {
-            // SAFETY: `data` is the `&B` passed to `section`, alive for the call.
-            let body = &*data.cast::<B>();
-            body(&Participant {
-                index,
-                section: sec,
-            });
-        }
-        let sec = Section::new(call::<B>, (body as *const B).cast(), size, dispatched);
-        let guard = JoinGuard(&sec);
-        if dispatched > 0 {
-            if let Some(awake) = self.awake {
-                awake.publish(&sec, targets);
-            }
-        }
-        // SAFETY: `call::<B>` and `body` were paired just above.
-        let own = catch_unwind(AssertUnwindSafe(|| unsafe { sec.call_here(0) }));
-        if let Err(payload) = own {
-            sec.fail(payload);
-        }
-        drop(guard); // every dispatched share has finished
-        if let Some(payload) = sec.take_panic() {
-            resume_unwind(payload);
+/// Publishes `body` to `targets`, runs participant 0 on the calling thread,
+/// joins every dispatched share, then re-raises the first panic.
+///
+/// The one implementation of a section: `TeamExec` and team-carrying `Exec`
+/// tokens both dispatch through it.
+pub(crate) fn section<B>(
+    awake: Option<&Awake>,
+    targets: impl Iterator<Item = (usize, usize)>,
+    dispatched: usize,
+    size: usize,
+    body: &B,
+) where
+    B: Fn(&Participant<'_>) + Sync,
+{
+    unsafe fn call<B: Fn(&Participant<'_>)>(data: *const (), sec: &Section, index: usize) {
+        // SAFETY: `data` is the `&B` passed to `section`, alive for the call.
+        let body = &*data.cast::<B>();
+        body(&Participant {
+            index,
+            section: sec,
+        });
+    }
+    let sec = Section::new(call::<B>, (body as *const B).cast(), size, dispatched);
+    let guard = JoinGuard(&sec);
+    if dispatched > 0 {
+        if let Some(awake) = awake {
+            awake.publish(&sec, targets);
         }
     }
+    // SAFETY: `call::<B>` and `body` were paired just above.
+    let own = catch_unwind(AssertUnwindSafe(|| unsafe { sec.call_here(0) }));
+    if let Err(payload) = own {
+        sec.fail(payload);
+    }
+    drop(guard); // every dispatched share has finished
+    if let Some(payload) = sec.take_panic() {
+        resume_unwind(payload);
+    }
+}
+
+/// Runs `f(c, child_ids)` for every child of `plan` at once: child 0 on the
+/// calling thread, child `c` on the first member of its index range.
+pub(crate) fn split_raw<F>(awake: Option<&Awake>, ids: &[usize], plan: &Plan<'_>, f: F)
+where
+    F: Fn(usize, &[usize]) + Sync,
+{
+    let body = |p: &Participant<'_>| {
+        let c = p.index();
+        let (start, size) = plan.child(c);
+        f(c, &ids[start..start + size - 1]);
+    };
+    let n = plan.children();
+    section(
+        awake,
+        (1..n).map(|c| (ids[plan.child(c).0 - 1], c)),
+        n - 1,
+        ids.len() + 1,
+        &body,
+    );
+}
+
+/// Runs `f(k)` for `k in 0..participants` at once (leader is `k = 0`).
+pub(crate) fn spread_raw<F>(awake: Option<&Awake>, ids: &[usize], participants: usize, f: F)
+where
+    F: Fn(usize) + Sync,
+{
+    let body = |p: &Participant<'_>| f(p.index());
+    section(
+        awake,
+        ids.iter()
+            .take(participants - 1)
+            .enumerate()
+            .map(|(j, &id)| (id, j + 1)),
+        participants - 1,
+        participants,
+        &body,
+    );
 }
 
 impl fmt::Debug for TeamExec<'_> {

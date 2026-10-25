@@ -28,6 +28,8 @@ use crate::error::Refused;
 use crate::policy::WaitPolicy;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::any::Any;
+use std::sync::OnceLock;
+use std::thread::Thread;
 use std::time::Duration;
 
 const ABSENT: usize = 0;
@@ -63,6 +65,12 @@ struct Slot {
     /// Idle policy written by the releasing leader before `IDLE` is stored.
     idle_spin_ns: AtomicU64,
     idle_yield: AtomicBool,
+    /// How long a reserved member spins without work before it parks.
+    park_ns: AtomicU64,
+    /// True while the member sleeps in `thread::park` (reserved and idle).
+    parked: AtomicBool,
+    /// The worker's thread; a slot index is one worker thread for the pool's life.
+    thread: OnceLock<Thread>,
 }
 
 impl Slot {
@@ -74,6 +82,19 @@ impl Slot {
             arg: AtomicUsize::new(0),
             idle_spin_ns: AtomicU64::new(0),
             idle_yield: AtomicBool::new(false),
+            park_ns: AtomicU64::new(u64::MAX),
+            parked: AtomicBool::new(false),
+            thread: OnceLock::new(),
+        }
+    }
+
+    /// Unparks the member if it sleeps. Pairs with `park_member` (SeqCst on
+    /// both sides: the state/generation change is ordered before this load).
+    fn wake(&self) {
+        if self.parked.load(Ordering::SeqCst) {
+            if let Some(t) = self.thread.get() {
+                t.unpark();
+            }
         }
     }
 }
@@ -116,7 +137,8 @@ impl Awake {
             s.idle_spin_ns.store(ns, Ordering::Relaxed);
             s.idle_yield
                 .store(policy.idle_runs_rayon(), Ordering::Relaxed);
-            s.state.store(IDLE, Ordering::Release);
+            s.state.store(IDLE, Ordering::SeqCst);
+            s.wake();
         }
     }
 
@@ -131,7 +153,8 @@ impl Awake {
             s.arg.store(arg, Ordering::Relaxed);
             s.ptr.store(ptr, Ordering::Relaxed);
             // fetch_add: always the latest value, whichever thread led before.
-            s.gen.fetch_add(1, Ordering::Release);
+            s.gen.fetch_add(1, Ordering::SeqCst);
+            s.wake();
         }
     }
 
@@ -147,6 +170,7 @@ impl Awake {
         pool: &crate::pool::Pool,
         need: usize,
         policy: WaitPolicy,
+        park_spin: Duration,
     ) -> Result<Reservation<'a>, Refused> {
         let mut ids = Vec::with_capacity(need);
         // Idle members are claimed with a compare-and-swap. A member that is
@@ -181,6 +205,10 @@ impl Awake {
                 self.release(&ids, policy);
                 return Err(Refused::Unavailable);
             }
+        }
+        let ns = u64::try_from(park_spin.as_nanos()).unwrap_or(u64::MAX);
+        for &id in &ids {
+            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
         }
         Ok(Reservation {
             awake: self,
@@ -319,6 +347,7 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
         }
         return;
     }
+    let _ = slot.thread.get_or_init(std::thread::current);
     let seen = slot.gen.load(Ordering::Acquire);
     let epoch = aw.release_epoch.load(Ordering::Relaxed);
     match acq.join() {
@@ -337,7 +366,9 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     use std::time::Instant;
     let slot = &aw.slots[id];
     let mut idle_since: Option<Instant> = None;
+    let mut reserved_since: Option<Instant> = None;
     let mut spins = 0u32;
+    let mut polls = 0u32;
     loop {
         match slot.state.load(Ordering::Acquire) {
             RESERVED => {
@@ -345,9 +376,20 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
                     backoff(&mut spins);
+                    polls = polls.wrapping_add(1);
+                    if polls & 0xFF == 0 {
+                        let since = *reserved_since.get_or_insert_with(Instant::now);
+                        let park_ns = slot.park_ns.load(Ordering::Relaxed);
+                        if since.elapsed().as_nanos() >= u128::from(park_ns) {
+                            park_member(slot, seen);
+                            reserved_since = None;
+                            spins = 0;
+                        }
+                    }
                 } else {
                     seen = g;
                     spins = 0;
+                    reserved_since = None;
                     let ptr = slot.ptr.load(Ordering::Relaxed);
                     let arg = slot.arg.load(Ordering::Relaxed);
                     // SAFETY: the leader keeps the section alive until its
@@ -393,6 +435,17 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
             _ => backoff(&mut spins),
         }
     }
+}
+
+/// Sleeps (still reserved) until a section is published or the reservation
+/// ends. Dekker pairing with `Slot::wake`: raise `parked`, then re-check.
+#[cfg(feature = "parallel")]
+fn park_member(slot: &Slot, seen: usize) {
+    slot.parked.store(true, Ordering::SeqCst);
+    while slot.gen.load(Ordering::SeqCst) == seen && slot.state.load(Ordering::SeqCst) == RESERVED {
+        std::thread::park();
+    }
+    slot.parked.store(false, Ordering::SeqCst);
 }
 
 /// A unit of dispatched work, living on the leader's stack.

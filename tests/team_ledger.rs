@@ -54,3 +54,27 @@ fn a_team_inside_a_fork_child_stays_within_the_budget() {
     assert!(ledger::max_live(root) <= 8);
     assert_eq!(ledger::live(root), 0);
 }
+
+#[test]
+fn team_tokens_with_nested_forks_stay_within_the_budget() {
+    let pool = pool(8);
+    let team = pool.reserve(8).unwrap();
+    for budget in [1, 2, 3, 5, 8] {
+        let exec = team.exec(budget);
+        let root = exec.ledger_root().unwrap();
+        exec.fork(5, |_, l1| {
+            l1.fork(4, |_, l2| {
+                l2.fork(3, |_, mut l3| {
+                    nap();
+                    l3.reborrow()
+                        .for_ranges(10, std::num::NonZeroUsize::MIN, |_| nap());
+                    let _ = l3.reborrow().broadcast(|_| nap());
+                    l3.fork(2, |_, _| nap());
+                });
+            });
+        });
+        assert!(ledger::max_live(root) <= budget, "budget {budget}");
+        assert!(ledger::max_live(root) >= 1);
+        assert_eq!(ledger::live(root), 0);
+    }
+}

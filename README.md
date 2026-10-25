@@ -55,6 +55,7 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
 | `Exec::can_broadcast()` | non-consuming: true exactly when `broadcast` would not refuse right now; ask before building an expensive setup |
 | `Exec::team(f)` / `team_with(over, f)` | reserve `budget - 1` awake pool members for a scope and run barrier-bearing sections through `TeamExec` (`run`, `run_with`, `split`, `fork`, `reborrow`), or `Err(Refused::Unavailable)`; see the design record |
+| `Pool::reserve(width)` -> `Team`, `Team::exec(budget)` / `try_exec` | persistent reservation for an engine that owns its pool; minted tokens are ordinary `Exec`s whose `fork`, `for_ranges`, `broadcast`, `team` dispatch on the reserved members; one leader at a time (`exec` blocks, `try_exec` -> `Refused::Busy`); idle members park while reserved |
 | `PoolBuilder::idle_spin`, `idle_runs_rayon`, `acquire_timeout`; `Pool::release_idle` | waiting policy of idle team members |
 | `Exec::external(f)` | enter the pool once and hand the budget as a plain width to an outside library (faer, a vendor BLAS); how it divides the width is that library's concern |
 

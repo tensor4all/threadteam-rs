@@ -1,12 +1,14 @@
 //! Reserved awake members: the scoped authority [`TeamExec`].
 
 use crate::awake::{Awake, JoinGuard, Section};
+use crate::cost::{pays_at, width_for_by, DispatchKind};
 use crate::error::Error;
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::split;
 use crate::track::Track;
 use core::fmt;
 use core::num::NonZeroUsize;
+use core::time::Duration;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 
 /// A peer of a team section panicked: barriers return this so that the other
@@ -218,6 +220,38 @@ impl<'team> TeamExec<'team> {
     /// ```
     pub fn size(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.ids.len() + 1).unwrap_or(NonZeroUsize::MIN)
+    }
+
+    /// The cost of one section of `width` participants on this team: the steady
+    /// state of [`DispatchKind::Team`]. [`Duration::MAX`] for a team of one or
+    /// `width < 2`; `width` is clamped to the size.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use threadteam::Exec;
+    ///
+    /// Exec::serial().team(|team| {
+    ///     assert_eq!(team.dispatch_cost(2.try_into().unwrap()), Duration::MAX);
+    /// }).unwrap();
+    /// ```
+    pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
+        let width = width.min(self.size());
+        match self.awake {
+            Some(awake) if width.get() >= 2 => awake.costs.cost(DispatchKind::Team, width),
+            _ => Duration::MAX,
+        }
+    }
+
+    /// [`Exec::pays`](crate::Exec::pays) for this team.
+    pub fn pays(&self, estimate: Duration, sections: u32, width: NonZeroUsize) -> bool {
+        pays_at(estimate, sections, self.dispatch_cost(width))
+    }
+
+    /// [`Exec::width_for`](crate::Exec::width_for) for this team.
+    pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
+        width_for_by(estimate, sections, self.size(), |k| self.dispatch_cost(k))
     }
 
     /// The effective waiting policy of this scope.

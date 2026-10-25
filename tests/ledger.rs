@@ -4,7 +4,7 @@
 use std::num::NonZeroUsize;
 use std::sync::Barrier;
 use std::time::Duration;
-use strided_exec::{ledger, Exec, Pool};
+use threadteam::{ledger, Exec, Pool};
 
 fn pool(n: usize) -> Pool {
     Pool::builder()

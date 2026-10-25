@@ -11,14 +11,14 @@
 //! # Examples
 //!
 //! ```
-//! use strided_exec::{ledger, Exec, Pool};
+//! use threadteam::{ledger, Exec, Pool};
 //!
 //! let pool = Pool::builder().threads(2).build()?;
 //! let exec = Exec::new(&pool, 2)?;
 //! let root = exec.ledger_root().expect("a token from `new` is a root");
 //! exec.fork(4, |_, _| {});
 //! assert!(ledger::max_live(root) <= 2);
-//! # Ok::<(), strided_exec::Error>(())
+//! # Ok::<(), threadteam::Error>(())
 //! ```
 
 use std::collections::HashMap;
@@ -74,14 +74,14 @@ fn lookup(root: u64) -> Option<Arc<Counts>> {
 /// # Examples
 ///
 /// ```
-/// use strided_exec::{ledger, Exec, Pool};
+/// use threadteam::{ledger, Exec, Pool};
 ///
 /// let pool = Pool::builder().threads(1).build()?;
 /// let exec = Exec::new(&pool, 1)?;
 /// let root = exec.ledger_root().unwrap();
 /// exec.fork(3, |_, _| {});
 /// assert_eq!(ledger::max_live(root), 1);
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 pub fn max_live(root: u64) -> usize {
     lookup(root).map_or(0, |c| c.max.load(Ordering::SeqCst))
@@ -92,14 +92,14 @@ pub fn max_live(root: u64) -> usize {
 /// # Examples
 ///
 /// ```
-/// use strided_exec::{ledger, Exec, Pool};
+/// use threadteam::{ledger, Exec, Pool};
 ///
 /// let pool = Pool::builder().threads(1).build()?;
 /// let exec = Exec::new(&pool, 1)?;
 /// let root = exec.ledger_root().unwrap();
 /// exec.fork(2, |_, _| {});
 /// assert_eq!(ledger::live(root), 0);
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 pub fn live(root: u64) -> usize {
     lookup(root).map_or(0, |c| c.live.load(Ordering::SeqCst))
@@ -114,14 +114,14 @@ pub fn live(root: u64) -> usize {
 /// # Examples
 ///
 /// ```
-/// use strided_exec::{ledger, Exec, Pool};
+/// use threadteam::{ledger, Exec, Pool};
 ///
 /// let pool = Pool::builder().threads(2).build()?;
 /// let exec = Exec::new(&pool, 2)?;
 /// let root = exec.ledger_root().unwrap();
 /// exec.fork(1, |_, _| {});
 /// assert_eq!(ledger::installs(root), 0, "one task runs inline");
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 pub fn installs(root: u64) -> usize {
     lookup(root).map_or(0, |c| c.installs.load(Ordering::SeqCst))
@@ -139,7 +139,7 @@ pub fn installs(root: u64) -> usize {
 /// # Examples
 ///
 /// ```no_run
-/// use strided_exec::{ledger, Exec};
+/// use threadteam::{ledger, Exec};
 ///
 /// Exec::serial().fork(4, |_, _| {});
 /// assert!(ledger::global_pool_unstarted());

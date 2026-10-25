@@ -6,7 +6,7 @@
 #![cfg(all(feature = "parallel", feature = "ledger"))]
 
 use std::num::NonZeroUsize;
-use strided_exec::{Exec, Pool};
+use threadteam::{Exec, Pool};
 
 #[test]
 fn global_pool_is_never_started() {
@@ -31,7 +31,7 @@ fn global_pool_is_never_started() {
     });
 
     assert!(
-        strided_exec::ledger::global_pool_unstarted(),
-        "the global pool was started by strided-exec"
+        threadteam::ledger::global_pool_unstarted(),
+        "the global pool was started by threadteam"
     );
 }

@@ -1,16 +1,15 @@
 [package]
-name = "strided-exec"
-version = "0.7.1"
-edition.workspace = true
-license.workspace = true
-authors.workspace = true
-repository.workspace = true
+name = "threadteam"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
+repository = "https://github.com/tensor4all/threadteam-rs"
 readme = "README.md"
-documentation = "https://docs.rs/strided-exec"
-homepage = "https://github.com/tensor4all/strided-rs"
-description = "Splittable CPU placement token (Pool, Exec) for strided kernels: the only place that starts tasks."
-keywords = ["tensor", "strided", "threading", "scheduler"]
-categories = ["science", "concurrency"]
+documentation = "https://docs.rs/threadteam"
+description = "Scoped CPU thread-team placement token: a Pool and a non-Clone Exec with fork, for_ranges, external and broadcast; no Rayon type in the public API."
+keywords = ["threading", "parallel", "scheduler", "placement", "thread-pool"]
+categories = ["concurrency", "science"]
 
 [features]
 default = ["parallel"]
@@ -21,8 +20,8 @@ parallel = ["dep:rayon"]
 ledger = []
 
 [dependencies]
-rayon = { workspace = true, optional = true }
-thiserror.workspace = true
+rayon = { version = "1.10", optional = true }
+thiserror = "1.0"
 
 [lib]
 bench = false

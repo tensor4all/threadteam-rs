@@ -4,7 +4,7 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex};
-use strided_exec::{Exec, Pool, Refused};
+use threadteam::{Exec, Pool, Refused};
 
 fn named(prefix: &'static str, n: usize) -> Pool {
     Pool::builder()

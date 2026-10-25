@@ -8,7 +8,7 @@
 /// # Examples
 ///
 /// ```
-/// use strided_exec::{Error, Exec, Pool};
+/// use threadteam::{Error, Exec, Pool};
 ///
 /// let pool = Pool::builder().threads(1).build()?;
 /// assert_eq!(Exec::new(&pool, 0).unwrap_err(), Error::ZeroBudget);
@@ -36,7 +36,7 @@ pub enum Error {
 /// # Examples
 ///
 /// ```
-/// use strided_exec::Refused;
+/// use threadteam::Refused;
 ///
 /// assert!(Refused::ForkChild.to_string().contains("fork"));
 /// ```

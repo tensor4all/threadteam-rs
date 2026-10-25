@@ -4,7 +4,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use strided_exec::{Exec, Pool};
+use threadteam::{Exec, Pool};
 
 #[test]
 fn drop_of_an_unused_pool_returns() {

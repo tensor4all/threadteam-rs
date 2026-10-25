@@ -3,7 +3,7 @@
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
-use strided_exec::{Error, Exec, Pool};
+use threadteam::{Error, Exec, Pool};
 
 fn pool(n: usize) -> Pool {
     Pool::builder().threads(n).build().unwrap()

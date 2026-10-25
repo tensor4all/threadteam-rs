@@ -38,7 +38,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///
 /// ```
 /// use std::sync::atomic::{AtomicUsize, Ordering};
-/// use strided_exec::{Exec, Pool};
+/// use threadteam::{Exec, Pool};
 ///
 /// let pool = Pool::builder().threads(2).build()?;
 /// let exec = Exec::new(&pool, 2)?;
@@ -47,23 +47,23 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 ///     sum.fetch_add(r.sum::<usize>(), Ordering::Relaxed);
 /// });
 /// assert_eq!(sum.into_inner(), 4950);
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 ///
 /// A token cannot be duplicated:
 ///
 /// ```compile_fail
 /// fn needs_clone<T: Clone>() {}
-/// needs_clone::<strided_exec::Exec<'static>>();
+/// needs_clone::<threadteam::Exec<'static>>();
 /// ```
 ///
 /// ```compile_fail
 /// fn needs_copy<T: Copy>() {}
-/// needs_copy::<strided_exec::Exec<'static>>();
+/// needs_copy::<threadteam::Exec<'static>>();
 /// ```
 ///
 /// ```compile_fail
-/// let exec = strided_exec::Exec::serial();
+/// let exec = threadteam::Exec::serial();
 /// exec.fork(1, |_, _| {});
 /// exec.fork(1, |_, _| {}); // `fork` consumed the token
 /// ```
@@ -84,7 +84,7 @@ impl Exec<'static> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::Exec;
+    /// use threadteam::Exec;
     ///
     /// let exec = Exec::serial();
     /// assert!(exec.is_serial());
@@ -113,7 +113,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::{Error, Exec, Pool};
+    /// use threadteam::{Error, Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(2).build()?;
     /// let exec = Exec::new(&pool, 64)?;
@@ -136,7 +136,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// assert_eq!(strided_exec::Exec::serial().budget().get(), 1);
+    /// assert_eq!(threadteam::Exec::serial().budget().get(), 1);
     /// ```
     pub fn budget(&self) -> NonZeroUsize {
         self.budget
@@ -149,7 +149,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// assert!(strided_exec::Exec::serial().is_serial());
+    /// assert!(threadteam::Exec::serial().is_serial());
     /// ```
     pub fn is_serial(&self) -> bool {
         self.budget.get() == 1
@@ -168,12 +168,12 @@ impl<'p> Exec<'p> {
     ///
     /// ```
     /// use std::num::NonZeroUsize;
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(4).build()?;
     /// let exec = Exec::new(&pool, 4)?.limit(NonZeroUsize::new(2).unwrap());
     /// assert!(exec.budget().get() <= 2);
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn limit(self, max: NonZeroUsize) -> Exec<'p> {
         Exec {
@@ -193,7 +193,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::Exec;
+    /// use threadteam::Exec;
     ///
     /// let mut exec = Exec::serial();
     /// exec.reborrow().fork(2, |_, _| {});
@@ -224,7 +224,7 @@ impl<'p> Exec<'p> {
     ///
     /// ```
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(2).build()?;
     /// let hits: Vec<AtomicUsize> = (0..5).map(|_| AtomicUsize::new(0)).collect();
@@ -232,7 +232,7 @@ impl<'p> Exec<'p> {
     ///     hits[i].fetch_add(1, Ordering::Relaxed);
     /// });
     /// assert!(hits.iter().all(|h| h.load(Ordering::Relaxed) == 1));
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn fork<F>(self, jobs: usize, f: F)
     where
@@ -290,7 +290,7 @@ impl<'p> Exec<'p> {
     ///
     /// ```
     /// use std::sync::atomic::{AtomicUsize, Ordering};
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(2).build()?;
     /// let covered = AtomicUsize::new(0);
@@ -298,7 +298,7 @@ impl<'p> Exec<'p> {
     ///     covered.fetch_add(r.len(), Ordering::Relaxed);
     /// });
     /// assert_eq!(covered.into_inner(), 10);
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn for_ranges<F>(self, len: usize, grain: NonZeroUsize, f: F)
     where
@@ -358,7 +358,7 @@ impl<'p> Exec<'p> {
     ///
     /// ```
     /// use std::sync::Barrier;
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(2).build()?;
     /// let exec = Exec::new(&pool, 2)?;
@@ -366,7 +366,7 @@ impl<'p> Exec<'p> {
     /// exec.broadcast(|_i| {
     ///     barrier.wait(); // every participant is running, or this call refused
     /// }).expect("called from a plain thread on a root token");
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn broadcast<F>(self, f: F) -> Result<(), Refused>
     where
@@ -409,7 +409,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(2).build()?;
     /// let exec = Exec::new(&pool, 2)?;
@@ -419,7 +419,7 @@ impl<'p> Exec<'p> {
     ///     assert_eq!(child.broadcast(|_| {}).is_ok(), predicted);
     /// });
     /// assert!(Exec::serial().can_broadcast());
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn can_broadcast(&self) -> bool {
         self.refusal().is_none()
@@ -454,7 +454,7 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::Exec;
+    /// use threadteam::Exec;
     ///
     /// let width = Exec::serial().external(|width| width.get());
     /// assert_eq!(width, 1);
@@ -481,12 +481,12 @@ impl<'p> Exec<'p> {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::{Exec, Pool};
+    /// use threadteam::{Exec, Pool};
     ///
     /// let pool = Pool::builder().threads(1).build()?;
     /// assert!(Exec::new(&pool, 1)?.ledger_root().is_some());
     /// assert!(Exec::serial().ledger_root().is_none());
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[cfg(feature = "ledger")]
     pub fn ledger_root(&self) -> Option<u64> {

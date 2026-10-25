@@ -1,6 +1,6 @@
-//! Splittable CPU placement for the strided stack.
+//! Splittable CPU placement token for the tensor4all CPU stack.
 //!
-//! `strided-exec` is the single place that starts tasks. Kernels never see a
+//! `threadteam` is the single place that starts tasks. Kernels never see a
 //! scheduler type: they take an [`Exec`], a token for `budget` slots of a
 //! [`Pool`], and split it with [`Exec::fork`], [`Exec::for_ranges`],
 //! [`Exec::broadcast`] or [`Exec::external`].
@@ -21,7 +21,7 @@
 //!
 //! ```
 //! use std::sync::atomic::{AtomicUsize, Ordering};
-//! use strided_exec::{Exec, Pool};
+//! use threadteam::{Exec, Pool};
 //!
 //! let pool = Pool::builder().threads(4).build()?;
 //! let mut exec = Exec::new(&pool, 4)?;
@@ -37,7 +37,7 @@
 //! exec.fork(2, |_i, child| {
 //!     assert!(child.budget().get() <= 2);
 //! });
-//! # Ok::<(), strided_exec::Error>(())
+//! # Ok::<(), threadteam::Error>(())
 //! ```
 
 mod error;

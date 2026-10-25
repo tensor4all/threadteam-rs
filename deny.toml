@@ -1,0 +1,21 @@
+# Only `threadteam` starts tasks on a thread pool. Every other workspace crate
+# reaches parallelism through `threadteam::Exec`, so a direct `rayon`
+# dependency (normal, dev or build) anywhere else is rejected. Consumers add
+# the third-party crates that bring rayon in themselves (for example criterion)
+# to their own wrappers list. faer and spindle are banned outright: `Exec::external` hands a plain width to such a
+# library, and the library is the consumer's dependency, never threadteam's.
+[graph]
+all-features = true
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    { crate = "rayon", wrappers = [
+        "threadteam",
+    ] },
+    { crate = "rayon-core", wrappers = ["rayon"] },
+    { crate = "faer" },
+    { crate = "t4a-faer" },
+    { crate = "spindle" },
+]

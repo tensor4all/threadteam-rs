@@ -4,7 +4,7 @@
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use strided_exec::{Exec, Pool};
+use threadteam::{Exec, Pool};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);

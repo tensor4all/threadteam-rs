@@ -31,11 +31,11 @@ const DEFAULT_STACK_BYTES: usize = 16 << 20;
 /// # Examples
 ///
 /// ```
-/// use strided_exec::Pool;
+/// use threadteam::Pool;
 ///
 /// let pool = Pool::builder().threads(2).thread_name(|i| format!("w{i}")).build()?;
 /// assert!(pool.width().get() <= 2);
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 pub struct Pool {
     // Field order matters: `inner` is dropped (shutdown signalled) before
@@ -53,9 +53,9 @@ impl Pool {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder().threads(1).build()?;
+    /// let pool = threadteam::Pool::builder().threads(1).build()?;
     /// assert_eq!(pool.width().get(), 1);
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn builder() -> PoolBuilder {
         PoolBuilder::new()
@@ -68,9 +68,9 @@ impl Pool {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder().threads(1).build()?;
+    /// let pool = threadteam::Pool::builder().threads(1).build()?;
     /// assert_eq!(pool.width().get(), 1);
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn width(&self) -> NonZeroUsize {
         self.width
@@ -113,7 +113,7 @@ impl fmt::Debug for Pool {
 /// # Examples
 ///
 /// ```
-/// use strided_exec::Pool;
+/// use threadteam::Pool;
 ///
 /// let pool = Pool::builder()
 ///     .threads(2)
@@ -121,7 +121,7 @@ impl fmt::Debug for Pool {
 ///     .on_start(|_worker| { /* e.g. pin the thread */ })
 ///     .build()?;
 /// assert!(pool.width().get() >= 1);
-/// # Ok::<(), strided_exec::Error>(())
+/// # Ok::<(), threadteam::Error>(())
 /// ```
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub struct PoolBuilder {
@@ -149,7 +149,7 @@ impl PoolBuilder {
     /// # Examples
     ///
     /// ```
-    /// use strided_exec::{Error, Pool};
+    /// use threadteam::{Error, Pool};
     ///
     /// assert_eq!(Pool::builder().threads(0).build().unwrap_err(), Error::ZeroThreads);
     /// ```
@@ -164,12 +164,12 @@ impl PoolBuilder {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder()
+    /// let pool = threadteam::Pool::builder()
     ///     .threads(1)
     ///     .thread_name(|i| format!("my-pool-{i}"))
     ///     .build()?;
     /// # let _ = pool;
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[must_use]
     pub fn thread_name(mut self, f: impl Fn(usize) -> String + 'static) -> Self {
@@ -182,9 +182,9 @@ impl PoolBuilder {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder().threads(1).stack_size(4 << 20).build()?;
+    /// let pool = threadteam::Pool::builder().threads(1).stack_size(4 << 20).build()?;
     /// # let _ = pool;
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[must_use]
     pub fn stack_size(mut self, bytes: usize) -> Self {
@@ -200,9 +200,9 @@ impl PoolBuilder {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder().threads(1).on_start(|_| {}).build()?;
+    /// let pool = threadteam::Pool::builder().threads(1).on_start(|_| {}).build()?;
     /// # let _ = pool;
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[must_use]
     pub fn on_start(mut self, f: impl Fn(usize) + Send + Sync + 'static) -> Self {
@@ -223,9 +223,9 @@ impl PoolBuilder {
     /// # Examples
     ///
     /// ```
-    /// let pool = strided_exec::Pool::builder().threads(2).build()?;
+    /// let pool = threadteam::Pool::builder().threads(2).build()?;
     /// assert!(pool.width().get() <= 2);
-    /// # Ok::<(), strided_exec::Error>(())
+    /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn build(self) -> Result<Pool, Error> {
         if self.threads == Some(0) {

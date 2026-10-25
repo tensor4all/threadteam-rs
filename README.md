@@ -1,17 +1,17 @@
-# strided-exec
+# threadteam
 
-Splittable CPU placement for the strided stack. `strided-exec` is the one place
+Splittable CPU placement token for the tensor4all CPU stack. `threadteam` is the one place
 that starts tasks: kernels take an `Exec` token and split it, and no scheduler
 type appears in any public signature.
 
-Design record: `docs/design/cpu-exec-placement.md` (placement proposal for
-tenferro-rs#2206, #2272, #2273).
+Used by strided-rs, tcontract-rs, cpueinsum-rs, tlinalg-rs and tenferro-rs.
+Design record: [`docs/design/placement.md`](docs/design/placement.md).
 
 ## Usage
 
 ```rust
 use std::sync::atomic::{AtomicUsize, Ordering};
-use strided_exec::{Exec, Pool};
+use threadteam::{Exec, Pool};
 
 // The owner builds a pool once and keeps it.
 let pool = Pool::builder().threads(4).build()?;
@@ -29,18 +29,16 @@ exec.reborrow().for_ranges(1000, 64.try_into().unwrap(), |r| {
 exec.fork(2, |_job, child| {
     let _ = child.budget();
 });
-# Ok::<(), strided_exec::Error>(())
+# Ok::<(), threadteam::Error>(())
 ```
 
 `Exec::serial()` needs no pool and runs everything inline.
 
 ## Intended consumer pattern
 
-The owner of the CPU resources (an engine, `tcontract-exec`'s pool) holds a
-`strided_exec::Pool` and mints `Exec::new(&pool, budget)` for each call, passing
+The owner of the CPU resources (an engine, a contraction resource bundle) holds
+a `threadteam::Pool` and mints `Exec::new(&pool, budget)` for each call, passing
 the token to kernels by value. Kernels never store a token and never mint one.
-Today `tcontract-exec`'s `Exec` is `Copy` and its `Pool::rayon_pool()` is public;
-both go away when tcontract migrates to this crate.
 
 ## API
 
@@ -87,7 +85,7 @@ both go away when tcontract migrates to this crate.
   and returns without joining. Without `parallel` there is nothing to join.
 * **No scheduler type is public.** There is no constructor from, and no accessor
   returning, a scheduler pool. `scripts/check-no-public-rayon.sh` runs
-  `cargo public-api -p strided-exec` (when installed) and fails if `rayon::`
+  `cargo public-api -p threadteam` (when installed) and fails if `rayon::`
   appears in the output.
 
 ## Features
@@ -100,3 +98,7 @@ both go away when tcontract migrates to this crate.
 Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
 a test binary that runs serial and pooled work and then checks that
 `rayon::ThreadPoolBuilder::new().build_global()` still succeeds.
+
+## License
+
+Licensed under either of MIT or Apache-2.0 at your option.

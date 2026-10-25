@@ -105,6 +105,7 @@ pub(crate) struct Awake {
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
+    pub(crate) costs: crate::cost::DispatchCosts,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
     #[cfg(feature = "trace")]
@@ -112,13 +113,19 @@ pub(crate) struct Awake {
 }
 
 impl Awake {
-    pub(crate) fn new(width: usize, defaults: WaitPolicy, acquire_timeout: Duration) -> Self {
+    pub(crate) fn new(
+        width: usize,
+        defaults: WaitPolicy,
+        acquire_timeout: Duration,
+        costs: crate::cost::DispatchCosts,
+    ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
             park: Parker::new(),
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
+            costs,
             acquire_timeout,
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),

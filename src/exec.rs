@@ -3,6 +3,7 @@
 use crate::awake::Awake;
 #[cfg(feature = "parallel")]
 use crate::awake::LendGuard;
+use crate::cost::{pays_at, width_for_by, DispatchKind};
 use crate::error::{Error, Refused};
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
@@ -15,6 +16,7 @@ use core::fmt;
 use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
+use core::time::Duration;
 
 /// `budget` slots of a [`Pool`], or the calling thread alone.
 ///
@@ -179,6 +181,88 @@ impl<'p> Exec<'p> {
     /// ```
     pub fn budget(&self) -> NonZeroUsize {
         self.budget
+    }
+
+    /// The cost of one parallel section of `width` participants started now on
+    /// this token: the steady state (sections back to back, shares that carry
+    /// work). [`Duration::MAX`] when no section is possible: a serial token, or
+    /// `width < 2`. `width` is clamped to the budget.
+    ///
+    /// The kind of token is decided at call time:
+    ///
+    /// * the token has team authority (it comes from a [`Team`](crate::Team), or
+    ///   is a child of such a token): [`DispatchKind::Team`];
+    /// * a plain token whose caller is a worker of its pool:
+    ///   [`DispatchKind::InPool`];
+    /// * a plain token whose caller is outside the pool: [`DispatchKind::Outside`].
+    ///
+    /// The numbers come from the pool's [`DispatchCosts`] (see
+    /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)). The
+    /// call allocates nothing and reads no thread-local state of this crate.
+    /// The answer depends on the calling thread, so ask it on the thread that
+    /// will dispatch.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use std::time::Duration;
+    /// use threadteam::Exec;
+    ///
+    /// let two = NonZeroUsize::new(2).unwrap();
+    /// assert_eq!(Exec::serial().dispatch_cost(two), Duration::MAX);
+    /// ```
+    pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
+        let width = width.min(self.budget);
+        if width.get() < 2 {
+            return Duration::MAX;
+        }
+        match (self.team, self.pool) {
+            (Some(t), _) => t.awake.costs.cost(DispatchKind::Team, width),
+            (None, Some(pool)) => {
+                let kind = if sched::in_pool(pool) {
+                    DispatchKind::InPool
+                } else {
+                    DispatchKind::Outside
+                };
+                pool.awake.costs.cost(kind, width)
+            }
+            (None, None) => Duration::MAX,
+        }
+    }
+
+    /// Whether a region of serial time `estimate` that opens `sections` parallel
+    /// sections of `width` participants pays on this token: `estimate >=
+    /// PAYS * sections * dispatch_cost(width)` (see [`pays_at`]). False for a
+    /// serial token.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use threadteam::Exec;
+    ///
+    /// let two = 2.try_into().unwrap();
+    /// assert!(!Exec::serial().pays(Duration::from_secs(1), 1, two));
+    /// ```
+    pub fn pays(&self, estimate: Duration, sections: u32, width: NonZeroUsize) -> bool {
+        pays_at(estimate, sections, self.dispatch_cost(width))
+    }
+
+    /// The width in `1..=budget` that minimises `sections * D(k) + estimate / k`
+    /// for this token, counting only widths at which the region
+    /// [`pays`](Self::pays); 1 when none does (see [`width_for_by`]).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use threadteam::Exec;
+    ///
+    /// assert_eq!(Exec::serial().width_for(Duration::from_secs(1), 1).get(), 1);
+    /// ```
+    pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
+        width_for_by(estimate, sections, self.budget, |k| self.dispatch_cost(k))
     }
 
     /// Whether no parallelism is possible: the budget is one slot.

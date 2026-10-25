@@ -1,0 +1,356 @@
+//! Dispatch costs of the three kinds of token and the rule that uses them.
+//!
+//! A token states what one parallel section costs it; a kernel states how long
+//! its region takes on one thread; the region runs in parallel when the serial
+//! time is at least [`PAYS`] times the dispatch cost of every section it opens.
+//! The design record is `docs/design/thresholds.md`.
+
+use core::num::NonZeroUsize;
+use core::time::Duration;
+
+/// The one multiple of the stack: a region runs in parallel when its serial
+/// estimate is at least `PAYS * sections * dispatch_cost`.
+///
+/// At the threshold a region that scales three times on six threads is 1.5 times
+/// faster (`3 / (3/3 + 1)`) and one that scales only twice is not slower.
+pub const PAYS: f64 = 3.0;
+
+/// Which kind of token a dispatch cost belongs to.
+///
+/// The kind is read from the token and the calling thread when the cost is
+/// asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DispatchKind {
+    /// A token with authority over reserved members (team): a section is a
+    /// publication to spinning members plus a join.
+    Team,
+    /// A plain token used by a worker of its own pool: the join tree runs on the
+    /// caller, nothing is installed.
+    InPool,
+    /// A plain token used by a thread outside the pool: one install, a wake of
+    /// the workers and a wait.
+    Outside,
+}
+
+/// Dispatch cost of one kind of token at the measured widths 2, 4 and 6.
+///
+/// The model: linear interpolation between the anchors, the value at width 2
+/// below it, and above width 6 the width 6 value grown in proportion to the
+/// width (a wider team wakes and joins more participants). Width 1 never
+/// reaches the model: a token of one slot has no parallel section, see
+/// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost).
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::time::Duration;
+/// use threadteam::WidthCosts;
+///
+/// let us = Duration::from_micros;
+/// let c = WidthCosts::new([us(3), us(2), us(1)]);
+/// assert_eq!(c.at(NonZeroUsize::new(2).unwrap()), us(3));
+/// assert_eq!(c.at(NonZeroUsize::new(3).unwrap()), Duration::from_nanos(2500));
+/// assert_eq!(c.at(NonZeroUsize::new(12).unwrap()), us(2));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WidthCosts {
+    /// Nanoseconds at widths 2, 4, 6.
+    ns: [u64; 3],
+}
+
+const ANCHORS: [u64; 3] = [2, 4, 6];
+
+fn to_ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl WidthCosts {
+    /// The costs measured at widths 2, 4 and 6.
+    pub fn new(at_2_4_6: [Duration; 3]) -> Self {
+        WidthCosts {
+            ns: at_2_4_6.map(to_ns),
+        }
+    }
+
+    /// The same cost at every anchor (the model of an unmeasured host).
+    pub fn flat(cost: Duration) -> Self {
+        WidthCosts::new([cost; 3])
+    }
+
+    /// The cost of a section of `width` participants, by the model above.
+    pub fn at(&self, width: NonZeroUsize) -> Duration {
+        let w = width.get() as u64;
+        let ns = if w <= ANCHORS[0] {
+            self.ns[0]
+        } else if w >= ANCHORS[2] {
+            // Proportional growth above the last anchor.
+            (u128::from(self.ns[2]) * u128::from(w) / u128::from(ANCHORS[2]))
+                .try_into()
+                .unwrap_or(u64::MAX)
+        } else {
+            let i = usize::from(w > ANCHORS[1]);
+            let (w0, w1) = (ANCHORS[i], ANCHORS[i + 1]);
+            let (c0, c1) = (i128::from(self.ns[i]), i128::from(self.ns[i + 1]));
+            let t = i128::from(w - w0);
+            let span = i128::from(w1 - w0);
+            (c0 + (c1 - c0) * t / span).max(0) as u64
+        };
+        Duration::from_nanos(ns)
+    }
+}
+
+/// Dispatch costs of a pool's three kinds of token.
+///
+/// [`host_default`](DispatchCosts::host_default) holds measured values for the
+/// host class it knows (Apple silicon on macOS, QoS `UserInitiated`, the pool
+/// default) and a conservative generic table for every other host. A pool owner
+/// that measured its own host overrides them with
+/// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs).
+///
+/// The values are *steady state*: sections back to back, with shares that carry
+/// work. A section after the members parked costs more (about 27 us on the
+/// measured host; after a gap of a millisecond or more 6 us on a team, and 30 to
+/// 45 us for a plain token from outside). That penalty is documented, not part
+/// of the values: a rule that read the state would keep sparse callers serial
+/// and never warm the team.
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::time::Duration;
+/// use threadteam::{DispatchCosts, DispatchKind, WidthCosts};
+///
+/// let costs = DispatchCosts::host_default()
+///     .with(DispatchKind::Outside, WidthCosts::flat(Duration::from_micros(50)));
+/// let w6 = NonZeroUsize::new(6).unwrap();
+/// assert_eq!(costs.cost(DispatchKind::Outside, w6), Duration::from_micros(50));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DispatchCosts {
+    team: WidthCosts,
+    in_pool: WidthCosts,
+    outside: WidthCosts,
+}
+
+const fn us_f(x: f64) -> Duration {
+    // Microseconds with one decimal, for the tables below.
+    Duration::from_nanos((x * 1000.0) as u64)
+}
+
+impl DispatchCosts {
+    /// Costs of the three kinds.
+    pub fn new(team: WidthCosts, in_pool: WidthCosts, outside: WidthCosts) -> Self {
+        DispatchCosts {
+            team,
+            in_pool,
+            outside,
+        }
+    }
+
+    /// Measured on an Apple M5 Max, 6 threads, QoS `UserInitiated`, from the
+    /// back to back sections whose shares carry 10 us of work
+    /// (`docs/design/thresholds-data/`), in microseconds at widths 2, 4, 6:
+    /// team 3.0, 2.3, 1.4; in pool 6.0, 11, 5.5; outside 14, 18, 19.
+    pub fn apple_m5() -> Self {
+        DispatchCosts {
+            team: WidthCosts::new([us_f(3.0), us_f(2.3), us_f(1.4)]),
+            in_pool: WidthCosts::new([us_f(6.0), us_f(11.0), us_f(5.5)]),
+            outside: WidthCosts::new([us_f(14.0), us_f(18.0), us_f(19.0)]),
+        }
+    }
+
+    /// The conservative table of a host that is not measured: 3 us for a team,
+    /// 15 us in the pool and 40 us from outside, at every width. It errs towards
+    /// staying serial.
+    pub fn generic() -> Self {
+        DispatchCosts {
+            team: WidthCosts::flat(us_f(3.0)),
+            in_pool: WidthCosts::flat(us_f(15.0)),
+            outside: WidthCosts::flat(us_f(40.0)),
+        }
+    }
+
+    /// The table of this host class: [`apple_m5`](Self::apple_m5) on macOS with
+    /// an aarch64 CPU, [`generic`](Self::generic) elsewhere (Linux and x86_64
+    /// are not measured yet).
+    pub fn host_default() -> Self {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        {
+            Self::apple_m5()
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            Self::generic()
+        }
+    }
+
+    /// These costs with the table of `kind` replaced.
+    #[must_use]
+    pub fn with(mut self, kind: DispatchKind, costs: WidthCosts) -> Self {
+        match kind {
+            DispatchKind::Team => self.team = costs,
+            DispatchKind::InPool => self.in_pool = costs,
+            DispatchKind::Outside => self.outside = costs,
+        }
+        self
+    }
+
+    /// The cost of one section of `width` participants on a token of `kind`.
+    pub fn cost(&self, kind: DispatchKind, width: NonZeroUsize) -> Duration {
+        match kind {
+            DispatchKind::Team => self.team.at(width),
+            DispatchKind::InPool => self.in_pool.at(width),
+            DispatchKind::Outside => self.outside.at(width),
+        }
+    }
+}
+
+impl Default for DispatchCosts {
+    fn default() -> Self {
+        DispatchCosts::host_default()
+    }
+}
+
+fn ns_f64(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e9
+}
+
+/// The one rule: parallel exactly when
+/// `estimate >= PAYS * sections * dispatch_cost`.
+///
+/// `dispatch_cost` comes from [`Exec::dispatch_cost`](crate::Exec::dispatch_cost)
+/// (or a consumer's own token type that delegates to it). `Duration::MAX`
+/// (a serial token) never pays; `sections == 0` always pays (nothing to
+/// dispatch). `sections` is the real number of dispatches the region performs,
+/// not a tuning knob.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use threadteam::pays_at;
+///
+/// let d = Duration::from_micros(2);
+/// assert!(pays_at(Duration::from_micros(6), 1, d));
+/// assert!(!pays_at(Duration::from_micros(5), 1, d));
+/// assert!(!pays_at(Duration::from_micros(6), 2, d)); // two sections need 12 us
+/// assert!(!pays_at(Duration::from_secs(1), 1, Duration::MAX));
+/// ```
+pub fn pays_at(estimate: Duration, sections: u32, dispatch_cost: Duration) -> bool {
+    if dispatch_cost == Duration::MAX {
+        return false;
+    }
+    if sections == 0 {
+        return true;
+    }
+    ns_f64(estimate) >= PAYS * f64::from(sections) * ns_f64(dispatch_cost)
+}
+
+/// The width in `1..=budget` that minimises `sections * D(k) + estimate / k`,
+/// where `D` is `cost` and a width only counts when the region [`pays_at`] it;
+/// 1 when no width does. Ties go to the smaller width. Allocation-free.
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::time::Duration;
+/// use threadteam::width_for_by;
+///
+/// let budget = NonZeroUsize::new(6).unwrap();
+/// let flat = |_| Duration::from_micros(2);
+/// assert_eq!(width_for_by(Duration::from_micros(1), 1, budget, flat).get(), 1);
+/// assert_eq!(width_for_by(Duration::from_millis(1), 1, budget, flat).get(), 6);
+/// ```
+pub fn width_for_by(
+    estimate: Duration,
+    sections: u32,
+    budget: NonZeroUsize,
+    cost: impl Fn(NonZeroUsize) -> Duration,
+) -> NonZeroUsize {
+    let est = ns_f64(estimate);
+    let mut best = NonZeroUsize::MIN;
+    let mut best_obj = est;
+    for k in 2..=budget.get() {
+        let Some(width) = NonZeroUsize::new(k) else {
+            continue;
+        };
+        let d = cost(width);
+        if !pays_at(estimate, sections, d) {
+            continue;
+        }
+        let obj = f64::from(sections) * ns_f64(d) + est / k as f64;
+        if obj < best_obj {
+            best = width;
+            best_obj = obj;
+        }
+    }
+    best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn nz(n: usize) -> NonZeroUsize {
+        NonZeroUsize::new(n).unwrap()
+    }
+    fn us(n: u64) -> Duration {
+        Duration::from_micros(n)
+    }
+
+    #[test]
+    fn anchors_are_returned_exactly() {
+        let c = DispatchCosts::apple_m5();
+        assert_eq!(c.cost(DispatchKind::Team, nz(2)), us_f(3.0));
+        assert_eq!(c.cost(DispatchKind::Team, nz(4)), us_f(2.3));
+        assert_eq!(c.cost(DispatchKind::Team, nz(6)), us_f(1.4));
+        assert_eq!(c.cost(DispatchKind::Outside, nz(6)), us_f(19.0));
+    }
+
+    #[test]
+    fn interpolation_and_extrapolation() {
+        let c = WidthCosts::new([us(3), us(2), us(1)]);
+        assert_eq!(c.at(nz(1)), us(3));
+        assert_eq!(c.at(nz(3)), Duration::from_nanos(2500));
+        assert_eq!(c.at(nz(5)), Duration::from_nanos(1500));
+        assert_eq!(c.at(nz(12)), us(2));
+        // Non-monotone anchors interpolate without underflow.
+        let n = WidthCosts::new([us(1), us(5), us(0)]);
+        assert_eq!(n.at(nz(5)), Duration::from_nanos(2500));
+    }
+
+    #[test]
+    fn pays_is_the_multiple_of_the_cost() {
+        let d = us(2);
+        assert!(pays_at(us(6), 1, d));
+        assert!(!pays_at(Duration::from_nanos(5999), 1, d));
+        assert!(pays_at(us(12), 2, d));
+        assert!(!pays_at(us(11), 2, d));
+        assert!(!pays_at(us(1_000_000), 1, Duration::MAX));
+        assert!(pays_at(Duration::ZERO, 0, d));
+    }
+
+    #[test]
+    fn width_for_minimises_the_model() {
+        let budget = nz(6);
+        let d = |k: NonZeroUsize| us(2) * k.get() as u32;
+        // 2 us * k + est / k: for est = 200 us the optimum is k = 10 clamped to
+        // the budget; for est = 50 us it is k = 5 (obj 20) against k = 4 (20.5)
+        // and k = 6 (20.3).
+        assert_eq!(width_for_by(us(200), 1, budget, d).get(), 6);
+        assert_eq!(width_for_by(us(50), 1, budget, d).get(), 5);
+        // Below the multiple at every width: serial.
+        assert_eq!(width_for_by(us(5), 1, budget, d).get(), 1);
+        // More sections move the optimum down.
+        assert!(width_for_by(us(200), 4, budget, d).get() < 6);
+        // A serial cost never pays.
+        assert_eq!(
+            width_for_by(us(1_000_000), 1, budget, |_| Duration::MAX).get(),
+            1
+        );
+        assert_eq!(width_for_by(us(1_000_000), 1, nz(1), d).get(), 1);
+    }
+}

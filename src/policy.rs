@@ -178,6 +178,7 @@ impl Qos {
         self.apply_to_current_thread_always();
     }
 
+    #[allow(dead_code)] // used by `raise_current_thread_qos` on Apple targets
     pub(crate) fn apply_to_current_thread_always(self) {
         #[cfg(target_vendor = "apple")]
         {

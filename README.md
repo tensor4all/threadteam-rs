@@ -54,6 +54,7 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | `Exec::for_ranges(len, grain, f)` | at most `budget` tasks, ranges of at least `grain` except possibly the last |
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
 | `Exec::can_broadcast()` | non-consuming: true exactly when `broadcast` would not refuse right now; ask before building an expensive setup |
+| `Exec::carries_team()` | true when the token has team authority (minted by a `Team` or a child of one); `team()` then returns the carried team without acquisition, so a consumer that wants a `TeamExec` asks this and keeps `external` for plain tokens |
 | `Exec::team(f)` / `team_with(over, f)` | reserve `budget - 1` awake pool members for a scope and run barrier-bearing sections through `TeamExec` (`run`, `run_with`, `split`, `fork`, `reborrow`), or `Err(Refused::Unavailable)`; see the design record |
 | `Pool::into_team(width)` -> `Team` (owns the pool; `IntoTeamError` gives it back), `Team::exec(budget)` / `try_exec`, `Team::pool`, `Team::into_pool` | persistent reservation for an engine that owns its pool (`Pool` is not `Clone`); minted tokens are ordinary `Exec`s whose `fork`, `for_ranges`, `broadcast`, `team` dispatch on the reserved members; one leader at a time (`exec` blocks, `try_exec` -> `Refused::Busy`); idle members park while reserved |
 | `PoolBuilder::qos(Qos)`, `raise_current_thread_qos(Qos)` | worker QoS on macOS (default `UserInitiated`); raise the leading thread without ever lowering it |

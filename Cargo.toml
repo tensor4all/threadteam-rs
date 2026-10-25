@@ -25,3 +25,10 @@ thiserror = "1.0"
 
 [lib]
 bench = false
+
+[dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+name = "team_dispatch"
+harness = false

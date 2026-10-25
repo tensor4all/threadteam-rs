@@ -40,18 +40,23 @@
 //! # Ok::<(), threadteam::Error>(())
 //! ```
 
+mod awake;
 mod error;
 mod exec;
 #[cfg(feature = "ledger")]
 pub mod ledger;
+mod policy;
 mod pool;
 mod sched;
 mod split;
+mod team;
 mod track;
 
 pub use error::{Error, Refused};
 pub use exec::Exec;
+pub use policy::{WaitOverride, WaitPolicy};
 pub use pool::{Pool, PoolBuilder};
+pub use team::{Cancelled, Participant, TeamExec};
 
 #[cfg(test)]
 mod tests;

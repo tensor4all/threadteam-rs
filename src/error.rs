@@ -26,6 +26,10 @@ pub enum Error {
     /// The operating system or the scheduler refused to start the workers.
     #[error("failed to start the pool workers: {0}")]
     PoolBuild(String),
+    /// [`TeamExec::split`](crate::TeamExec::split) was given sizes that are
+    /// empty, contain a zero, or sum to more than the team size.
+    #[error("child team sizes must be non-empty, non-zero and sum to at most the team size")]
+    InvalidSplit,
 }
 
 /// A [`broadcast`](crate::Exec::broadcast) that cannot guarantee co-scheduling.
@@ -52,4 +56,11 @@ pub enum Refused {
     /// one of the slots the participants need.
     #[error("the caller is a worker of the token's pool and would occupy a participant slot")]
     CallerInPool,
+    /// [`Exec::team`](crate::Exec::team) could not reserve every member
+    /// without waiting for a Rayon job that is already running.
+    ///
+    /// Nothing ran and no member stays claimed. The caller takes a
+    /// barrier-free path.
+    #[error("the team members could not all be reserved without waiting for a running Rayon job")]
+    Unavailable,
 }

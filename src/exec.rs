@@ -1,9 +1,11 @@
 //! The splittable placement token.
 
 use crate::error::{Error, Refused};
+use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
 use crate::sched;
 use crate::split;
+use crate::team::TeamExec;
 use crate::track::Track;
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -469,6 +471,92 @@ impl<'p> Exec<'p> {
             }
         }
         f(NonZeroUsize::MIN)
+    }
+
+    /// Reserves `budget - 1` pool members for the scope of `f` and hands `f`
+    /// the exclusive [`TeamExec`] authority over them and the calling thread.
+    ///
+    /// The calling thread is participant 0 (the leader); the members are
+    /// pool workers that stay reserved, spinning and serving no Rayon job,
+    /// until `f` returns (or unwinds). A serial or budget-one token yields a
+    /// team of one without touching the pool.
+    ///
+    /// Acquisition never waits for a Rayon job that is already running. Idle
+    /// members of an earlier team (see [`WaitPolicy`]) are claimed with a
+    /// compare-and-swap; missing ones are requested from the pool, and the
+    /// call waits at most the pool's acquisition timeout
+    /// ([`PoolBuilder::acquire_timeout`](crate::PoolBuilder::acquire_timeout))
+    /// for idle workers to wake. If not all members are there by then, every
+    /// tentative claim is released and nothing runs. Before `f` is called,
+    /// every participant has acknowledged on its own thread.
+    ///
+    /// The token stays with the caller (this takes `&mut self`), so a refused
+    /// acquisition leaves it available for a barrier-free fallback such as
+    /// [`fork`](Exec::fork). It is conserved as usual: while `f` runs the token
+    /// is borrowed.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Unavailable`] when the members could not be reserved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Exec, Pool, Refused};
+    ///
+    /// let pool = Pool::builder().threads(4).build()?;
+    /// let mut exec = Exec::new(&pool, 4)?;
+    /// match exec.team(|team| team.size().get()) {
+    ///     Ok(n) => assert!(n >= 1),
+    ///     Err(Refused::Unavailable) => exec.fork(4, |_, _| {}), // barrier-free fallback
+    ///     Err(_) => unreachable!(),
+    /// }
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn team<R>(
+        &mut self,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
+        self.team_with(WaitOverride::new(), f)
+    }
+
+    /// [`team`](Exec::team) with a scoped override of the waiting policy.
+    ///
+    /// The override applies to this operation only and is inherited by the
+    /// children of the team; the pool's defaults are not changed. It governs
+    /// the idle interval after this reservation ends and never weakens the
+    /// reservation itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Unavailable`] when the members could not be reserved.
+    pub fn team_with<R>(
+        &mut self,
+        over: WaitOverride,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
+        let pool = match self.pool {
+            Some(pool) if self.budget.get() > 1 => pool,
+            _ => {
+                let policy = self.pool.map_or(WaitPolicy::DEFAULT, Pool::wait_policy);
+                return Ok(f(TeamExec {
+                    awake: None,
+                    ids: &[],
+                    policy: policy.with(over),
+                    track: self.track.alias(),
+                }));
+            }
+        };
+        let policy = pool.wait_policy().with(over);
+        let reservation = pool.awake.acquire(pool, self.budget.get() - 1, policy)?;
+        let mut team = TeamExec {
+            awake: Some(&pool.awake),
+            ids: &reservation.ids,
+            policy,
+            track: self.track.alias(),
+        };
+        team.acknowledge();
+        Ok(f(team))
     }
 
     /// Root id of this token in the [`ledger`](crate::ledger), if it has one.

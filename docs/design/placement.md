@@ -421,25 +421,20 @@ a counter `parked` of members inside or entering the wait. The protocol:
   order of SeqCst accesses, which `loom` does not model); and because the
   leader takes the lock before notifying, the notification cannot fall between a
   member's check and its wait (the usual condition-variable handshake).
-* With nobody parked a dispatch pays one uncontended atomic read-modify-write. A broadcast also wakes
-  parked members of other teams of the same pool, which re-check and sleep again;
-  one broadcast replaces a chain of per-thread unparks, so the cost on the
-  leader is one syscall instead of one per member.
-* Spurious wake-ups loop. There is no per-member wake state and no tree: an
-  earlier per-member design (unparks fanned out through the members) lost a
-  wake-up when a woken member unparked a child before the leader had published
-  the child's generation; the broadcast design has no such ordering to get wrong.
-  `tests/team_owner.rs` keeps the stress that reproduced it (zero spin, cold
-  acquisitions, CPU burners, a watchdog).
+* With nobody parked a dispatch pays one uncontended atomic read-modify-write.
+  A broadcast also wakes parked members of other teams of the same pool, which
+  re-check and sleep again; the leader pays one syscall, not one per member.
+* Spurious wake-ups loop. There is no per-member wake state: every parked member
+  waits on the one condition variable, so no wake-up depends on the order in
+  which a leader publishes to individual members.
 
 The handshake is the small `Parker` type in `src/park.rs`, built on a `sync`
 shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
 
 * **Model check.** `tests/loom_park.rs` runs the real `Parker` under `loom` with
   one leader and two members: a published section, a released reservation, and a
-  member that parks twice. An earlier version of the handshake (a SeqCst store/load pair,
-  Dekker style) was reported as a deadlock by loom, which led to the
-  read-modify-write form above. CI job `loom`:
+  member that parks twice. The correctness argument therefore uses only what loom
+  models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a
   test pause the member between raising `parked` and taking the lock, between its

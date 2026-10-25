@@ -38,7 +38,7 @@ waited, seen = 0, []
 while True:
     b = others(); u = idle(); seen.append(u)
     if not b and u is not None and u >= IDLE_MIN: break
-    if waited >= 300: break
+    if waited >= int(os.environ.get("HOSTRUN_MAX_WAIT", "300")): break
     time.sleep(15); waited += 17
 before = {"idle": seen[-1], "load": os.getloadavg(), "top3": top3(), "others": b}
 samples, stop = [], threading.Event()

@@ -1,0 +1,34 @@
+[package]
+name = "thr-confirm"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Built against the dispatch-cost branches of the stack (local worktrees of the same revs the draft PRs pin).
+[dependencies]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+strided-basic = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-basic", features = ["parallel"] }
+strided-view = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-view" }
+tcontract = { path = "/Users/hiroshi/projects/tensor4all/tcontract-rs-dispatch-cost/crates/tcontract" }
+tcontract-exec = { path = "/Users/hiroshi/projects/tensor4all/tcontract-rs-dispatch-cost/crates/tcontract-exec" }
+tcontract-kernel = { path = "/Users/hiroshi/projects/tensor4all/tcontract-rs-dispatch-cost/crates/tcontract-kernel", features = ["std"] }
+cpueinsum = { path = "/Users/hiroshi/projects/tensor4all/cpueinsum-rs-dispatch-cost/crates/cpueinsum" }
+
+[patch.crates-io]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+strided-traits = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-traits" }
+strided-view = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-view" }
+strided-perm = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-perm" }
+strided-basic = { path = "/Users/hiroshi/projects/tensor4all/strided-rs-dispatch-cost/strided-basic" }
+tcontract = { path = "/Users/hiroshi/projects/tensor4all/tcontract-rs-dispatch-cost/crates/tcontract" }
+tcontract-exec = { path = "/Users/hiroshi/projects/tensor4all/tcontract-rs-dispatch-cost/crates/tcontract-exec" }
+t4a-faer = { path = "/Users/hiroshi/projects/tensor4all/t4a-faer-par-team/faer" }
+t4a-faer-traits = { path = "/Users/hiroshi/projects/tensor4all/t4a-faer-par-team/faer-traits" }
+
+[patch."https://github.com/tensor4all/threadteam-rs"]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+
+[workspace]
+
+[profile.release]
+debug = 0

@@ -90,7 +90,7 @@ impl Default for WaitPolicy {
 /// use std::time::Duration;
 /// use threadteam::{Exec, Pool, WaitOverride};
 ///
-/// let pool = Pool::builder().threads(2).build()?;
+/// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
 /// let mut exec = Exec::new(&pool, 2)?;
 /// exec.team_with(WaitOverride::new().idle_spin(Duration::ZERO), |team| {
 ///     assert_eq!(team.policy().idle_spin(), Duration::ZERO);

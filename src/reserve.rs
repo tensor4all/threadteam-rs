@@ -70,7 +70,7 @@ impl Drop for LeaderGuard<'_> {
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use threadteam::Pool;
 ///
-/// let pool = Pool::builder().threads(4).build()?;
+/// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
 /// let team = pool.reserve(4).expect("an idle pool");
 /// let sum = AtomicUsize::new(0);
 /// let exec = team.exec(4); // blocks while another thread leads
@@ -102,7 +102,7 @@ impl Pool {
     /// # Examples
     ///
     /// ```
-    /// let pool = threadteam::Pool::builder().threads(3).build()?;
+    /// let pool = threadteam::Pool::builder().threads(3).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let team = pool.reserve(3).expect("an idle pool");
     /// assert_eq!(team.size().get(), pool.width().get().min(3));
     /// # Ok::<(), threadteam::Error>(())
@@ -161,7 +161,7 @@ impl<'p> Team<'p> {
     /// # Examples
     ///
     /// ```
-    /// let pool = threadteam::Pool::builder().threads(2).build()?;
+    /// let pool = threadteam::Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let team = pool.reserve(2).expect("an idle pool");
     /// {
     ///     let exec = team.exec(2);

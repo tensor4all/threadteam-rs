@@ -44,7 +44,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use threadteam::{Exec, Pool};
 ///
-/// let pool = Pool::builder().threads(2).build()?;
+/// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
 /// let exec = Exec::new(&pool, 2)?;
 /// let sum = AtomicUsize::new(0);
 /// exec.for_ranges(100, 1.try_into().unwrap(), |r| {
@@ -133,7 +133,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Error, Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 64)?;
     /// assert_eq!(exec.budget(), pool.width());
     /// assert_eq!(Exec::new(&pool, 0).unwrap_err(), Error::ZeroBudget);
@@ -207,7 +207,7 @@ impl<'p> Exec<'p> {
     /// use std::num::NonZeroUsize;
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(4).build()?;
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 4)?.limit(NonZeroUsize::new(2).unwrap());
     /// assert!(exec.budget().get() <= 2);
     /// # Ok::<(), threadteam::Error>(())
@@ -270,7 +270,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let hits: Vec<AtomicUsize> = (0..5).map(|_| AtomicUsize::new(0)).collect();
     /// Exec::new(&pool, 2)?.fork(5, |i, _child| {
     ///     hits[i].fetch_add(1, Ordering::Relaxed);
@@ -350,7 +350,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let covered = AtomicUsize::new(0);
     /// Exec::new(&pool, 2)?.for_ranges(10, 4.try_into().unwrap(), |r| {
     ///     covered.fetch_add(r.len(), Ordering::Relaxed);
@@ -419,7 +419,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::Barrier;
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 2)?;
     /// let barrier = Barrier::new(exec.budget().get());
     /// exec.broadcast(|_i| {
@@ -481,7 +481,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 2)?;
     /// assert!(exec.can_broadcast());
     /// exec.fork(1, |_, child| {
@@ -575,7 +575,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Exec, Pool, Refused};
     ///
-    /// let pool = Pool::builder().threads(4).build()?;
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let mut exec = Exec::new(&pool, 4)?;
     /// match exec.team(|team| team.size().get()) {
     ///     Ok(n) => assert!(n >= 1),
@@ -653,7 +653,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(1).build()?;
+    /// let pool = Pool::builder().threads(1).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// assert!(Exec::new(&pool, 1)?.ledger_root().is_some());
     /// assert!(Exec::serial().ledger_root().is_none());
     /// # Ok::<(), threadteam::Error>(())

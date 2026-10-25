@@ -91,7 +91,7 @@ impl Participant<'_> {
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use threadteam::{Exec, Pool};
 ///
-/// let pool = Pool::builder().threads(4).build()?;
+/// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
 /// let mut exec = Exec::new(&pool, 4)?;
 /// let hits = AtomicUsize::new(0);
 /// let outcome = exec.team(|mut team| {
@@ -284,7 +284,7 @@ impl<'team> TeamExec<'team> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(3).build()?;
+    /// let pool = Pool::builder().threads(3).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let sum = AtomicUsize::new(0);
     /// Exec::new(&pool, 3)?.team(|team| {
     ///     team.run(|i, n| { sum.fetch_add(i + 10 * n, Ordering::Relaxed); });
@@ -353,7 +353,7 @@ impl<'team> TeamExec<'team> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(4).build()?;
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let total = AtomicUsize::new(0);
     /// Exec::new(&pool, 4)?.team(|team| {
     ///     let _ = team.split(&[2, 2], |c, child| {
@@ -390,7 +390,7 @@ impl<'team> TeamExec<'team> {
     /// ```
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(4).build()?;
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// Exec::new(&pool, 4)?.team(|team| {
     ///     team.fork(2, |_c, child| assert!(child.size().get() <= 2));
     /// }).expect("idle pool");

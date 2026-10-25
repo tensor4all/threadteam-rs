@@ -77,9 +77,10 @@ impl Participant<'_> {
 ///   `budget - 1` pool workers. Before any section runs, every participant
 ///   acknowledged on its own thread (a rendezvous), so barriers inside
 ///   sections cannot deadlock for lack of threads.
-/// * Reserved members spin: they run no unrelated Rayon job and do not leave
-///   on a timeout, also between sections and during a long serial phase of
-///   the leader. They are returned when the scope ends.
+/// * Reserved members spin, then park once the park delay (`idle_spin`) has
+///   passed since their own last share; they run no unrelated Rayon job and do
+///   not leave on a timeout, also between sections and during a long serial
+///   phase of the leader. They are returned when the scope ends.
 /// * A panic in any participant propagates to the leader after every
 ///   dispatched share has finished; the reservation is released.
 ///

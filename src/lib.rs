@@ -55,6 +55,8 @@ mod sync;
 mod team;
 #[cfg(feature = "test-hooks")]
 pub mod test_hooks;
+#[cfg(feature = "trace")]
+pub mod trace;
 mod track;
 
 pub use error::{Error, Refused};

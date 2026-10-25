@@ -21,6 +21,9 @@ ledger = []
 # Test support: hooks that pause threads inside the park/wake handshake and
 # deliberate protocol breakages (see `test_hooks`). Zero cost when off.
 test-hooks = []
+# Test support: a ring of timestamped state transitions per reserved member
+# (see `trace`). Zero cost when off.
+trace = []
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
@@ -45,6 +48,20 @@ harness = false
 [[bench]]
 name = "wake_probe"
 harness = false
+
+[[bench]]
+name = "idle_trace"
+harness = false
+required-features = ["trace", "parallel"]
+
+[[bench]]
+name = "spin_grid"
+harness = false
+required-features = ["parallel"]
+
+[[test]]
+name = "idle_clock"
+required-features = ["trace", "parallel"]
 
 [[test]]
 name = "team_hooks"

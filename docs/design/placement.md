@@ -482,6 +482,44 @@ leaves its worker out of Rayon service for up to `idle_spin`; a following
 caller that alternates with such work sets a short spin or calls
 `Pool::release_idle`.
 
+**Idle clock and the default delay.** The park delay of a reserved member is
+measured on a clock that belongs to that member alone: it starts when the
+member first finds nothing to do after its own last share (or after it started,
+or was taken back from a lend), and it restarts with every share the member
+runs. A share of another member does not move it, and neither does anything the
+leader does between sections. When the clock exceeds the delay the member
+parks. Consequences:
+
+* A team that runs no section costs CPU for the delay after the team is built
+  (or after its last section), then nothing: members that spin beyond that are a
+  bug.
+* Sections less than the delay apart keep every participating member spinning
+  the whole time. That is the intended behaviour, not a leak: it is what makes a
+  dispatch cost one atomic store and no syscall (about 0.3 us, against some tens of
+  us after a park on the reference M5, see `benches/spin_grid.rs`).
+* A CPU measurement over a window of sequential work therefore depends on where
+  the window sits relative to the last section (or the construction of the team):
+  a window inside the first 200 ms reads about `width - 1` extra cores, a window
+  after it reads one. Measure CPU after a settle time longer than the delay, or
+  say what the window contains.
+
+The default is 200 ms, the same as the default blocktime of the LLVM and Intel
+OpenMP runtimes (`KMP_BLOCKTIME`): long enough that a loop of small parallel
+regions with serial work between them never pays a wake-up, short enough that a
+program that stops using the team goes quiet within a fifth of a second. The
+sweep in `benches/spin_grid.rs` (6 participants) shows the trade: with a 200 ms
+delay a dispatch after a 100 ms gap costs 12 us (members still spinning, 4.9
+cores); with a zero delay it costs 37 us after any gap and members use no CPU.
+Callers with sparse sections set a shorter delay with `idle_spin` or
+`team_with`.
+
+The clock is explicit in the code (`last_work` in `member_loop`) and visible
+with the feature `trace`, which stamps every member transition (enter, share
+begin and end, park enter and exit, lend, leave) into a preallocated ring; the
+bench `idle_trace` prints each member's spin, park and run time per phase and
+`tests/idle_clock.rs` checks that a member parks neither before the delay since
+its own last share nor never.
+
 `Pool::release_idle` bumps an epoch: idle members leave at once, reserved
 members leave when their reservation ends. It never revokes a live token and
 does not wait, so it may be called inside a reservation. Dropping the pool

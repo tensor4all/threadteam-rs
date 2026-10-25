@@ -32,6 +32,15 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering
 use std::any::Any;
 use std::time::Duration;
 
+/// Records a trace event for a member (`Some(slot)`) or a leader (`None`);
+/// nothing without the feature `trace`.
+macro_rules! trace {
+    ($aw:expr, $id:expr, $kind:ident) => {
+        #[cfg(feature = "trace")]
+        $aw.trace.record($id, crate::trace::Kind::$kind);
+    };
+}
+
 const ABSENT: usize = 0;
 const IDLE: usize = 1;
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -98,6 +107,8 @@ pub(crate) struct Awake {
     pub(crate) defaults: WaitPolicy,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
+    #[cfg(feature = "trace")]
+    pub(crate) trace: crate::trace::Trace,
 }
 
 impl Awake {
@@ -109,6 +120,8 @@ impl Awake {
             release_epoch: AtomicUsize::new(0),
             defaults,
             acquire_timeout,
+            #[cfg(feature = "trace")]
+            trace: crate::trace::Trace::new(width),
         }
     }
 
@@ -154,6 +167,7 @@ impl Awake {
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
         }
+        trace!(self, None, Publish);
         self.wake_parked();
     }
 
@@ -371,19 +385,33 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
 
 /// The member loop. Returns when the idle policy, `release_idle` or shutdown
 /// returns the thread to Rayon.
+///
+/// Idle clock of a reserved member: `last_work` is the instant at which this
+/// member first found nothing to do after its last share (or after it started,
+/// or was taken back from Rayon). It belongs to the member alone, a share of
+/// another member does not move it, and it is read only while polling. When it
+/// is older than the member's park delay the member parks and stays reserved;
+/// a member whose team runs no section therefore costs CPU for the park delay
+/// at most, then nothing.
 #[cfg(feature = "parallel")]
 fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     use std::time::Instant;
     let slot = &aw.slots[id];
     let mut idle_since: Option<Instant> = None;
-    let mut reserved_since: Option<Instant> = None;
+    let mut last_work: Option<Instant> = None;
+    let mut was_lent = false;
     let mut spins = 0u32;
     let mut polls = 0u32;
+    trace!(aw, Some(id), Enter);
     loop {
         match slot.state.load(Ordering::Acquire) {
             RESERVED if slot.lent.load(Ordering::Acquire) => {
+                if !was_lent {
+                    was_lent = true;
+                    trace!(aw, Some(id), LentBegin);
+                }
                 idle_since = None;
-                reserved_since = None;
+                last_work = None;
                 // Serve the pool's jobs; resume team service when taken back.
                 if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
                     for _ in 0..32 {
@@ -392,30 +420,38 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 }
             }
             RESERVED => {
+                if was_lent {
+                    was_lent = false;
+                    trace!(aw, Some(id), LentEnd);
+                }
                 idle_since = None;
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
+                    let since = *last_work.get_or_insert_with(Instant::now);
                     backoff(&mut spins);
                     polls = polls.wrapping_add(1);
-                    if polls & 0xFF == 0 {
-                        let since = *reserved_since.get_or_insert_with(Instant::now);
+                    if polls & 0x3F == 0 {
                         let park_ns = slot.park_ns.load(Ordering::Relaxed);
                         if since.elapsed().as_nanos() >= u128::from(park_ns) {
+                            trace!(aw, Some(id), ParkEnter);
                             park_member(aw, slot, seen);
-                            reserved_since = None;
+                            trace!(aw, Some(id), ParkExit);
+                            last_work = None;
                             spins = 0;
                         }
                     }
                 } else {
                     seen = g;
                     spins = 0;
-                    reserved_since = None;
+                    last_work = None;
                     let ptr = slot.ptr.load(Ordering::Relaxed);
                     let arg = slot.arg.load(Ordering::Relaxed);
+                    trace!(aw, Some(id), SectionBegin);
                     // SAFETY: the leader keeps the section alive until its
                     // completion counter reaches zero, which happens only
                     // after this call decremented it.
                     unsafe { Section::execute_member(ptr, arg) };
+                    trace!(aw, Some(id), SectionEnd);
                 }
             }
             IDLE => {
@@ -430,6 +466,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                         .compare_exchange(IDLE, ABSENT, Ordering::AcqRel, Ordering::Relaxed)
                         .is_ok()
                     {
+                        trace!(aw, Some(id), Leave);
                         return;
                     }
                     continue; // claimed meanwhile

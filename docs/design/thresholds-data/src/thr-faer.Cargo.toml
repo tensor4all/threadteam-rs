@@ -1,0 +1,18 @@
+[package]
+name = "thr-faer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+faer = { package = "t4a-faer", path = "/Users/hiroshi/projects/tensor4all/t4a-faer-par-team/faer", default-features = false, features = ["std", "rayon", "threadteam"] }
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+gemm = { version = "0.19.0", default-features = false }
+
+[patch."https://github.com/tensor4all/threadteam-rs"]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+
+[workspace]
+
+[profile.release]
+debug = 0

@@ -46,6 +46,11 @@ name = "team_dispatch"
 harness = false
 
 [[bench]]
+name = "dispatch_cost"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
 name = "wake_probe"
 harness = false
 

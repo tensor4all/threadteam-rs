@@ -1,0 +1,28 @@
+[package]
+name = "thr-stack"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+strided-basic = { path = "../strided-rs/strided-basic", features = ["parallel"] }
+strided-view = { path = "../strided-rs/strided-view" }
+tcontract = { path = "../tcontract-rs/crates/tcontract" }
+tcontract-exec = { path = "../tcontract-rs/crates/tcontract-exec" }
+tcontract-kernel = { path = "../tcontract-rs/crates/tcontract-kernel", features = ["std"] }
+
+[patch.crates-io]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+strided-traits = { path = "../strided-rs/strided-traits" }
+strided-view = { path = "../strided-rs/strided-view" }
+strided-perm = { path = "../strided-rs/strided-perm" }
+strided-basic = { path = "../strided-rs/strided-basic" }
+
+[patch."https://github.com/tensor4all/threadteam-rs"]
+threadteam = { path = "/Users/hiroshi/projects/tensor4all/threadteam-rs-team" }
+
+[workspace]
+
+[profile.release]
+debug = 0

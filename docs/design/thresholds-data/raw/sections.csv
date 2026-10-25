@@ -1,0 +1,19 @@
+work,config,run_sections,split_or_fork_regions,gemm_tiled,gemm_below_floor,gemm_one_tile
+gemm_sq 64,gf0,1,0,1,0,0
+gemm_sq 96,gf0,1,0,1,0,0
+gemm_sq 128,gf0,1,0,1,0,0
+gemm_sq 256,gf0,1,0,1,0,0
+lu 64,pt0_gf0,3,2,3,0,0
+lu 64,default,0,0,0,0,0
+lu 128,pt0_gf0,11,6,11,0,0
+lu 128,default,0,0,0,0,0
+lu 192,pt0_gf0,25,11,25,0,0
+lu 192,default,0,1,0,0,0
+lu 256,pt0_gf0,38,15,38,0,0
+lu 256,default,0,1,0,0,0
+lu 384,pt0_gf0,72,30,72,20,0
+lu 384,default,3,13,3,50,0
+lu 512,pt0_gf0,107,38,107,28,0
+lu 512,default,5,16,5,76,0
+lu 768,pt0_gf0,148,82,148,160,0
+lu 768,default,15,57,15,238,0

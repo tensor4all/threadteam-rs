@@ -1,8 +1,8 @@
 # Serial and parallel thresholds derived from the token's dispatch cost
 
-Status: proposal (phase 1 of tensor4all/tensor4all-meta#48, acceptance condition "recalibrate the
-serial thresholds"). Nothing in faer, strided-rs, tcontract-rs, cpueinsum-rs or tlinalg-rs has been
-changed. All numbers are from one Apple M5 Max (6 threads, QoS `UserInitiated`) on an interactive
+Status: phase 2 implemented for `threadteam` and the faer fork (`exp/par-team-lifetime`, draft PR
+tensor4all/faer#61); strided-rs, tcontract-rs, cpueinsum-rs and tlinalg-rs still use their own constants
+(section 3.4). All numbers are from one Apple M5 Max (6 threads, QoS `UserInitiated`) on an interactive
 laptop, so they are rough; final acceptance needs a quiet Linux host, including x86_64.
 
 ## Shape
@@ -225,69 +225,62 @@ Median of the `seq` mode, from the L2 resident shapes of the sweeps ([`tables.md
 | strided map `exp` f64 | element | 1.38 | 1.36 to 1.39 |
 | strided `sum` f64 | element | 0.081 | 0.078 to 0.083 |
 
-## 3. Proposal
+## 3. Design
 
-### 3.1 API in `threadteam`
+### 3.1 API in `threadteam` (implemented, `src/cost.rs`)
 
 ```rust
-impl Exec<'_> {
-    /// Cost of one parallel section of `width` participants run now on this token:
-    /// the steady state (back to back sections), with shares that carry work.
-    /// `Duration::MAX` when the token is serial or `width < 2`; `width` is clamped to the budget.
-    /// The kind is read from the token: team authority, else the caller is a worker of the pool
-    /// (join cost), else the caller is outside (install and wake).
-    pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration;
-}
-impl TeamExec<'_> {
-    pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration;
-}
-
-/// The one rule: parallel iff the serial estimate is at least `PAYS * sections * dispatch_cost`.
 pub const PAYS: f64 = 3.0;
-impl Exec<'_> {
-    pub fn pays(&self, est_serial: Duration, sections: u32) -> bool;
-    /// The width in `1..=budget` minimising `sections * D(k) + est / k`, 1 unless `pays`.
-    pub fn width_for(&self, est_serial: Duration, sections: u32) -> NonZeroUsize;
-}
-
-pub struct DispatchCosts { /* team, in_pool, outside: per width table */ }
-impl DispatchCosts { pub fn host_default() -> Self; /* the table below, by (os, arch, QoS) */ }
+pub enum DispatchKind { Team, InPool, Outside }
+pub struct WidthCosts;     // values at widths 2, 4, 6: new([Duration; 3]), flat(Duration), at(width)
+pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), generic(), with(kind, costs), cost(kind, width)
 impl PoolBuilder { pub fn dispatch_costs(self, c: DispatchCosts) -> Self; }
+impl Pool        { pub fn dispatch_costs(&self) -> DispatchCosts; }
+impl Exec<'_> {
+    pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration;  // MAX: serial or width < 2
+    pub fn pays(&self, estimate: Duration, sections: u32, width: NonZeroUsize) -> bool;
+    pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize;
+}
+impl TeamExec<'_> { dispatch_cost, pays, width_for, dispatch_costs() }
+pub fn pays_at(estimate: Duration, sections: u32, dispatch_cost: Duration) -> bool;
+pub fn width_for_by(estimate, sections, budget, cost: impl Fn(NonZeroUsize) -> Duration) -> NonZeroUsize;
 ```
 
-faer: `ParShape` gains `dispatch_cost(self) -> Duration` (`Seq` is `Duration::MAX`; `Team(n)` carries the
-cost copied from its token when `Par::shape` is called; `Rayon(n)`, which faer only reaches inside
-`external`, uses the in pool cost). `Par::dispatch_cost(&self)` reads the `TeamExec`.
+The rule is `pays_at`: `estimate >= PAYS * sections * D`. `width_for` minimises `sections * D(k) +
+estimate / k` over `1..=budget`, counting only widths at which the region pays, and returns 1 when none does
+(ties go to the smaller width). The kind is read from the token and the calling thread when asked: team
+authority (including `fork` children of a team token), else a worker of the pool (in pool), else outside. No
+thread-local state, no allocation (`tests/dispatch_cost.rs`).
 
-`sections` is the number of sections a kernel opens for the region (GEMM tile grid 1, a 2 way split of
-strided 1, composite regions counted per region). It stays 1 unless a kernel documents a larger count;
-the measured fixed overhead of the strided kernels on a team (2 to 3 us, against 1.4 us) is not
-counted; see the exception below. The multiple `PAYS = 3` is chosen so that at the threshold a region
-that scales 3 times on 6 threads is 1.5 times faster (`3 / (3/3 + 1)`) and one that scales only twice is
-not slower; it is the smallest round number that stays above the measured break-even of GEMM and of strided copy,
-map and `sum` on every kind of token (1 to 3 times `D`). The exception is `exp` on a team token: the
-derived 3.0 thousand elements is below the measured 4 to 8 thousand (2048 elements are 1.8 times slower
-than serial, 4096 are 1.04), because a strided call on a team has a fixed overhead of 2 to 3 us (two
-sections' worth) that the dispatch cost does not contain. Declaring `sections = 2` for the strided
-kernels fixes `exp` (6.1 thousand) and puts copy, map and `sum` at 1.4 to 3 times their measured
-break-even; this is left to the lead's decision.
+Width model: linear interpolation between the widths 2, 4 and 6, the width 2 value below, and above width 6
+the width 6 value grown in proportion to the width. A host that is not measured gets the flat generic table
+(team 3, in pool 15, outside 40 microseconds), which errs towards staying serial.
 
-Defaults (Apple M5 Max, 6 threads, `UserInitiated`; the table is documented in the crate and a host that
-is not in it gets the conservative fallback), in microseconds, taken from the 10 us share rows:
+faer: `ParShape::Team(n, DispatchCosts)` carries the costs of its token (copied by `Par::shape`);
+`ParShape::dispatch_cost(width)` and `pays(estimate, sections, width)` delegate to threadteam for team shapes.
+`Rayon(n)` is entered from outside the pool by faer, so it uses the `Outside` cost of the host default table
+(the same numbers are kept in `faer::utils::cost` for a build without the `threadteam` feature). `Seq` is
+`Duration::MAX`.
 
-| kind | w=2 | w=4 | w=6 | fallback for an unmeasured host |
+Decisions of the lead:
+
+* **`sections` is the real number of dispatches**, not tuned to the data. A kernel that enters the token twice
+  declares 2. The strided kernels, which the data shows to carry a fixed overhead of about two sections on a
+  team, will declare their real count when they are converted (later task); `exp` on a team token then follows
+  from the count and not from a larger multiple.
+* **Costs are steady state.** The wake penalty after the members parked (about 27 microseconds on a team; a
+  plain token from outside after a gap of 10 ms costs 31 to 45) is documented here and is not part of the
+  table or of `PAYS`. A caller with isolated sections raises its own estimate or calls `Pool::release_idle`.
+* `PAYS = 3`: at the threshold a region that scales three times on six threads is 1.5 times faster and one
+  that scales twice is not slower.
+
+Steady-state defaults (Apple M5 Max, 6 threads, `UserInitiated`), microseconds, from the 10 us share rows:
+
+| kind | w=2 | w=4 | w=6 | generic fallback |
 | --- | --- | --- | --- | --- |
-| team (steady) | 3.0 | 2.3 | 1.4 | 3 |
-| plain in pool (join) | 6.0 | 11 | 5.5 | 15 |
-| plain outside (install and wake) | 14 | 18 | 19 | 40 |
-
-State penalties, documented but not fed into thresholds: a team section after a gap of 1 ms or more costs
-6 us, after the members parked 27 us; a plain section from outside after 10 ms costs 31 to 45 us. A rule
-based on the steady cost lets an isolated call pay up to this once per burst. A rule that read the state
-would keep sparse callers serial and never warm the team (a serial call does not wake it), so the cost
-stays steady state and callers with isolated sections raise `PAYS` or call `Pool::release_idle`.
-`PoolBuilder::dispatch_costs` is the override; a calibration at pool build time is not proposed (it
-costs tens of milliseconds and the host is noisy).
+| team | 3.0 | 2.3 | 1.4 | 3 |
+| plain in pool | 6.0 | 11 | 5.5 | 15 |
+| plain outside | 14 | 18 | 19 | 40 |
 
 ### 3.2 Throughput constants (one per kernel family, in the crate that owns the kernel)
 
@@ -325,18 +318,69 @@ an explicit override. Measured against that, two rules need their own multiple: 
 (memory bound, a split costs about 13 us on a team at 18 thousand elements) is treated as a region with
 `sections = 4` so that it needs about 17 us of serial work, and regions inside a factorisation that
 run on cold caches (every region after the first) use `sections = 2`, from the 3 us per section
-measured in the LU at `n = 192`. These two numbers are not verified: the LU acceptance measurement is
-phase 2.
+measured in the LU at `n = 192`. These two numbers are provisional; the rough M5 check below does not
+contradict them, and acceptance is on a quiet Linux host.
 
-### 3.4 What changes in each repository (phase 2, not done)
+### 3.4 What changed and what remains
+
+Done in `threadteam`: the API above, the defaults table, tests, `placement.md` and the README table.
+
+Done in faer (`exp/par-team-lifetime`):
+
+* The GEMM floors of `matmul/mod.rs` (x86_64 private kernel and the aarch64 and generic `gemm` crate route)
+  and `utils/team.rs` (`gemm_tiled`) are `pays(estimate, 1, width)` with the serial throughput of the dtype
+  (`utils::cost::ns_per_mac`: f64 0.037, c64 0.165 per complex MAC; f32 and c32 are those halved, documented
+  scaling, see the worklog for the one-thread check). This fixes the team route, which compared `m*n*k`
+  against the real floor for complex products too. Derived floors at width 6 (`PAYS * D`: team 4.2 us,
+  outside 57 us): f64 113 thousand MACs on a team (`48^3`) and 1.54 million outside (`115^3`); c64 25 thousand
+  (`29^3`) and 345 thousand (`70^3`). The `gemm` crate keeps its own floor under faer's, which is lower than
+  faer's on every kind of token that reaches it.
+* LU (`partial_pivoting/factor.rs`): `par_threshold` is a per-region rule. `PartialPivLuParams::par_threshold
+  == 0` (the new default) derives each region from its serial time. The trailing update (triangular solve and
+  product, `cols * (b*b/2 + rows*b)` MACs at the dtype's GEMM rate) declares `sections = 2`; the swap stage
+  (`n * cols` row swaps at 0.55 ns each, measured one thread, random pivots, cache resident) declares
+  `sections = 4`. Both counts are provisional and stay separate rules. Any other value of `par_threshold`
+  restores the old fixed floors (`work > 2 * par_threshold` for the update, `m * cols > par_threshold` for the
+  swap) and `usize::MAX` disables parallelism; `0` therefore no longer means "always parallel" (use 1).
+* The unused `par_threshold` of `qr/no_pivoting` (`QrParams`) is removed.
+
+Remaining work in faer (thresholds unchanged, each a time floor of a different size per kernel):
+`lu/full_pivoting/factor.rs:372` (`256*512`), `cholesky/bunch_kaufman/factor.rs:328` (`128*128`),
+`qr/col_pivoting/factor.rs:244`, `svd/bidiag.rs:108`, `evd/hessenberg.rs:291` and `evd/tridiag.rs:322`
+(`192*256`), `householder.rs:160`, `:224`, `:478`, `:609`, `:626` (`gemm::get_threading_threshold`),
+`matmul/mod.rs:774`, `:894` (matvec), `matmul/internal/mod.rs:72`, `matmul/triangular.rs:125`, `:694`,
+`triangular_solve.rs:439`, `:520`. The `faer-ffi` mirror of `QrParams` (outside the workspace) still names
+the removed field.
+
+Remaining work in the other repositories (later task):
 
 | repository | change |
 | --- | --- |
-| `threadteam` | `dispatch_cost`, `pays`, `width_for`, `DispatchCosts`, `PoolBuilder::dispatch_costs`, defaults table and the bench `dispatch_cost`; `Exec::external` on a team token costs 8 to 9 us (lending members), documented |
-| faer | `ParShape::dispatch_cost`; the GEMM floors (`matmul/mod.rs:1442`, `utils/team.rs:280`, the `gemm` crate threshold set through `set_threading_threshold` for the plain route) and every `par_threshold` call site in the inventory use the rule with a flop estimate; complex counted as 4 real MACs on the team route; the LU swap gate becomes a region with its own `sections` |
-| strided-rs | `MINTHREADLENGTH` replaced by `exec.pays(est, 1)` per kernel with the constants of 3.2; softmax's `MIN_BYTES_PER_TASK` expressed in time too |
-| tcontract-rs | `WidthPolicy` removed in favour of `Exec::width_for`; `NS_PER_FLOP` 0.0185; hand faer `Par::Team` on a team token instead of `external` |
-| cpueinsum-rs, tlinalg-rs | follow tcontract (`NS_PER_FLOP`, `width_for`); `faer_par` builds `Par::Team` when the token carries a team |
+| strided-rs | `MINTHREADLENGTH` replaced by `exec.pays(est, sections, width)` per kernel with the constants of 3.2 and the real section count of each kernel (a kernel that enters twice declares 2); softmax's `MIN_BYTES_PER_TASK` in time too |
+| tcontract-rs | `WidthPolicy` removed in favour of `Exec::width_for`; `NS_PER_FLOP` 0.0185; hand faer `Par::Team` on a team token instead of `external` (`external` on a team token costs 8 to 9 us, it lends the members) |
+| cpueinsum-rs, tlinalg-rs | follow tcontract; `faer_par` builds `Par::Team` when the token carries a team |
+
+For those crates: use `Exec::pays` and `Exec::width_for` (they read the token kind at call time, so a function
+that may be called from inside or outside the pool needs no branch of its own); take the throughput constant
+from section 3.2; `TeamExec` has the same three methods; `Par::shape()` of a team in faer carries the pool's
+costs, so a `PoolBuilder::dispatch_costs` override reaches faer's team decisions but not its Rayon ones.
+
+### 3.5 Rough confirmation of the faer floors (M5, 6 threads)
+
+`faer-benchmark` `bench/par-team-lifetime`, `data/probes/20261026-dispatch-cost-floors-m5-6t/` (two processes
+per cell, no busy process, new floors against the previous revision; times are the ratio to one thread serial):
+
+| cell | before | now |
+| --- | --- | --- |
+| GEMM f64 `64^3`, team | 1.00 | 0.23 |
+| GEMM c64 `32^3`, `48^3`, `64^3`, team | 1.07, 1.07, 1.06 | 0.31, 0.21, 0.21 |
+| GEMM c64 `48^3`, plain from outside | 1.73 | 1.07 (serial, run to run noise) |
+| GEMM f64 `96^3`, plain from outside | 1.27 | 1.07 (serial, noise) |
+| LU f64 128, 192, 256, 384, 512, team | 1.07, 1.02, 1.01, 0.59, 0.50 | 0.98, 0.79, 0.67, 0.51, 0.45 |
+| LU f64 128, 192, 256, 384, 512, plain | 1.02, 1.14, 1.03, 0.86, 0.68 | 1.00, 0.98, 0.95, 0.80, 0.63 |
+
+Serial rates on one thread: f32 0.019 and c32 0.084 ns per MAC, within 10 percent of the halved f64 and c64
+constants used for them.
 
 ## 4. Limits of this data
 

@@ -127,3 +127,124 @@ impl WaitOverride {
         self
     }
 }
+
+/// Scheduling class of the pool's worker threads (macOS quality of service).
+///
+/// Applied to each worker when it starts, with `pthread_set_qos_class_self_np`
+/// on Apple targets; on other targets it has no effect. No platform type
+/// appears here.
+///
+/// * The builder default is [`Qos::UserInitiated`] on Apple targets: numerical
+///   workers should not run at the system's default class.
+/// * [`Qos::Default`] asks for the system default class explicitly.
+/// * The **leading (calling) thread** takes part in every team section, so its
+///   class matters as much as the workers'. `threadteam` never changes the
+///   caller's QoS; set it where the thread is created.
+///
+/// # Examples
+///
+/// ```
+/// use threadteam::{Pool, Qos};
+///
+/// let pool = Pool::builder().threads(2).qos(Qos::UserInteractive).build()?;
+/// # let _ = pool;
+/// # Ok::<(), threadteam::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Qos {
+    /// The system default class (`QOS_CLASS_DEFAULT`).
+    Default,
+    /// `QOS_CLASS_UTILITY`: long-running work the user is not waiting on.
+    Utility,
+    /// `QOS_CLASS_USER_INITIATED`: work the user started and waits for.
+    UserInitiated,
+    /// `QOS_CLASS_USER_INTERACTIVE`: the highest class.
+    UserInteractive,
+}
+
+impl Qos {
+    /// What a pool uses when [`PoolBuilder::qos`](crate::PoolBuilder::qos) was not called.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) const PLATFORM_DEFAULT: Option<Qos> = if cfg!(target_vendor = "apple") {
+        Some(Qos::UserInitiated)
+    } else {
+        None
+    };
+
+    /// Sets the calling thread's class (a no-op off Apple targets).
+    #[cfg(feature = "parallel")]
+    pub(crate) fn apply_to_current_thread(self) {
+        self.apply_to_current_thread_always();
+    }
+
+    pub(crate) fn apply_to_current_thread_always(self) {
+        #[cfg(target_vendor = "apple")]
+        {
+            let class = match self {
+                Qos::Default => libc::qos_class_t::QOS_CLASS_DEFAULT,
+                Qos::Utility => libc::qos_class_t::QOS_CLASS_UTILITY,
+                Qos::UserInitiated => libc::qos_class_t::QOS_CLASS_USER_INITIATED,
+                Qos::UserInteractive => libc::qos_class_t::QOS_CLASS_USER_INTERACTIVE,
+            };
+            // SAFETY: plain libpthread call on the current thread; a failure
+            // (nonzero return) leaves the thread's class unchanged.
+            unsafe {
+                libc::pthread_set_qos_class_self_np(class, 0);
+            }
+        }
+        #[cfg(not(target_vendor = "apple"))]
+        let _ = self;
+    }
+}
+
+/// Raises the calling thread's [`Qos`] to at least `qos`; never lowers it.
+///
+/// The current class is read first (`pthread_get_qos_class_np`) and the call
+/// does nothing when it already is `qos` or higher, so a thread the application
+/// runs at `UserInteractive` stays there. A no-op on non-Apple targets.
+///
+/// An engine calls this once for the thread that will lead team sections: the
+/// leader computes alongside the members, so a leader at a lower class than the
+/// workers slows every section. `threadteam` itself never changes the QoS of a
+/// caller; whether to call this is the engine's choice (and can be offered as an
+/// opt-out).
+///
+/// # Examples
+///
+/// ```
+/// use threadteam::{raise_current_thread_qos, Qos};
+///
+/// raise_current_thread_qos(Qos::UserInitiated);
+/// ```
+pub fn raise_current_thread_qos(qos: Qos) {
+    #[cfg(target_vendor = "apple")]
+    {
+        use libc::qos_class_t as C;
+        let rank = |c: C| match c {
+            C::QOS_CLASS_USER_INTERACTIVE => 5,
+            C::QOS_CLASS_USER_INITIATED => 4,
+            C::QOS_CLASS_DEFAULT => 3,
+            C::QOS_CLASS_UTILITY => 2,
+            C::QOS_CLASS_BACKGROUND => 1,
+            _ => 0,
+        };
+        let wanted = match qos {
+            Qos::Default => C::QOS_CLASS_DEFAULT,
+            Qos::Utility => C::QOS_CLASS_UTILITY,
+            Qos::UserInitiated => C::QOS_CLASS_USER_INITIATED,
+            Qos::UserInteractive => C::QOS_CLASS_USER_INTERACTIVE,
+        };
+        let mut current = C::QOS_CLASS_UNSPECIFIED;
+        let mut relative = 0;
+        // SAFETY: reads the calling thread's class into two local variables.
+        let ok = unsafe {
+            libc::pthread_get_qos_class_np(libc::pthread_self(), &mut current, &mut relative)
+        } == 0;
+        if !ok || rank(current) < rank(wanted) {
+            qos.apply_to_current_thread_always();
+        }
+    }
+    #[cfg(not(target_vendor = "apple"))]
+    let _ = qos;
+}

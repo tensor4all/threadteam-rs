@@ -153,7 +153,7 @@ fn main() {
         if pool.width().get() < w {
             continue;
         }
-        let team = pool.reserve(w).expect("team");
+        let team = pool.into_team(w).expect("team");
         let mut tok = team.exec(w);
         let fork_team = per_call_ns(7, 100_000, || {
             tok.reborrow().fork(w, |_, _| {
@@ -179,7 +179,7 @@ fn main() {
         }
         let after = median(after);
         drop(tok);
-        drop(team);
+        let pool = team.into_pool();
         let mut plain = Exec::new(&pool, w).unwrap();
         let fork_plain = per_call_ns(7, 5_000, || {
             plain.reborrow().fork(w, |_, _| {
@@ -203,7 +203,7 @@ fn main() {
             .acquire_timeout(Duration::from_secs(5))
             .build()
             .unwrap();
-        let team = pool.reserve(6).expect("team");
+        let team = pool.into_team(6).expect("team");
         team.exec(6).fork(6, |_, _| {});
         let (c0, t0) = (cpu_time(), Instant::now());
         while t0.elapsed() < Duration::from_millis(600) {

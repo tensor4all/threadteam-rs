@@ -79,10 +79,10 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
         .acquire_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
-    let team = pool.reserve(4).unwrap();
+    let team = pool.into_team(4).unwrap();
     let mut exec = team.exec(4);
     let grain = std::num::NonZeroUsize::MIN;
-    let mut phases = |exec: &mut Exec<'_>| {
+    let phases = |exec: &mut Exec<'_>| {
         exec.reborrow().fork(7, |i, child| {
             sink.fetch_add(i, Ordering::Relaxed);
             child.fork(2, |_, _| {});

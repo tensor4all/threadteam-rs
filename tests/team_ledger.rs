@@ -58,7 +58,7 @@ fn a_team_inside_a_fork_child_stays_within_the_budget() {
 #[test]
 fn team_tokens_with_nested_forks_stay_within_the_budget() {
     let pool = pool(8);
-    let team = pool.reserve(8).unwrap();
+    let team = pool.into_team(8).unwrap();
     for budget in [1, 2, 3, 5, 8] {
         let exec = team.exec(budget);
         let root = exec.ledger_root().unwrap();

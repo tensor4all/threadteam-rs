@@ -38,6 +38,9 @@ const IDLE: usize = 1;
 const YIELD: usize = 2;
 const RESERVED: usize = 3;
 
+/// Children per node of the wake-up tree (leader and woken members alike).
+pub(crate) const WAKE_FANOUT: usize = 4;
+
 /// Alignment that keeps a hot atomic on its own cache line pair (128 bytes
 /// covers Apple Silicon and adjacent-line prefetch on x86).
 #[repr(align(128))]
@@ -69,6 +72,9 @@ struct Slot {
     park_ns: AtomicU64,
     /// True while the member sleeps in `thread::park` (reserved and idle).
     parked: AtomicBool,
+    /// Set by the leader while the member's thread is lent to Rayon
+    /// (`Exec::external` on a team token).
+    lent: AtomicBool,
     /// The worker's thread; a slot index is one worker thread for the pool's life.
     thread: OnceLock<Thread>,
 }
@@ -84,6 +90,7 @@ impl Slot {
             idle_yield: AtomicBool::new(false),
             park_ns: AtomicU64::new(u64::MAX),
             parked: AtomicBool::new(false),
+            lent: AtomicBool::new(false),
             thread: OnceLock::new(),
         }
     }
@@ -142,19 +149,40 @@ impl Awake {
         }
     }
 
-    /// Publishes `section` to the given `(slot, argument)` targets.
+    /// Publishes `section` to its `n` targets (position `p` gets argument `p + 1`).
     ///
     /// The caller leads every target (its slot is `RESERVED` for the caller)
     /// and keeps `section` alive until its completion counter reaches zero.
-    pub(crate) fn publish(&self, section: &Section, targets: impl Iterator<Item = (usize, usize)>) {
+    ///
+    /// All generations are bumped first, then only the first `WAKE_FANOUT`
+    /// targets are unparked; every member that starts a share unparks its own
+    /// children in the same tree (`Section::wake_children`). A member that parks
+    /// concurrently re-checks its generation after raising `parked`, so none
+    /// can sleep through a published section.
+    pub(crate) fn publish(&self, section: &Section) {
         let ptr = (section as *const Section).cast_mut();
-        for (id, arg) in targets {
-            let s = &self.slots[id];
-            s.arg.store(arg, Ordering::Relaxed);
+        let n = section.dispatched;
+        for pos in 0..n {
+            let s = &self.slots[section.slot(pos)];
+            s.arg.store(pos + 1, Ordering::Relaxed);
             s.ptr.store(ptr, Ordering::Relaxed);
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
-            s.wake();
+        }
+        for pos in 0..n.min(WAKE_FANOUT) {
+            self.slots[section.slot(pos)].wake();
+        }
+    }
+
+    /// Lends (or takes back) the members' threads to Rayon: while lent, a
+    /// reserved member runs the pool's jobs instead of idling.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn lend(&self, ids: &[usize], on: bool) {
+        for &id in ids {
+            self.slots[id].lent.store(on, Ordering::SeqCst);
+            if on {
+                self.slots[id].wake();
+            }
         }
     }
 
@@ -165,13 +193,13 @@ impl Awake {
     /// acquisition timeout for *idle workers to wake up*, never for a worker
     /// that is busy: when the members are not all there by then the claim is
     /// closed, every tentative member is released and `Unavailable` returned.
-    pub(crate) fn acquire<'a>(
-        self: &'a std::sync::Arc<Self>,
+    pub(crate) fn acquire(
+        self: &std::sync::Arc<Self>,
         pool: &crate::pool::Pool,
         need: usize,
         policy: WaitPolicy,
         park_spin: Duration,
-    ) -> Result<Reservation<'a>, Refused> {
+    ) -> Result<Reservation, Refused> {
         let mut ids = Vec::with_capacity(need);
         // Idle members are claimed with a compare-and-swap. A member that is
         // inside `yield_now` is not claimable at that instant, but it is only
@@ -211,7 +239,7 @@ impl Awake {
             self.slots[id].park_ns.store(ns, Ordering::Relaxed);
         }
         Ok(Reservation {
-            awake: self,
+            awake: std::sync::Arc::clone(self),
             ids,
             policy,
         })
@@ -261,13 +289,13 @@ impl Awake {
 }
 
 /// Members reserved for one leader; released on drop, also on unwind.
-pub(crate) struct Reservation<'a> {
-    awake: &'a Awake,
+pub(crate) struct Reservation {
+    awake: std::sync::Arc<Awake>,
     pub(crate) ids: Vec<usize>,
     policy: WaitPolicy,
 }
 
-impl Drop for Reservation<'_> {
+impl Drop for Reservation {
     fn drop(&mut self) {
         // Every section was joined before its entry returned, so nothing is
         // outstanding here.
@@ -371,6 +399,16 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     let mut polls = 0u32;
     loop {
         match slot.state.load(Ordering::Acquire) {
+            RESERVED if slot.lent.load(Ordering::Acquire) => {
+                idle_since = None;
+                reserved_since = None;
+                // Serve the pool's jobs; resume team service when taken back.
+                if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
+                    for _ in 0..32 {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
             RESERVED => {
                 idle_since = None;
                 let g = slot.gen.load(Ordering::Acquire);
@@ -395,7 +433,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                     // SAFETY: the leader keeps the section alive until its
                     // completion counter reaches zero, which happens only
                     // after this call decremented it.
-                    unsafe { Section::execute_member(ptr, arg) };
+                    unsafe { Section::execute_member(ptr, arg, aw) };
                 }
             }
             IDLE => {
@@ -442,7 +480,10 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
 #[cfg(feature = "parallel")]
 fn park_member(slot: &Slot, seen: usize) {
     slot.parked.store(true, Ordering::SeqCst);
-    while slot.gen.load(Ordering::SeqCst) == seen && slot.state.load(Ordering::SeqCst) == RESERVED {
+    while slot.gen.load(Ordering::SeqCst) == seen
+        && slot.state.load(Ordering::SeqCst) == RESERVED
+        && !slot.lent.load(Ordering::SeqCst)
+    {
         std::thread::park();
     }
     slot.parked.store(false, Ordering::SeqCst);
@@ -453,6 +494,10 @@ pub(crate) struct Section {
     call: unsafe fn(*const (), &Section, usize),
     data: *const (),
     size: usize,
+    /// Number of dispatched targets and the map from target position to slot.
+    dispatched: usize,
+    slot_of: unsafe fn(*const (), usize) -> usize,
+    slot_data: *const (),
     /// Dispatched participants that have not finished.
     remaining: Padded<AtomicUsize>,
     arrived: Padded<AtomicUsize>,
@@ -473,16 +518,40 @@ impl Section {
         data: *const (),
         size: usize,
         dispatched: usize,
+        slot_of: unsafe fn(*const (), usize) -> usize,
+        slot_data: *const (),
     ) -> Self {
         Section {
             call,
             data,
             size,
+            dispatched,
+            slot_of,
+            slot_data,
             remaining: Padded(AtomicUsize::new(dispatched)),
             arrived: Padded(AtomicUsize::new(0)),
             epoch: Padded(AtomicUsize::new(0)),
             cancelled: AtomicBool::new(false),
             panic: AtomicPtr::new(core::ptr::null_mut()),
+        }
+    }
+
+    /// Slot of the target at `pos`.
+    fn slot(&self, pos: usize) -> usize {
+        // SAFETY: `slot_of` and `slot_data` were paired by the creator.
+        unsafe { (self.slot_of)(self.slot_data, pos) }
+    }
+
+    /// A member that starts its share (`arg = pos + 1`) unparks its children
+    /// in the wake-up tree over the targets.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    fn wake_children(&self, aw: &Awake, arg: usize) {
+        let first = WAKE_FANOUT * arg;
+        for child in first..first + WAKE_FANOUT {
+            if child >= self.dispatched {
+                break;
+            }
+            aw.slots[self.slot(child)].wake();
         }
     }
 
@@ -503,8 +572,9 @@ impl Section {
     /// the completion counter reaches zero. It is not used after the final
     /// decrement.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    unsafe fn execute_member(ptr: *const Section, arg: usize) {
+    unsafe fn execute_member(ptr: *const Section, arg: usize, aw: &Awake) {
         let sec = &*ptr;
+        sec.wake_children(aw, arg);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
         if let Err(p) = r {
             sec.fail(p);
@@ -594,5 +664,26 @@ impl Drop for JoinGuard<'_> {
 impl Drop for Section {
     fn drop(&mut self) {
         drop(self.take_panic());
+    }
+}
+
+/// Lends reserved members to Rayon while alive.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub(crate) struct LendGuard<'a> {
+    awake: &'a Awake,
+    ids: &'a [usize],
+}
+
+impl<'a> LendGuard<'a> {
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn new(awake: &'a Awake, ids: &'a [usize]) -> Self {
+        awake.lend(ids, true);
+        LendGuard { awake, ids }
+    }
+}
+
+impl Drop for LendGuard<'_> {
+    fn drop(&mut self) {
+        self.awake.lend(self.ids, false);
     }
 }

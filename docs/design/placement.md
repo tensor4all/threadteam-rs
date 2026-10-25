@@ -343,21 +343,34 @@ parent's again. Members the sizes leave over stay parked.
 ### Persistent reservation: `Team` and team tokens
 
 ```rust
-impl Pool {
-    pub fn reserve(&self, width: usize) -> Result<Team<'_>, Refused>;
-    pub fn reserve_with(&self, width: usize, over: WaitOverride) -> Result<Team<'_>, Refused>;
+impl Pool {                               // Pool stays a unique owner: not Clone
+    pub fn into_team(self, width: usize) -> Result<Team, IntoTeamError>;
+    pub fn into_team_with(self, width: usize, over: WaitOverride) -> Result<Team, IntoTeamError>;
 }
-impl<'p> Team<'p> {                       // Drop returns the members to Rayon
+impl IntoTeamError { pub fn reason(&self) -> Refused; pub fn into_pool(self) -> Pool; }
+impl Team {                               // owns the Pool; no lifetime; Drop drops the pool
+    pub fn pool(&self) -> &Pool;          // borrow only
+    pub fn into_pool(self) -> Pool;       // releases the members, gives the pool back
     pub fn size(&self) -> NonZeroUsize;
     pub fn exec(&self, budget: usize) -> Exec<'_>;                     // blocks; panics on re-entry
     pub fn try_exec(&self, budget: usize) -> Result<Exec<'_>, Refused>; // Err(Refused::Busy)
 }
 ```
 
-An owner that has its pool to itself (tenferro's engine) reserves `width - 1`
-members once, with the same acquisition and acknowledgement rendezvous as
-`Exec::team`, and keeps the `Team` for its lifetime. `Team` borrows the `Pool`
-(the pool joins its threads after the team was dropped). `exec(budget)` mints a
+An owner that has its pool to itself (tenferro's engine) moves the pool into a
+`Team` with `into_team`, which reserves `width - 1` members once, with the same
+acquisition and acknowledgement rendezvous as `Exec::team`, and stores the `Team`
+(or a plain `Pool` when it wants no team). `Pool` is a unique owner: it is not
+`Clone`, no method returns a second handle, and sharing a pool between callers
+stays outside this crate (for example an `Arc<Pool>` held by the caller, where
+per-call acquisition with `Exec::team` applies). The `Team` holds the `Pool` by
+value and has no lifetime and no `Arc` around the pool. When the members cannot
+all be reserved, `IntoTeamError` returns the pool together with the `Refused`
+reason and the caller falls back to plain tokens. Dropping the `Team` releases the
+members (zero idle spin, unparked) and then drops the pool, which joins the
+workers; `into_pool` releases the members and returns the pool instead. The
+only internal sharing is an `Arc` of the awake-member state that claim jobs
+hold; it is not a pool handle. `exec(budget)` mints a
 root token, `budget` clamped to `1..=size`, that carries `TeamAuth`: the token's
 members, a slice of the team's with `ids.len() + 1 == budget`. The slice stays
 consistent through `limit` (narrowed), `reborrow` (copied) and `fork` (the sub-slice
@@ -372,7 +385,7 @@ On a token with team authority the `Exec` methods dispatch through the same
 | `for_ranges` | the leader and the first `tasks - 1` members run the chunks; no Rayon entry |
 | `broadcast` | every participant of the budget at once on the reserved members; never refused (a `fork` child owns its members too), `can_broadcast` is true |
 | `team(f)` / `team_with` | hands out the carried (sub)team at once, no acquisition |
-| `external(f)` | unchanged: enters the pool and hands the width. Members spin or park, so the library runs on the pool's other workers only |
+| `external(f)` | enters the pool as before and hands the width (the budget). While `f` runs, the token's members are **lent**: each sets aside its spin or park and runs `rayon::yield_now` (the pool's jobs) until the call returns, then resumes team service. A lent job still running on return delays the next section until it finishes. `tests/team_owner.rs` runs four mutually waiting tasks on a team of four from inside `external`: they can only complete on four threads |
 | `limit`, `reborrow`, `budget`, `is_serial` | as on any token |
 
 Budget conservation and the ledger hold as on plain tokens: the same bodies
@@ -400,8 +413,32 @@ changed; the leader bumps `gen` (or releasing stores `IDLE`), then reads `parked
 and, when set, calls `unpark` on the member's thread. The `Thread` handle is a
 `OnceLock` in the member's slot, set once by the worker (a slot index is one
 worker thread for the life of the pool). No allocation happens on the dispatch
-path; the first dispatch after a park pays one `unpark` per parked member, a
-warm dispatch only the `parked` load. Spurious wake-ups loop. Dropping the
+path. Spurious wake-ups loop.
+
+**Wake-up tree.** The leader first bumps the generation of every target, then
+unparks only the first `WAKE_FANOUT` (4) targets; every member that starts a
+share unparks its children, positions `4 * (pos + 1) ..` of the same target
+list (the section stores the target map on the leader's stack), reading only the
+`parked` flags of members that are awake. A member that parks concurrently
+re-checks its generation after raising `parked`, so no member sleeps through a
+published section. The latency is `O(log n)` unparks deep. Measured on an M5 Max
+under background load (`benches/wake_probe.rs`): one `unpark` call costs about
+4 us and a parked thread needs about 5 us to run, regardless of the protocol, so
+the first dispatch after a park costs roughly that per tree level; the tree
+shortens the serial chain of unparks, the floor is the syscalls. Waking
+many parked members faster needs a single wake-all primitive (futex
+wake-all, or `os_sync_wake_by_address_all` on macOS 14.4+) instead of per-thread
+`unpark`; that is not implemented. Release and lending unpark serially.
+
+**Quality of service.** `PoolBuilder::qos(Qos)` sets the class of each worker
+when it starts (`pthread_set_qos_class_self_np` on Apple targets, nothing
+elsewhere; no platform type is public). The default is `UserInitiated` on
+macOS. `threadteam` never changes the caller's class, but the calling thread
+leads every section, so `raise_current_thread_qos(Qos)` raises the calling
+thread to at least the given class and never lowers it (the current class is
+read first); an engine calls it once for its leading thread. In the wake probe
+the class (builder default, explicit `Default`, `UserInteractive`) made no
+measurable difference to the wake latency on this host. Dropping the
 team stores `IDLE` with a zero idle spin and unparks, so the members return to
 Rayon at once.
 

@@ -30,8 +30,9 @@ impl Drop for LeaderGuard<'_> {
 
 /// Pool members reserved for as long as this value lives.
 ///
-/// An owner that has its pool to itself (an engine) reserves `width - 1`
-/// workers once with [`Pool::reserve`] and mints tokens with
+/// An owner that has its pool to itself (an engine) moves the pool into a
+/// `Team` with [`Pool::into_team`], which reserves `width - 1` workers once,
+/// and mints tokens with
 /// [`exec`](Team::exec). A minted token is an ordinary [`Exec`] that carries
 /// the team's authority:
 ///
@@ -41,13 +42,17 @@ impl Drop for LeaderGuard<'_> {
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
-/// * `external` hands the width as on any token. The members spin or park, so
-///   a library started through it runs on the pool's *other* workers only.
+/// * `external` hands the width as on any token and **lends the token's
+///   members to the pool for the call**: they run the pool's Rayon jobs (the
+///   library's work) instead of idling, and resume team service when the call
+///   returns. A lent job that is still running delays the next section until it
+///   finishes.
 ///
 /// Reserved members spin for the reservation's `idle_spin`, then **park**
 /// while staying reserved: they do not return to Rayon until the `Team` is
-/// dropped. The next dispatch unparks them, which costs a syscall for the
-/// first dispatch after a park (measured by `benches/team_dispatch.rs`) and
+/// dropped. The next dispatch wakes them through a tree (the leader unparks
+/// four members, each woken member unparks its own children), which costs
+/// syscalls on the first dispatch after a park (`benches/wake_probe.rs`) and
 /// nothing for a warm one.
 ///
 /// # Serialization of callers
@@ -59,9 +64,12 @@ impl Drop for LeaderGuard<'_> {
 /// second token on the thread that still holds one would wait for itself, so
 /// `exec` panics in that case. No thread-local state is used.
 ///
-/// Dropping the `Team` returns the members to Rayon immediately (the pool
-/// still joins its threads when it is dropped). Tokens borrow the `Team`, so
-/// none outlives it.
+/// A `Team` **owns** its [`Pool`] and has no lifetime: an engine stores a `Team`
+/// (or a plain `Pool` when it wants no team). `Pool` is not `Clone`, no method
+/// hands out a second handle, and [`pool`](Team::pool) only borrows. Dropping
+/// the `Team` releases the members and then drops the pool, which joins the
+/// workers; [`into_pool`](Team::into_pool) releases the members and gives the
+/// pool back instead. Tokens borrow the `Team`, so none outlives it.
 ///
 /// # Examples
 ///
@@ -71,7 +79,7 @@ impl Drop for LeaderGuard<'_> {
 /// use threadteam::Pool;
 ///
 /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
-/// let team = pool.reserve(4).expect("an idle pool");
+/// let team = pool.into_team(4).expect("an idle pool");
 /// let sum = AtomicUsize::new(0);
 /// let exec = team.exec(4); // blocks while another thread leads
 /// exec.for_ranges(100, NonZeroUsize::MIN, |r| {
@@ -80,15 +88,66 @@ impl Drop for LeaderGuard<'_> {
 /// assert_eq!(sum.into_inner(), 100);
 /// # Ok::<(), threadteam::Error>(())
 /// ```
-pub struct Team<'p> {
-    pool: &'p Pool,
-    reservation: Reservation<'p>,
+pub struct Team {
+    // Field order matters: the members are released before the pool is dropped.
+    reservation: Reservation,
     policy: WaitPolicy,
     gate: Gate,
+    pool: Pool,
 }
 
+/// [`Pool::into_team`] could not reserve the members: the pool is handed back.
+///
+/// # Examples
+///
+/// ```
+/// let pool = threadteam::Pool::builder().threads(2).build()?;
+/// match pool.into_team(2) {
+///     Ok(team) => drop(team),
+///     Err(e) => {
+///         let _reason = e.reason();
+///         let pool = e.into_pool(); // fall back to plain tokens
+///         assert!(pool.width().get() >= 1);
+///     }
+/// }
+/// # Ok::<(), threadteam::Error>(())
+/// ```
+pub struct IntoTeamError {
+    pool: Pool,
+    reason: Refused,
+}
+
+impl IntoTeamError {
+    /// Why the members could not be reserved.
+    pub fn reason(&self) -> Refused {
+        self.reason
+    }
+
+    /// The pool, unchanged.
+    pub fn into_pool(self) -> Pool {
+        self.pool
+    }
+}
+
+impl fmt::Debug for IntoTeamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IntoTeamError")
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for IntoTeamError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "cannot turn the pool into a team: {}", self.reason)
+    }
+}
+
+impl std::error::Error for IntoTeamError {}
+
 impl Pool {
-    /// Reserves `width - 1` members for as long as the returned [`Team`] lives.
+    /// Moves the pool into a [`Team`] that reserves `width - 1` members for as
+    /// long as it lives.
     ///
     /// `width` counts the leader and is clamped to the pool width; zero is
     /// treated as one. Acquisition never waits for a running Rayon job (see
@@ -97,42 +156,51 @@ impl Pool {
     ///
     /// # Errors
     ///
-    /// [`Refused::Unavailable`] when the members could not all be reserved.
+    /// [`IntoTeamError`] when the members could not all be reserved; it gives
+    /// the pool back with the [`Refused`] reason so the caller falls back to
+    /// plain tokens.
     ///
     /// # Examples
     ///
     /// ```
-    /// let pool = threadteam::Pool::builder().threads(3).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
-    /// let team = pool.reserve(3).expect("an idle pool");
-    /// assert_eq!(team.size().get(), pool.width().get().min(3));
+    /// let pool = threadteam::Pool::builder()
+    ///     .threads(3)
+    ///     .acquire_timeout(std::time::Duration::from_secs(10))
+    ///     .build()?;
+    /// let team = pool.into_team(3).expect("an idle pool");
+    /// assert_eq!(team.size().get(), team.pool().width().get().min(3));
     /// # Ok::<(), threadteam::Error>(())
     /// ```
-    pub fn reserve(&self, width: usize) -> Result<Team<'_>, Refused> {
-        self.reserve_with(width, WaitOverride::new())
+    pub fn into_team(self, width: usize) -> Result<Team, IntoTeamError> {
+        self.into_team_with(width, WaitOverride::new())
     }
 
-    /// [`reserve`](Pool::reserve) with an override of the park delay
+    /// [`into_team`](Pool::into_team) with an override of the park delay
     /// (`idle_spin`) of the reserved members.
     ///
     /// # Errors
     ///
-    /// [`Refused::Unavailable`] when the members could not all be reserved.
-    pub fn reserve_with(&self, width: usize, over: WaitOverride) -> Result<Team<'_>, Refused> {
+    /// As [`into_team`](Pool::into_team).
+    pub fn into_team_with(self, width: usize, over: WaitOverride) -> Result<Team, IntoTeamError> {
         let width = width.clamp(1, self.width().get());
         let policy = self.wait_policy().with(over);
         // On drop the members leave at once.
         let release = WaitPolicy::new(Duration::ZERO, false);
-        let reservation = self
+        let reservation = match self
             .awake
-            .acquire(self, width - 1, release, policy.idle_spin())?;
+            .acquire(&self, width - 1, release, policy.idle_spin())
+        {
+            Ok(r) => r,
+            Err(reason) => return Err(IntoTeamError { pool: self, reason }),
+        };
         let team = Team {
-            pool: self,
             reservation,
             policy,
             gate: Gate {
                 owner: Mutex::new(None),
                 free: Condvar::new(),
             },
+            pool: self,
         };
         if width > 1 {
             // Every participant acknowledges on its own thread.
@@ -143,7 +211,22 @@ impl Pool {
     }
 }
 
-impl<'p> Team<'p> {
+impl Team {
+    /// The owned pool, borrowed (for `width`, `resident_members`, or plain
+    /// tokens next to the team). It cannot be cloned or moved out of a `&Team`.
+    pub fn pool(&self) -> &Pool {
+        &self.pool
+    }
+
+    /// Releases the members and gives the pool back.
+    pub fn into_pool(self) -> Pool {
+        let Team {
+            reservation, pool, ..
+        } = self;
+        drop(reservation);
+        pool
+    }
+
     /// Number of participants: the leader plus the reserved members.
     pub fn size(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.reservation.ids.len() + 1).unwrap_or(NonZeroUsize::MIN)
@@ -162,7 +245,7 @@ impl<'p> Team<'p> {
     ///
     /// ```
     /// let pool = threadteam::Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
-    /// let team = pool.reserve(2).expect("an idle pool");
+    /// let team = pool.into_team(2).expect("an idle pool");
     /// {
     ///     let exec = team.exec(2);
     ///     assert!(team.try_exec(2).is_err()); // this thread leads already
@@ -226,11 +309,11 @@ impl<'p> Team<'p> {
             ids: &self.reservation.ids[..budget - 1],
             policy: self.policy,
         };
-        Exec::from_team(self.pool, auth, LeaderGuard(&self.gate))
+        Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
     }
 }
 
-impl fmt::Debug for Team<'_> {
+impl fmt::Debug for Team {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Team").field("size", &self.size()).finish()
     }

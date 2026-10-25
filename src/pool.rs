@@ -2,7 +2,7 @@
 
 use crate::awake::Awake;
 use crate::error::Error;
-use crate::policy::WaitPolicy;
+use crate::policy::{Qos, WaitPolicy};
 use core::fmt;
 use core::num::NonZeroUsize;
 use core::sync::atomic::Ordering;
@@ -25,11 +25,20 @@ const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 /// external pool and no accessor returning one. The pool's owner keeps the
 /// `Pool` and mints tokens from it with [`Exec::new`](crate::Exec::new).
 ///
-/// Dropping a `Pool` shuts its workers down and joins them: when `drop`
-/// returns, every worker thread has exited, so the thread-local destructors of
-/// the workers (including state set up by an [`on_start`](PoolBuilder::on_start)
-/// hook) have already run. Without the `parallel` feature there are no workers
-/// and nothing is joined.
+/// A `Pool` is a unique owner: it is not `Clone` and no method returns a second
+/// handle. An engine that wants reserved, always-awake members moves the pool
+/// into a [`Team`](crate::Team) with [`into_team`](Pool::into_team); the team owns
+/// the pool from then on (and gives it back with
+/// [`Team::into_pool`](crate::Team::into_pool)). Sharing a pool between several
+/// callers stays outside this crate (for example behind an `Arc` held by the
+/// caller), where each call acquires its members with
+/// [`Exec::team`](crate::Exec::team) or uses plain tokens.
+///
+/// Dropping a `Pool` (or the `Team` that owns it) shuts its workers down and
+/// joins them: when `drop` returns, every worker thread has exited, so the
+/// thread-local destructors of the workers (including state set up by an
+/// [`on_start`](PoolBuilder::on_start) hook) have already run. Without the
+/// `parallel` feature there are no workers and nothing is joined.
 ///
 /// A pool dropped from one of its own workers cannot wait for itself: that drop
 /// signals shutdown and returns without joining, so the workers exit shortly
@@ -199,6 +208,7 @@ pub struct PoolBuilder {
     on_start: Option<Box<dyn Fn(usize) + Send + Sync>>,
     wait: WaitPolicy,
     acquire_timeout: Duration,
+    qos: Option<Qos>,
 }
 
 impl PoolBuilder {
@@ -210,6 +220,7 @@ impl PoolBuilder {
             on_start: None,
             wait: WaitPolicy::DEFAULT,
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+            qos: None,
         }
     }
 
@@ -346,6 +357,27 @@ impl PoolBuilder {
         self
     }
 
+    /// Scheduling class of the workers (see [`Qos`]).
+    ///
+    /// Defaults to [`Qos::UserInitiated`] on macOS and to nothing elsewhere.
+    /// The calling thread's class is not changed by this crate; an engine that
+    /// wants its leading thread raised too calls
+    /// [`raise_current_thread_qos`](crate::raise_current_thread_qos) once on it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Pool, Qos};
+    /// let pool = Pool::builder().threads(1).qos(Qos::Default).build()?;
+    /// # let _ = pool;
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn qos(mut self, qos: Qos) -> Self {
+        self.qos = Some(qos);
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -377,6 +409,7 @@ impl PoolBuilder {
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
         let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&handles);
+        let qos = self.qos.or(Qos::PLATFORM_DEFAULT);
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .stack_size(self.stack_size)
@@ -388,7 +421,12 @@ impl PoolBuilder {
                 if let Some(size) = thread.stack_size() {
                     b = b.stack_size(size);
                 }
-                let handle = b.spawn(move || thread.run())?;
+                let handle = b.spawn(move || {
+                    if let Some(q) = qos {
+                        q.apply_to_current_thread();
+                    }
+                    thread.run()
+                })?;
                 match sink.lock() {
                     Ok(mut guard) => guard.push(handle),
                     Err(poisoned) => poisoned.into_inner().push(handle),

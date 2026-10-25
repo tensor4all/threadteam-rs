@@ -318,13 +318,7 @@ impl<'team> TeamExec<'team> {
             f(p);
         };
         let ids = self.ids;
-        section(
-            self.awake,
-            ids.iter().enumerate().map(|(j, &id)| (id, j + 1)),
-            ids.len(),
-            ids.len() + 1,
-            &body,
-        );
+        section(self.awake, &|pos| ids[pos], ids.len(), ids.len() + 1, &body);
     }
 
     /// Divides the team into child reservations of the given sizes.
@@ -444,15 +438,20 @@ impl<'team> TeamExec<'team> {
 ///
 /// The one implementation of a section: `TeamExec` and team-carrying `Exec`
 /// tokens both dispatch through it.
-pub(crate) fn section<B>(
+pub(crate) fn section<B, S>(
     awake: Option<&Awake>,
-    targets: impl Iterator<Item = (usize, usize)>,
+    slot_of: &S,
     dispatched: usize,
     size: usize,
     body: &B,
 ) where
     B: Fn(&Participant<'_>) + Sync,
+    S: Fn(usize) -> usize + Sync,
 {
+    unsafe fn slot_call<S: Fn(usize) -> usize>(data: *const (), pos: usize) -> usize {
+        // SAFETY: `data` is the `&S` passed to `section`, alive for the call.
+        (*data.cast::<S>())(pos)
+    }
     unsafe fn call<B: Fn(&Participant<'_>)>(data: *const (), sec: &Section, index: usize) {
         // SAFETY: `data` is the `&B` passed to `section`, alive for the call.
         let body = &*data.cast::<B>();
@@ -461,11 +460,18 @@ pub(crate) fn section<B>(
             section: sec,
         });
     }
-    let sec = Section::new(call::<B>, (body as *const B).cast(), size, dispatched);
+    let sec = Section::new(
+        call::<B>,
+        (body as *const B).cast(),
+        size,
+        dispatched,
+        slot_call::<S>,
+        (slot_of as *const S).cast(),
+    );
     let guard = JoinGuard(&sec);
     if dispatched > 0 {
         if let Some(awake) = awake {
-            awake.publish(&sec, targets);
+            awake.publish(&sec);
         }
     }
     // SAFETY: `call::<B>` and `body` were paired just above.
@@ -493,7 +499,7 @@ where
     let n = plan.children();
     section(
         awake,
-        (1..n).map(|c| (ids[plan.child(c).0 - 1], c)),
+        &|pos| ids[plan.child(pos + 1).0 - 1],
         n - 1,
         ids.len() + 1,
         &body,
@@ -508,10 +514,7 @@ where
     let body = |p: &Participant<'_>| f(p.index());
     section(
         awake,
-        ids.iter()
-            .take(participants - 1)
-            .enumerate()
-            .map(|(j, &id)| (id, j + 1)),
+        &|pos| ids[pos],
         participants - 1,
         participants,
         &body,

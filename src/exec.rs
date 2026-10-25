@@ -1,6 +1,8 @@
 //! The splittable placement token.
 
 use crate::awake::Awake;
+#[cfg(feature = "parallel")]
+use crate::awake::LendGuard;
 use crate::error::{Error, Refused};
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
@@ -538,6 +540,9 @@ impl<'p> Exec<'p> {
             if self.budget.get() > 1 {
                 let width = self.budget;
                 let _released = self.track.release();
+                // A team token lends its reserved members to the pool for the
+                // call: the library's Rayon work runs on them as well.
+                let _lent = self.team.map(|t| LendGuard::new(t.awake, t.ids));
                 return sched::enter(pool, &self.track, move || f(width));
             }
         }

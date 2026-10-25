@@ -55,9 +55,9 @@ mod track;
 
 pub use error::{Error, Refused};
 pub use exec::Exec;
-pub use policy::{WaitOverride, WaitPolicy};
+pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
 pub use pool::{Pool, PoolBuilder};
-pub use reserve::Team;
+pub use reserve::{IntoTeamError, Team};
 pub use team::{Cancelled, Participant, TeamExec};
 
 #[cfg(test)]

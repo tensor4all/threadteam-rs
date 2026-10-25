@@ -1,6 +1,6 @@
 # Serial and parallel thresholds derived from the token's dispatch cost
 
-Status: phase 2 implemented for `threadteam` and the faer fork (`exp/par-team-lifetime`, draft PR
+Status: phase 2 implemented for `threadteam` and every gate of the faer fork (`exp/par-team-lifetime`, draft PR
 tensor4all/faer#61); strided-rs, tcontract-rs, cpueinsum-rs and tlinalg-rs still use their own constants
 (section 3.4). All numbers are from one Apple M5 Max (6 threads, QoS `UserInitiated`) on an interactive
 laptop, so they are rough; final acceptance needs a quiet Linux host, including x86_64.
@@ -30,35 +30,39 @@ Data: [`thresholds-data/tables.md`](thresholds-data/tables.md) (every table), ra
 "Work" is what the comparison counts. Kinds of token: **T** team token, **P** plain token (outside or
 inside its pool). A threshold written once applies to every kind of token today, which is the problem.
 
-### faer (t4a-faer `exp/par-team-lifetime`, measured at `8f45c43`; paths under `faer/src/`)
+### faer (t4a-faer `exp/par-team-lifetime` at `6788b20`; paths under `faer/src/`)
 
-| Where | Work compared | Value today | Token |
+Every gate is `pays(estimate, sections, width)` with `PAYS = 3` (section 3.1). The estimate is work times the
+serial rate of the family (section 2.3), `sections` is counted in the code of the gate. A shape condition that
+states a concern other than cost stays and is named. Token: **T** team, **P** plain; the rule reads the token.
+
+| Where | Work compared | Estimate (rate) | Sections |
 | --- | --- | --- | --- |
-| `linalg/matmul/mod.rs:1442` to `1465` (x86_64 private GEMM route) | `2 or 8 * m*n*k` flops against `2 * gemm::get_threading_threshold()` | `m*n*k >= 589824` (real), `>= 147456` (complex) | P |
-| `gemm-common-0.19.0/src/gemm.rs:109`, `:398` to `:407`, `:516` (aarch64 and generic route, dependency) | `m*n_chunk*k_chunk` MACs, threshold divided by 4 for c32 and 16 for c64 | `48*48*256 = 589824` (real), `36864` (c64) | P |
-| `utils/team.rs:280` (`gemm_tiled`, team route on every arch) | `m*n*k` MACs, no scaling by dtype | `>= 589824` for real and complex | T |
-| `linalg/matmul/mod.rs:774`, `:894` (matvec variants) | `nrows*ncols` of the matrix | `< 256*256` stays serial | T, P |
-| `linalg/matmul/internal/mod.rs:72` to `77` | `m*n*k` MACs | `> 32*32*32 = 32768` | T, P |
-| `linalg/matmul/triangular.rs:125` | `n*n*m` | `< 128*128*64` serial | T, P |
-| `linalg/matmul/triangular.rs:694` | `n*n*k` | `< 128*128*128` serial | T, P |
-| `linalg/lu/partial_pivoting/factor.rs:137` (default at `:274`) | trailing update area, `2 or 8 * rows*cols` against `2 * par_threshold` | `par_threshold = 128*128 = 16384` | T, P |
-| `linalg/lu/partial_pivoting/factor.rs:183` | swap stage `m*(ncols-n)` elements | `> 16384`, not scaled by dtype | T, P |
-| `linalg/lu/full_pivoting/factor.rs:372` (default at `:446`) | `(m-k-1)*(n-k-1)` per step | `par_threshold = 256*512` | T, P |
-| `linalg/cholesky/bunch_kaufman/factor.rs:328` (default at `:911`) | `rem*rem` per step | `par_threshold = 128*128` | T, P |
-| `linalg/qr/col_pivoting/factor.rs:244` (default at `:106`) | `(m-k-1)*(n-k-1)` per step | `par_threshold = 192*256` | T, P |
-| `linalg/qr/no_pivoting/factor.rs:126` | declared, not read | `192*256` | none |
-| `linalg/svd/bidiag.rs:108` (default at `:31`) | `(m-k-1)*(n-k-1)` per step | `par_threshold = 192*256` | T, P |
-| `linalg/evd/hessenberg.rs:291` (default at `:20`) | `n*n` per step | `par_threshold = 192*256` | T, P |
-| `linalg/evd/tridiag.rs:322` (default at `:17`) | `rem*rem/2` per step | `par_threshold = 192*256` | T, P |
-| `linalg/householder.rs:160` | rows below the basis, `n`, threads, `deep_rows*n*n` | `deep_rows >= 2n`, `>= 4*threads`, `deep_rows*n*n >= 8192` | T, P |
-| `linalg/householder.rs:224`, `:478`, `:609` | same family: `rows*n*n`, `nrows*ncols`, `M*K` | `>= 8192` (with the `2n` and `4*threads` shape rules) | T, P |
-| `linalg/triangular_solve.rs:439`, `:520` | right hand sides `k` and order `n` (a split, not a work floor) | `k > 64 && n <= 128` | T, P |
-| `sparse/linalg/matmul.rs:115`, `:171` | none | no floor, width taken as given | T, P |
+| `linalg/matmul/mod.rs` (x86_64 private route, aarch64 and generic `gemm` route), `utils/team.rs` (`gemm_tiled`) | `m*n*k` multiply-adds | GEMM rate of the dtype; the `gemm` crate keeps its own lower floor under it | 1 |
+| `linalg/lu/partial_pivoting/factor.rs` trailing update | `cols * (b*b/2 + rows*b)` multiply-adds | GEMM rate | 2 (solve and product, the second on cold caches) |
+| same, swap stage | `n * cols` row swaps | 0.55 ns per swap (memory bound) | 4 (provisional) |
+| `linalg/lu/full_pivoting/factor.rs` per step | `(m-k-1)*(n-k-1)` elements | LU full pivoting rate | 1 |
+| `linalg/cholesky/bunch_kaufman/factor.rs` (full pivoting) per step | `rem*rem` | Bunch-Kaufman rate | 1 |
+| `linalg/qr/col_pivoting/factor.rs` per step | `(m-k-1)*(n-k-1)` | QR column pivoting rate | 1 |
+| `linalg/qr/no_pivoting/factor.rs` | no gate of its own | delegates to the Householder and product gates | |
+| `linalg/svd/bidiag.rs` per step | `(m-k-1)*(n-k-1)` | bidiagonalization rate | 2 (fused update or `y2`, and `z2`) |
+| `linalg/evd/hessenberg.rs` (unblocked) per step | `n*n` of the trailing block | Hessenberg rate | 2 (two products) |
+| `linalg/evd/tridiag.rs` per step | `rem*rem/2` | tridiagonalization rate | 1 |
+| `linalg/householder.rs` `upgrade_householder_factor` (two sites) | `deep_rows * n * n` multiply-adds | GEMM rate | 1 |
+| same, shape conditions | `deep_rows >= 2n` (reduction deep against its `n x n` output), `>= 4 * threads` (rows per task) | not a cost, kept | |
+| `linalg/householder.rs` rank one apply (`N == 1`) | `M*K` target elements | rank one apply rate | 1 |
+| same, row split | `M*N*K` multiply-adds; shape: `M >= 2K`, `M >= 4 * threads`, chunk covers `N` | GEMM rate | 1 |
+| same, column split | `(1 or 2) * M*N*K` multiply-adds at width `n_tasks` | GEMM rate | 1 |
+| `linalg/matmul/mod.rs` matvec (both layouts) | `nrows*ncols` | matvec rate | 1 |
+| `linalg/matmul/internal/mod.rs` `spicy_matmul` | `nrows*ncols*depth` | GEMM rate | 1 |
+| `linalg/matmul/triangular.rs` product with a triangular right side | `m*n*n/2` | GEMM rate | 1 per level |
+| same, product into a triangle | `n*n*k/2` | GEMM rate | 2 per level (outer join, join in its second half) |
+| `linalg/triangular_solve.rs` (two sites) | `n*n*k/2`; the split for `k > 64 && n <= 128` is a shape rule, taken for every parallelism | GEMM rate | 1 (the join) |
+| LLT, LDLT, Bunch-Kaufman with partial pivoting | no gate of their own | the product and solve gates | |
+| `bidiag_svd.rs` and `tridiag_evd.rs` joins, `triangular_inverse.rs`, norm reductions, `zip`, `sparse/linalg/matmul.rs` | none | no work gate (not converted) | |
 
-The `par_threshold` fields in `bidiag`, `col_pivoting`, `hessenberg` and `tridiag` count elements of a
-trailing submatrix, so they are time floors of different sizes per kernel (a rank-one update, a
-Householder pass, a matrix-vector product). The data below shows that one number cannot be right for
-both kinds of token.
+`ParThreshold { Derived, Fixed(n), Never }` is the one type of every `par_threshold` field of these families
+(`Derived` is the default and is the table above; `Fixed(n)` is an explicit floor in the unit of the field).
 
 ### strided-rs (main, `d24474d`)
 
@@ -213,17 +217,38 @@ Findings that change the proposal:
 
 ### 2.3 Serial throughput constants (nanoseconds per unit, one thread)
 
-Median of the `seq` mode, from the L2 resident shapes of the sweeps ([`tables.md`](thresholds-data/tables.md)).
+Median of the one thread (`seq`) measurements. The first block is from the L2 resident shapes of the sweeps
+([`tables.md`](thresholds-data/tables.md)). The faer blocks are from the dedicated program of faer-benchmark
+`data/probes/20261026-threshold-recalibration/constants/` (the in-place routine of each family timed with
+`Par::Seq`, shapes 96 to 384, 768 for matvec, primed 250 ms, median of at least 9 repetitions, two processes per
+group, QoS `UserInitiated`; the unit is the one the gate counts and the time is the whole serial operation over the
+sum of its per-step units, so a step includes its serial parts). Host protocol of that program: idle at least
+85 percent and no other cargo, rustc, fbench or test process before each process, idle, load and the top 3
+consumers recorded before and after, a process below 85 percent idle before or after is marked busy. Idle before
+was 85.2 to 92.6 percent; 4 of 22 processes ended below 85 percent idle (74 to 78 percent for a few seconds,
+cause not identified), among them both Hessenberg processes, whose values (range 0.42 to 0.53 for f64) are used
+as measured and marked below.
 
-| family | unit | ns per unit | range over shapes |
-| --- | --- | --- | --- |
-| faer GEMM f64 (and tcontract matmul) | MAC | 0.037 | 0.034 to 0.040 (`16^3` is 0.07) |
-| faer GEMM c64 | complex MAC | 0.165 | 0.162 to 0.172 |
-| faer LU f64 | flop (`2/3 n^3`) | 0.030 | 0.059 at 64, 0.038 at 128, 0.029 at 256, 0.021 at 768 |
-| strided copy f64 | element | 0.090 | 0.065 to 0.105 |
-| strided map `2x+1` f64 | element | 0.100 | 0.073 to 0.129 |
-| strided map `exp` f64 | element | 1.38 | 1.36 to 1.39 |
-| strided `sum` f64 | element | 0.081 | 0.078 to 0.083 |
+| family | unit | f64 | c64 | range over shapes (f64) |
+| --- | --- | --- | --- | --- |
+| faer GEMM (and tcontract matmul) | MAC | 0.037 | 0.165 | 0.034 to 0.040 (`16^3` is 0.07) |
+| faer LU f64 (partial pivoting, whole) | flop (`2/3 n^3`) | 0.030 | | 0.059 at 64, 0.038 at 128, 0.029 at 256, 0.021 at 768 |
+| faer LU full pivoting step | element of the trailing block | 0.216 | 0.600 | 0.204 to 0.248 |
+| faer Bunch-Kaufman (full pivoting) step | element `rem^2` | 0.238 | 0.380 | 0.205 to 0.263 |
+| faer QR with column pivoting step | element of the trailing block | 0.202 | 0.713 | 0.187 to 0.232 |
+| faer bidiagonalization step | element of the trailing block | 0.480 | 1.36 | 0.429 to 0.600 |
+| faer Hessenberg step (unblocked), busy processes | element `n^2` | 0.451 | 1.57 | 0.419 to 0.535 |
+| faer tridiagonalization step | element of the triangle `rem^2/2` | 0.339 | 1.16 | 0.299 to 0.422 |
+| faer matvec, column major / row major | matrix element | 0.112 / 0.087 (used: 0.100) | 0.281 / 0.425 (used: 0.340) | 0.087 to 0.138 |
+| faer rank one Householder apply | target element `M*K` | 0.212 | 0.725 | 0.204 to 0.223 |
+| faer block apply, triangular product, triangular solve | MAC | 0.037, 0.039, 0.051 (use the GEMM rate) | 0.165, 0.176, 0.187 | |
+| strided copy f64 | element | 0.090 | | 0.065 to 0.105 |
+| strided map `2x+1` f64 | element | 0.100 | | 0.073 to 0.129 |
+| strided map `exp` f64 | element | 1.38 | | 1.36 to 1.39 |
+| strided `sum` f64 | element | 0.081 | | 0.078 to 0.083 |
+
+`f32` and `c32` are half of `f64` and `c64` (twice the lanes per register, half the bytes); only the GEMM was
+checked (0.019 and 0.084). A scalar that is not native takes the `f64` or `c64` rate, a lower bound of its time.
 
 ## 3. Design
 
@@ -284,11 +309,13 @@ Steady-state defaults (Apple M5 Max, 6 threads, `UserInitiated`), microseconds, 
 
 ### 3.2 Throughput constants (one per kernel family, in the crate that owns the kernel)
 
-The values of section 2.3 become named constants with a reference to the bench that produces them
-(`NS_PER_MAC_F64 = 0.037`, `NS_PER_MAC_C64 = 0.165`, `NS_PER_FLOP_LU = 0.030`, `NS_PER_ELEM_COPY = 0.090`,
-`NS_PER_ELEM_MAP = 0.100`, `NS_PER_ELEM_EXP = 1.38`, `NS_PER_ELEM_SUM = 0.081`). tcontract's
-`NS_PER_FLOP` becomes 0.0185 and `muladds_per_ns` 27 (from 10). The throughput does not depend on the
-token, so one set serves all kinds.
+The values of section 2.3 are named constants with a reference to the bench that produces them. faer:
+`utils::cost::ns_per_mac` (GEMM) and `utils::cost::rate` (`Rate { real, cplx }`: `LU_FULL_PIVOT`,
+`BUNCH_KAUFMAN`, `QR_COL_PIVOT`, `BIDIAG`, `HESSENBERG`, `TRIDIAG`, `MATVEC`, `HOUSEHOLDER_RANK_ONE`,
+`GEMM_MAC`), `NS_PER_SWAP = 0.55`. Planned for the other crates: `NS_PER_ELEM_COPY = 0.090`,
+`NS_PER_ELEM_MAP = 0.100`, `NS_PER_ELEM_EXP = 1.38`, `NS_PER_ELEM_SUM = 0.081`; tcontract's `NS_PER_FLOP`
+becomes 0.0185 and `muladds_per_ns` 27 (from 10). The throughput does not depend on the token, so one set serves
+all kinds.
 
 ### 3.3 Resulting thresholds at 6 threads (`PAYS = 3`, `sections = 1`)
 
@@ -312,45 +339,46 @@ today's constant for copy, map and `sum` (a copy at 32768 elements is 5.6 times 
 and 1.3 times for `exp`. On the team token the strided thresholds are 1.3 to 1.6 times today's constant
 for copy, map and `sum` and 11 times lower for `exp`, and the GEMM threshold is 5.2 times lower.
 
-Composite kernels (LU, QR, Cholesky, SVD and EVD steps): the rule applies per region, with the region's
-own flops or bytes and one dispatch cost, in place of the per kernel `par_threshold`; the field stays as
-an explicit override. Measured against that, two rules need their own multiple: the swap stage of LU
-(memory bound, a split costs about 13 us on a team at 18 thousand elements) is treated as a region with
-`sections = 4` so that it needs about 17 us of serial work, and regions inside a factorisation that
-run on cold caches (every region after the first) use `sections = 2`, from the 3 us per section
-measured in the LU at `n = 192`. These two numbers are provisional; the rough M5 check below does not
-contradict them, and acceptance is on a quiet Linux host.
+Composite kernels (LU, QR, Cholesky, SVD and EVD steps): the rule applies per region, with the region's own work
+at the family's own rate and the number of dispatches the region performs, in place of the per kernel
+`par_threshold` constant; the field is the one type `ParThreshold { Derived, Fixed, Never }`, so an explicit
+override is `Fixed`. The LU swap stage (memory bound, a split costs about 13 us on a team at 18 thousand elements)
+declares `sections = 4` and the trailing update of an LU level `sections = 2` (solve and product, the second on
+cold caches, from the 3 us per section measured in the LU at `n = 192`); both numbers are provisional, every
+other count is read from the code. Derived floors at width 6 (`PAYS * sections * D / rate`, f64, team 1.4 us and
+outside the pool 19 us of dispatch): full pivoting LU 19 thousand elements of the trailing block on a team and 264
+thousand outside; column pivoting QR 21 thousand and 282 thousand; bidiagonalization (two sections) 17.5 thousand
+and 237 thousand; tridiagonalization 12 thousand and 168 thousand (of the triangle); matvec 42 thousand and 570
+thousand matrix elements. The previous constants were `192 * 256 = 49152` elements for the last four families on
+every token.
 
 ### 3.4 What changed and what remains
 
 Done in `threadteam`: the API above, the defaults table, tests, `placement.md` and the README table.
 
-Done in faer (`exp/par-team-lifetime`):
+Done in faer (`exp/par-team-lifetime`, `6788b20`): every gate of the inventory table of section 1 except the ones
+the last row names.
 
-* The GEMM floors of `matmul/mod.rs` (x86_64 private kernel and the aarch64 and generic `gemm` crate route)
-  and `utils/team.rs` (`gemm_tiled`) are `pays(estimate, 1, width)` with the serial throughput of the dtype
-  (`utils::cost::ns_per_mac`: f64 0.037, c64 0.165 per complex MAC; f32 and c32 are those halved, documented
-  scaling, see the worklog for the one-thread check). This fixes the team route, which compared `m*n*k`
-  against the real floor for complex products too. Derived floors at width 6 (`PAYS * D`: team 4.2 us,
-  outside 57 us): f64 113 thousand MACs on a team (`48^3`) and 1.54 million outside (`115^3`); c64 25 thousand
-  (`29^3`) and 345 thousand (`70^3`). The `gemm` crate keeps its own floor under faer's, which is lower than
-  faer's on every kind of token that reaches it.
-* LU (`partial_pivoting/factor.rs`): `par_threshold` is a per-region rule. `PartialPivLuParams::par_threshold
-  == 0` (the new default) derives each region from its serial time. The trailing update (triangular solve and
-  product, `cols * (b*b/2 + rows*b)` MACs at the dtype's GEMM rate) declares `sections = 2`; the swap stage
-  (`n * cols` row swaps at 0.55 ns each, measured one thread, random pivots, cache resident) declares
-  `sections = 4`. Both counts are provisional and stay separate rules. Any other value of `par_threshold`
-  restores the old fixed floors (`work > 2 * par_threshold` for the update, `m * cols > par_threshold` for the
-  swap) and `usize::MAX` disables parallelism; `0` therefore no longer means "always parallel" (use 1).
-* The unused `par_threshold` of `qr/no_pivoting` (`QrParams`) is removed.
+* GEMM floors (`matmul/mod.rs`, `utils/team.rs`): `pays(estimate, 1, width)` with the GEMM rate of the dtype
+  (`utils::cost::ns_per_mac`; the team route used to compare `m*n*k` with the real floor for complex products).
+* LU (`partial_pivoting/factor.rs`): trailing update 2 sections, swap stage 4 sections (provisional).
+* The other composite regions and the Householder, matvec, `spicy_matmul`, triangular product and triangular solve
+  gates of the table: `ParThreshold::region_pays` or `par_pays` with the rate and the section count of the table.
+  `ParThreshold { Derived, Fixed(n), Never }` is the type of every `par_threshold` field (`Fixed(n)` keeps the old
+  floor in the unit the field documents; the C API maps 0 to `Derived` and `usize::MAX` to `Never`); the unused
+  `QrParams::par_threshold` and its `faer-ffi` mirror are removed.
+* Shape conditions that are not costs (`2n`, `4 * threads`, `M >= 2K`, the chunk covering the unit block, the
+  `k > 64 && n <= 128` split) stay and are commented at the gate.
+* Tests: the derived floors per family against the rule on the M5 table (`utils::cost::tests`), forced parallel
+  steps of the six reductions equal the serial ones, the Householder, matvec, triangular product and solve
+  parallel routes equal the serial ones above the floors (`householder::gate_tests`); `cargo test --release
+  --lib` with `std rayon threadteam` and with default features passes except the three known `strict_triangle`
+  cases.
 
-Remaining work in faer (thresholds unchanged, each a time floor of a different size per kernel):
-`lu/full_pivoting/factor.rs:372` (`256*512`), `cholesky/bunch_kaufman/factor.rs:328` (`128*128`),
-`qr/col_pivoting/factor.rs:244`, `svd/bidiag.rs:108`, `evd/hessenberg.rs:291` and `evd/tridiag.rs:322`
-(`192*256`), `householder.rs:160`, `:224`, `:478`, `:609`, `:626` (`gemm::get_threading_threshold`),
-`matmul/mod.rs:774`, `:894` (matvec), `matmul/internal/mod.rs:72`, `matmul/triangular.rs:125`, `:694`,
-`triangular_solve.rs:439`, `:520`. The `faer-ffi` mirror of `QrParams` (outside the workspace) still names
-the removed field.
+Remaining work in faer: the divide and conquer joins of `bidiag_svd.rs` and `tridiag_evd.rs`,
+`triangular_inverse.rs`, the norm reductions, `zip` and `sparse/linalg/matmul.rs` have no work gate. The f32 and
+c32 rates of the families other than the GEMM are halved, not measured. The Hessenberg constant is from processes
+marked busy.
 
 Remaining work in the other repositories (later task):
 
@@ -382,6 +410,23 @@ per cell, no busy process, new floors against the previous revision; times are t
 Serial rates on one thread: f32 0.019 and c32 0.084 ns per MAC, within 10 percent of the halved f64 and c64
 constants used for them.
 
+Remaining regions (`data/probes/20261026-threshold-recalibration/`, f64, 6 threads, four processes per build at 6
+threads and three serial, none busy; ratio to one thread serial, before is t4a-faer `9cd64f0`, after `6788b20`;
+times in microseconds are in the probe README):
+
+| cell | plain before | plain after | team before | team after |
+| --- | --- | --- | --- | --- |
+| QR factorization 128, 256, 512 | 2.49, 1.99, 1.22 | 1.01, 0.80, 0.48 | 0.72, 0.61, 0.41 | 0.85, 0.58, 0.41 |
+| Cholesky 128, 256, 512 | 1.00, 0.96, 0.57 | 1.00, 1.00, 0.60 | 1.00, 0.68, 0.41 | 1.00, 0.68, 0.41 |
+| SVD (values) 128, 256, 512 | 0.82, 1.05, 1.09 | 0.82, 0.87, 0.88 | 0.82, 1.05, 1.09 | 0.82, 0.87, 0.88 |
+| EVD (eigh) 128, 256, 512 | 1.24, 0.81, 0.69 | 1.01, 0.81, 0.66 | 1.23, 0.79, 0.69 | 1.01, 0.81, 0.66 |
+
+The plain token is no longer slower than serial at 128 and 256 for QR and at 128 for the eigensolver. QR at 128 on
+a team is worse than before (86 us to 102 us, serial 120 us); the cause is not established (candidate: the
+Householder regions of the blocked QR at shapes whose GEMM rate is below the L2 resident rate of the constant,
+`16^3` is 0.07 ns per MAC against 0.037). SVD at 128 is 0.82 for every 6 thread row, before and after: the
+parallel joins of `bidiag_svd` have no gate.
+
 ## 4. Limits of this data
 
 * One host, rough, 6 threads only (widths 2 and 4 only for the dispatch cost), one process per mode
@@ -394,4 +439,6 @@ constants used for them.
   the same sequential kernel (for instance `gemm_sq 32^3`) they differ by up to 5 percent, so ratios
   between 0.95 and 1.05 are not significant.
 * The LU `sections` multiples, the team token inside tcontract and the c64 team floor are findings or
-  estimates to be verified when implemented, not results.
+  estimates to be verified when implemented, not results. The rates of the faer reductions include the serial
+  parts of a step and are measured on L2 resident shapes; the QR 128 team cell shows that small shapes can sit
+  above them.

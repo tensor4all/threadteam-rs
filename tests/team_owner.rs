@@ -413,3 +413,46 @@ fn the_team_owns_the_pool_and_dropping_it_joins_the_workers() {
     drop(team); // members leave, the pool is dropped and joins its workers
     assert!(t.elapsed() < Duration::from_secs(5));
 }
+
+#[test]
+fn the_wake_tree_never_loses_a_member_when_parents_start_before_publication_ends() {
+    let _w = watchdog();
+    let team = pool(18, Duration::from_micros(300)).into_team(18).unwrap();
+    let mut exec = team.exec(18);
+    for i in 0..400u64 {
+        // Sleep around the park delay so that some members spin and some park.
+        std::thread::sleep(Duration::from_micros(100 + (i * 37) % 900));
+        let n = AtomicUsize::new(0);
+        exec.reborrow().fork(18, |_, _| {
+            n.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(n.load(Ordering::SeqCst), 18, "iteration {i}");
+    }
+}
+
+#[test]
+fn cold_scoped_teams_with_zero_spin_never_lose_a_member() {
+    let _w = watchdog();
+    // Zero spin: members park at once, so every acquisition and every
+    // section meets parked members.
+    let pool = Pool::builder()
+        .threads(12)
+        .idle_spin(Duration::ZERO)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut exec = Exec::new(&pool, 12).unwrap();
+    for i in 0..300 {
+        while pool.resident_members() != 0 {
+            std::hint::spin_loop();
+        }
+        let n = AtomicUsize::new(0);
+        exec.team(|t| {
+            t.run(|_, _| {
+                n.fetch_add(1, Ordering::SeqCst);
+            })
+        })
+        .unwrap();
+        assert_eq!(n.load(Ordering::SeqCst), 12, "iteration {i}");
+    }
+}

@@ -169,6 +169,7 @@ impl Awake {
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
         }
+        section.published.store(true, Ordering::Release);
         for pos in 0..n.min(WAKE_FANOUT) {
             self.slots[section.slot(pos)].wake();
         }
@@ -503,6 +504,10 @@ pub(crate) struct Section {
     arrived: Padded<AtomicUsize>,
     epoch: Padded<AtomicUsize>,
     cancelled: AtomicBool,
+    /// Set by the leader once every target's generation is bumped. A member
+    /// unparks its children only after that: a child woken earlier would see
+    /// its old generation, park again, and nobody would wake it.
+    published: AtomicBool,
     /// First panic payload, boxed twice so that it fits an `AtomicPtr`.
     /// (A `Mutex` would allocate on first use on some platforms.)
     panic: AtomicPtr<Box<dyn Any + Send>>,
@@ -532,6 +537,7 @@ impl Section {
             arrived: Padded(AtomicUsize::new(0)),
             epoch: Padded(AtomicUsize::new(0)),
             cancelled: AtomicBool::new(false),
+            published: AtomicBool::new(false),
             panic: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -547,6 +553,13 @@ impl Section {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     fn wake_children(&self, aw: &Awake, arg: usize) {
         let first = WAKE_FANOUT * arg;
+        if first >= self.dispatched {
+            return;
+        }
+        let mut spins = 0;
+        while !self.published.load(Ordering::Acquire) {
+            backoff(&mut spins);
+        }
         for child in first..first + WAKE_FANOUT {
             if child >= self.dispatched {
                 break;

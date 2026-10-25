@@ -278,6 +278,31 @@ impl<'p> Exec<'p> {
         self.budget.get() == 1
     }
 
+    /// Whether this token carries team authority: it was minted by a
+    /// [`Team`](crate::Team) or is a child of such a token. Its sections are team
+    /// sections ([`DispatchKind::Team`]) and [`team`](Exec::team) returns the
+    /// carried (sub)team at once, without acquisition, so a consumer that wants a
+    /// [`TeamExec`] (faer's `Par::Team`) asks this first and keeps
+    /// [`external`](Exec::external) for plain tokens, whose `team` would reserve
+    /// members.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Exec, Pool};
+    ///
+    /// assert!(!Exec::serial().carries_team());
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
+    /// assert!(!Exec::new(&pool, 2)?.carries_team());
+    /// if let Ok(team) = pool.into_team(2) {
+    ///     assert!(team.exec(2).carries_team());
+    /// }
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn carries_team(&self) -> bool {
+        self.team.is_some()
+    }
+
     /// Narrows the token to at most `max` slots.
     ///
     /// The result has budget `min(budget, max)` and the same pool; the dropped

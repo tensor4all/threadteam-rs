@@ -552,6 +552,40 @@ chunk-owned partials, fixed merge order): the crate gives no stealing within a
 team, so a section's shares are exactly the participants. Cache-domain layout and
 pinning are not handled.
 
+## Dispatch cost and the parallel rule
+
+A token states what one parallel section costs it; a kernel states how long its
+region takes on one thread (`docs/design/thresholds.md` has the data). A region
+runs in parallel when
+
+```
+serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
+```
+
+* `Exec::dispatch_cost(width)` and `TeamExec::dispatch_cost(width)` return
+  `D(width)`, the steady-state cost of one section (back to back, shares that
+  carry work). A serial token, `width < 2`, or a team of one gives
+  `Duration::MAX`; `width` is clamped to the budget.
+* The kind of token is read at call time: team authority (`Team` tokens and their
+  `fork` children) is `DispatchKind::Team`; a plain token whose caller is a worker
+  of its pool is `InPool`; a plain token called from outside is `Outside`. No
+  thread-local state is involved and nothing allocates.
+* `DispatchCosts` holds one `WidthCosts` per kind (values at widths 2, 4 and 6,
+  linear in between, proportional to the width above 6).
+  `DispatchCosts::host_default()` is the measured Apple M5 table on macOS with
+  aarch64 and a conservative flat table (3, 15, 40 microseconds) elsewhere;
+  `PoolBuilder::dispatch_costs` overrides it.
+* `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
+  `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,
+  sections)` (and `width_for_by` for a consumer's own cost function) returns the
+  width in `1..=budget` that minimises `sections * D(k) + estimate / k` among the
+  widths that pay, or 1.
+* `sections` is the number of dispatches the region really performs. It is a
+  count, not a tuning knob: a region that enters the token twice declares 2.
+* The costs are steady-state values. The wake penalty after members parked (about
+  27 microseconds on the measured host) is documented and is not folded into
+  `PAYS` or the table.
+
 ## Planned: one pool per cache domain
 
 A `Pool` built with a domain layout holds one Rayon pool per shared-cache

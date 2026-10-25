@@ -196,7 +196,7 @@ impl<'p> Exec<'p> {
     ///   [`DispatchKind::InPool`];
     /// * a plain token whose caller is outside the pool: [`DispatchKind::Outside`].
     ///
-    /// The numbers come from the pool's [`DispatchCosts`] (see
+    /// The numbers come from the pool's [`DispatchCosts`](crate::DispatchCosts) (see
     /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)). The
     /// call allocates nothing and reads no thread-local state of this crate.
     /// The answer depends on the calling thread, so ask it on the thread that

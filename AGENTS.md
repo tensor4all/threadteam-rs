@@ -33,6 +33,11 @@ Design record: `docs/design/placement.md`. Durable invariants:
 - **Allocation-free steady state**: `tests/alloc_free.rs` must pass; do not add
   allocation to the entry paths.
 - `Exec` stays neither `Clone` nor `Copy` (compile-fail doctests).
+- **Synchronization changes are model-checked**: any change to the park/wake
+  core (`src/park.rs`, `src/sync.rs`, member slots, section publication and
+  completion) must pass the loom models in `tests/loom_park.rs`, and a new
+  wait or wake path gets its own loom model before it lands. Keep the models
+  small (one leader, two members).
 
 ## Pre-push checklist
 
@@ -43,6 +48,7 @@ cargo clippy --all-targets --no-default-features -- -D warnings
 cargo test
 cargo test --all-features
 cargo test --no-default-features
+RUSTFLAGS="--cfg loom" cargo test --release --test loom_park
 cargo deny check bans
 scripts/check-no-public-rayon.sh      # needs cargo-public-api and a nightly toolchain
 cargo doc --no-deps

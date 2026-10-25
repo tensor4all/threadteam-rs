@@ -1,7 +1,7 @@
 //! Reserved awake members: the scoped authority [`TeamExec`].
 
 use crate::awake::{Awake, JoinGuard, Section};
-use crate::cost::{pays_at, width_for_by, DispatchKind};
+use crate::cost::{pays_at, width_for_by, DispatchCosts, DispatchKind};
 use crate::error::Error;
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::split;
@@ -242,6 +242,24 @@ impl<'team> TeamExec<'team> {
             Some(awake) if width.get() >= 2 => awake.costs.cost(DispatchKind::Team, width),
             _ => Duration::MAX,
         }
+    }
+
+    /// The [`DispatchCosts`] of the pool this team belongs to
+    /// ([`DispatchCosts::host_default`] for a team of one that never touched a
+    /// pool). For consumers that carry a shape of the team without the authority.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{DispatchCosts, Exec};
+    ///
+    /// Exec::serial().team(|team| {
+    ///     assert_eq!(team.dispatch_costs(), DispatchCosts::host_default());
+    /// }).unwrap();
+    /// ```
+    pub fn dispatch_costs(&self) -> DispatchCosts {
+        self.awake
+            .map_or_else(DispatchCosts::host_default, |a| a.costs)
     }
 
     /// [`Exec::pays`](crate::Exec::pays) for this team.

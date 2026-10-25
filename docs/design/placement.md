@@ -367,7 +367,7 @@ per-call acquisition with `Exec::team` applies). The `Team` holds the `Pool` by
 value and has no lifetime and no `Arc` around the pool. When the members cannot
 all be reserved, `IntoTeamError` returns the pool together with the `Refused`
 reason and the caller falls back to plain tokens. Dropping the `Team` releases the
-members (zero idle spin, unparked) and then drops the pool, which joins the
+members (zero idle spin, woken) and then drops the pool, which joins the
 workers; `into_pool` releases the members and returns the pool instead. The
 only internal sharing is an `Arc` of the awake-member state that claim jobs
 hold; it is not a pool handle. `exec(budget)` mints a
@@ -406,29 +406,54 @@ involved (the owner's thread id is stored in the team).
 
 **Parking.** A reserved member that finds no new section for the park delay
 (the effective `idle_spin` of the reservation: the pool default or the
-`reserve_with` / `team_with` override) parks in `std::thread::park` and stays
-reserved. The protocol is a Dekker pair on sequentially consistent atomics: the
-member raises `parked`, re-checks `gen` and `state`, and parks only if neither
-changed; the leader bumps `gen` (or releasing stores `IDLE`), then reads `parked`
-and, when set, calls `unpark` on the member's thread. The `Thread` handle is a
-`OnceLock` in the member's slot, set once by the worker (a slot index is one
-worker thread for the life of the pool). No allocation happens on the dispatch
-path. Spurious wake-ups loop.
+`reserve_with` / `team_with` override) parks and stays reserved. All parked
+members of a pool wait on one condition variable (`park_lock`, `park_cv`), with
+a counter `parked` of members inside or entering the wait. The protocol:
 
-**Wake-up tree.** The leader first bumps the generation of every target, then
-unparks only the first `WAKE_FANOUT` (4) targets; every member that starts a
-share unparks its children, positions `4 * (pos + 1) ..` of the same target
-list (the section stores the target map on the leader's stack), reading only the
-`parked` flags of members that are awake. A member that parks concurrently
-re-checks its generation after raising `parked`, so no member sleeps through a
-published section. The latency is `O(log n)` unparks deep. Measured on an M5 Max
-under background load (`benches/wake_probe.rs`): one `unpark` call costs about
-4 us and a parked thread needs about 5 us to run, regardless of the protocol, so
-the first dispatch after a park costs roughly that per tree level; the tree
-shortens the serial chain of unparks, the floor is the syscalls. Waking
-many parked members faster needs a single wake-all primitive (futex
-wake-all, or `os_sync_wake_by_address_all` on macOS 14.4+) instead of per-thread
-`unpark`; that is not implemented. Release and lending unpark serially.
+* A member raises `parked` (acquire-release increment), takes the lock,
+  re-checks `gen`, `state` and `lent` and waits only while none changed; it
+  lowers `parked` when it leaves.
+* A leader changes the state a member waits on (bumps `gen`, stores `IDLE`,
+  sets `lent`), then reads `parked` with an acquire-release `fetch_add(0)`. If it
+  is nonzero, the leader takes and drops the lock and calls `notify_all`. Either the member sees the changed
+  state after raising `parked`, or the leader sees `parked` (both are read-modify-writes of one atomic, so the
+  argument needs only its modification order and release sequences, not a total
+  order of SeqCst accesses, which `loom` does not model); and because the
+  leader takes the lock before notifying, the notification cannot fall between a
+  member's check and its wait (the usual condition-variable handshake).
+* With nobody parked a dispatch pays one uncontended atomic read-modify-write. A broadcast also wakes
+  parked members of other teams of the same pool, which re-check and sleep again;
+  one broadcast replaces a chain of per-thread unparks, so the cost on the
+  leader is one syscall instead of one per member.
+* Spurious wake-ups loop. There is no per-member wake state and no tree: an
+  earlier per-member design (unparks fanned out through the members) lost a
+  wake-up when a woken member unparked a child before the leader had published
+  the child's generation; the broadcast design has no such ordering to get wrong.
+  `tests/team_owner.rs` keeps the stress that reproduced it (zero spin, cold
+  acquisitions, CPU burners, a watchdog).
+
+The handshake is the small `Parker` type in `src/park.rs`, built on a `sync`
+shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
+
+* **Model check.** `tests/loom_park.rs` runs the real `Parker` under `loom` with
+  one leader and two members: a published section, a released reservation, and a
+  member that parks twice. An earlier version of the handshake (a SeqCst store/load pair,
+  Dekker style) was reported as a deadlock by loom, which led to the
+  read-modify-write form above. CI job `loom`:
+  `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
+* **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a
+  test pause the member between raising `parked` and taking the lock, between its
+  re-check and its wait, and the leader between the state change and reading
+  `parked` (`tests/team_hooks.rs`). Deliberate breakages (`Mutation`: the member
+  skips its re-check, the leader skips the lock handoff) must stall in exactly
+  these interleavings, which shows the scenarios can see a lost wake-up; the real
+  protocol completes them in well under a second. The hooks cost nothing when the
+  feature is off.
+* Every team test has a watchdog that aborts the process when the test body
+  stalls.
+
+No allocation happens on the dispatch path. Dropping the team stores `IDLE`
+with a zero idle spin and broadcasts, so the members return to Rayon at once.
 
 **Quality of service.** `PoolBuilder::qos(Qos)` sets the class of each worker
 when it starts (`pthread_set_qos_class_self_np` on Apple targets, nothing
@@ -439,7 +464,7 @@ thread to at least the given class and never lowers it (the current class is
 read first); an engine calls it once for its leading thread. In the wake probe
 the class (builder default, explicit `Default`, `UserInteractive`) made no
 measurable difference to the wake latency on this host. Dropping the
-team stores `IDLE` with a zero idle spin and unparks, so the members return to
+team stores `IDLE` with a zero idle spin and wakes them, so the members return to
 Rayon at once.
 
 ### Waiting policy

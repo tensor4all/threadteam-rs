@@ -18,7 +18,7 @@ fn watchdog() -> impl Drop {
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        if rx.recv_timeout(Duration::from_secs(60)).is_err() {
+        if rx.recv_timeout(Duration::from_secs(45)).is_err() {
             eprintln!("watchdog: test stalled");
             std::process::exit(101);
         }
@@ -180,6 +180,7 @@ fn concurrent_mint_from_two_threads_serializes_the_leaders() {
 
 #[test]
 fn try_exec_reports_busy_and_exec_panics_on_reentry() {
+    let _w = watchdog();
     let team = pool(3, Duration::from_millis(1)).into_team(3).unwrap();
     let exec = team.exec(3);
     assert_eq!(team.try_exec(3).unwrap_err(), Refused::Busy);
@@ -267,6 +268,7 @@ fn a_panic_in_a_section_with_parked_members_propagates_and_keeps_the_team() {
 
 #[test]
 fn into_team_with_overrides_the_park_delay_and_zero_width_is_one() {
+    let _w = watchdog();
     let team = pool(3, Duration::from_secs(5))
         .into_team_with(0, WaitOverride::new().idle_spin(Duration::ZERO))
         .unwrap();
@@ -430,11 +432,48 @@ fn the_wake_tree_never_loses_a_member_when_parents_start_before_publication_ends
     }
 }
 
+/// Threads that burn CPU, so that team threads get preempted in the middle of
+/// publication and park/wake windows (the shared CI and developer hosts do the
+/// same by accident).
+fn burners(n: usize) -> impl Drop {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    struct Burners(Arc<AtomicBool>, Vec<std::thread::JoinHandle<()>>);
+    impl Drop for Burners {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+            for h in self.1.drain(..) {
+                let _ = h.join();
+            }
+        }
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = (0..n)
+        .map(|i| {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let mut x = i as u64 + 1;
+                while !stop.load(Ordering::Relaxed) {
+                    for _ in 0..2000 {
+                        x = x
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                    }
+                    std::hint::black_box(x);
+                    if x.trailing_zeros() >= 3 {
+                        std::thread::yield_now();
+                    }
+                }
+            })
+        })
+        .collect();
+    Burners(stop, handles)
+}
+
 #[test]
 fn cold_scoped_teams_with_zero_spin_never_lose_a_member() {
     let _w = watchdog();
-    // Zero spin: members park at once, so every acquisition and every
-    // section meets parked members.
+    let _burn = burners(std::thread::available_parallelism().map_or(2, |n| (n.get() / 4).max(2)));
     let pool = Pool::builder()
         .threads(12)
         .idle_spin(Duration::ZERO)
@@ -442,9 +481,9 @@ fn cold_scoped_teams_with_zero_spin_never_lose_a_member() {
         .build()
         .unwrap();
     let mut exec = Exec::new(&pool, 12).unwrap();
-    for i in 0..300 {
+    for i in 0..1500 {
         while pool.resident_members() != 0 {
-            std::hint::spin_loop();
+            std::thread::yield_now();
         }
         let n = AtomicUsize::new(0);
         exec.team(|t| {

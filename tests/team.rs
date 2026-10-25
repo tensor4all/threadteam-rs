@@ -19,7 +19,7 @@ fn watchdog() -> impl Drop {
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        if rx.recv_timeout(Duration::from_secs(60)).is_err() {
+        if rx.recv_timeout(Duration::from_secs(45)).is_err() {
             eprintln!("watchdog: test stalled");
             std::process::exit(101);
         }
@@ -90,6 +90,7 @@ fn every_participant_is_on_its_own_thread_and_the_caller_leads() {
 
 #[test]
 fn serial_and_budget_one_teams_run_inline_without_a_pool() {
+    let _w = watchdog();
     let here = std::thread::current().id();
     let mut serial = Exec::serial();
     let n = serial
@@ -277,6 +278,7 @@ fn split_with_leftover_members_and_even_fork() {
 
 #[test]
 fn invalid_splits_are_rejected_before_anything_runs() {
+    let _w = watchdog();
     let pool = pool(4);
     let mut exec = Exec::new(&pool, 4).unwrap();
     exec.team(|mut team| {

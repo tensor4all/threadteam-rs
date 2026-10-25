@@ -50,10 +50,9 @@ impl Drop for LeaderGuard<'_> {
 ///
 /// Reserved members spin for the reservation's `idle_spin`, then **park**
 /// while staying reserved: they do not return to Rayon until the `Team` is
-/// dropped. The next dispatch wakes them through a tree (the leader unparks
-/// four members, each woken member unparks its own children), which costs
-/// syscalls on the first dispatch after a park (`benches/wake_probe.rs`) and
-/// nothing for a warm one.
+/// dropped. The next dispatch wakes them with one condition-variable broadcast,
+/// which costs a syscall on the first dispatch after a park
+/// (`benches/wake_probe.rs`) and one atomic load for a warm one.
 ///
 /// # Serialization of callers
 ///

@@ -20,16 +20,16 @@
 //! A leader publishes a [`Section`] (a stack object) by writing its address
 //! and an argument into the member's slot and bumping `gen`; the member runs
 //! it and decrements the section's completion counter. Nothing is allocated
-//! per dispatch and no thread is woken.
+//! per dispatch; a member that parked is woken by one condition-variable
+//! broadcast.
 //!
 //! No thread-local state is used: a member's identity is its slot index.
 
 use crate::error::Refused;
+use crate::park::Parker;
 use crate::policy::WaitPolicy;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::any::Any;
-use std::sync::OnceLock;
-use std::thread::Thread;
 use std::time::Duration;
 
 const ABSENT: usize = 0;
@@ -37,9 +37,6 @@ const IDLE: usize = 1;
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 const YIELD: usize = 2;
 const RESERVED: usize = 3;
-
-/// Children per node of the wake-up tree (leader and woken members alike).
-pub(crate) const WAKE_FANOUT: usize = 4;
 
 /// Alignment that keeps a hot atomic on its own cache line pair (128 bytes
 /// covers Apple Silicon and adjacent-line prefetch on x86).
@@ -70,13 +67,9 @@ struct Slot {
     idle_yield: AtomicBool,
     /// How long a reserved member spins without work before it parks.
     park_ns: AtomicU64,
-    /// True while the member sleeps in `thread::park` (reserved and idle).
-    parked: AtomicBool,
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
-    /// The worker's thread; a slot index is one worker thread for the pool's life.
-    thread: OnceLock<Thread>,
 }
 
 impl Slot {
@@ -89,19 +82,7 @@ impl Slot {
             idle_spin_ns: AtomicU64::new(0),
             idle_yield: AtomicBool::new(false),
             park_ns: AtomicU64::new(u64::MAX),
-            parked: AtomicBool::new(false),
             lent: AtomicBool::new(false),
-            thread: OnceLock::new(),
-        }
-    }
-
-    /// Unparks the member if it sleeps. Pairs with `park_member` (SeqCst on
-    /// both sides: the state/generation change is ordered before this load).
-    fn wake(&self) {
-        if self.parked.load(Ordering::SeqCst) {
-            if let Some(t) = self.thread.get() {
-                t.unpark();
-            }
         }
     }
 }
@@ -109,6 +90,8 @@ impl Slot {
 /// Shared state of the awake members of one pool.
 pub(crate) struct Awake {
     slots: Box<[Slot]>,
+    /// Parked members sleep here; a leader that changed their state wakes them.
+    pub(crate) park: Parker,
     pub(crate) shutdown: AtomicBool,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
@@ -121,6 +104,7 @@ impl Awake {
     pub(crate) fn new(width: usize, defaults: WaitPolicy, acquire_timeout: Duration) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
+            park: Parker::new(),
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
@@ -145,34 +129,32 @@ impl Awake {
             s.idle_yield
                 .store(policy.idle_runs_rayon(), Ordering::Relaxed);
             s.state.store(IDLE, Ordering::SeqCst);
-            s.wake();
         }
+        self.wake_parked();
+    }
+
+    /// Wakes every parked member (see [`Parker`]). Called after the state a
+    /// member waits on (`gen`, `state`, `lent`) changed with SeqCst.
+    pub(crate) fn wake_parked(&self) {
+        self.park.wake();
     }
 
     /// Publishes `section` to its `n` targets (position `p` gets argument `p + 1`).
     ///
     /// The caller leads every target (its slot is `RESERVED` for the caller)
     /// and keeps `section` alive until its completion counter reaches zero.
-    ///
-    /// All generations are bumped first, then only the first `WAKE_FANOUT`
-    /// targets are unparked; every member that starts a share unparks its own
-    /// children in the same tree (`Section::wake_children`). A member that parks
-    /// concurrently re-checks its generation after raising `parked`, so none
-    /// can sleep through a published section.
+    /// Every generation is bumped, then parked members are woken by one
+    /// broadcast (a single atomic load when nobody sleeps).
     pub(crate) fn publish(&self, section: &Section) {
         let ptr = (section as *const Section).cast_mut();
-        let n = section.dispatched;
-        for pos in 0..n {
+        for pos in 0..section.dispatched {
             let s = &self.slots[section.slot(pos)];
             s.arg.store(pos + 1, Ordering::Relaxed);
             s.ptr.store(ptr, Ordering::Relaxed);
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
         }
-        section.published.store(true, Ordering::Release);
-        for pos in 0..n.min(WAKE_FANOUT) {
-            self.slots[section.slot(pos)].wake();
-        }
+        self.wake_parked();
     }
 
     /// Lends (or takes back) the members' threads to Rayon: while lent, a
@@ -181,9 +163,9 @@ impl Awake {
     pub(crate) fn lend(&self, ids: &[usize], on: bool) {
         for &id in ids {
             self.slots[id].lent.store(on, Ordering::SeqCst);
-            if on {
-                self.slots[id].wake();
-            }
+        }
+        if on {
+            self.wake_parked();
         }
     }
 
@@ -376,7 +358,6 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
         }
         return;
     }
-    let _ = slot.thread.get_or_init(std::thread::current);
     let seen = slot.gen.load(Ordering::Acquire);
     let epoch = aw.release_epoch.load(Ordering::Relaxed);
     match acq.join() {
@@ -420,7 +401,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                         let since = *reserved_since.get_or_insert_with(Instant::now);
                         let park_ns = slot.park_ns.load(Ordering::Relaxed);
                         if since.elapsed().as_nanos() >= u128::from(park_ns) {
-                            park_member(slot, seen);
+                            park_member(aw, slot, seen);
                             reserved_since = None;
                             spins = 0;
                         }
@@ -434,7 +415,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                     // SAFETY: the leader keeps the section alive until its
                     // completion counter reaches zero, which happens only
                     // after this call decremented it.
-                    unsafe { Section::execute_member(ptr, arg, aw) };
+                    unsafe { Section::execute_member(ptr, arg) };
                 }
             }
             IDLE => {
@@ -476,18 +457,15 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     }
 }
 
-/// Sleeps (still reserved) until a section is published or the reservation
-/// ends. Dekker pairing with `Slot::wake`: raise `parked`, then re-check.
+/// Sleeps (still reserved) until a section is published, the reservation ends
+/// or the thread is lent. The handshake lives in [`Parker`].
 #[cfg(feature = "parallel")]
-fn park_member(slot: &Slot, seen: usize) {
-    slot.parked.store(true, Ordering::SeqCst);
-    while slot.gen.load(Ordering::SeqCst) == seen
-        && slot.state.load(Ordering::SeqCst) == RESERVED
-        && !slot.lent.load(Ordering::SeqCst)
-    {
-        std::thread::park();
-    }
-    slot.parked.store(false, Ordering::SeqCst);
+fn park_member(aw: &Awake, slot: &Slot, seen: usize) {
+    aw.park.park_while(|| {
+        slot.gen.load(Ordering::SeqCst) == seen
+            && slot.state.load(Ordering::SeqCst) == RESERVED
+            && !slot.lent.load(Ordering::SeqCst)
+    });
 }
 
 /// A unit of dispatched work, living on the leader's stack.
@@ -504,10 +482,6 @@ pub(crate) struct Section {
     arrived: Padded<AtomicUsize>,
     epoch: Padded<AtomicUsize>,
     cancelled: AtomicBool,
-    /// Set by the leader once every target's generation is bumped. A member
-    /// unparks its children only after that: a child woken earlier would see
-    /// its old generation, park again, and nobody would wake it.
-    published: AtomicBool,
     /// First panic payload, boxed twice so that it fits an `AtomicPtr`.
     /// (A `Mutex` would allocate on first use on some platforms.)
     panic: AtomicPtr<Box<dyn Any + Send>>,
@@ -537,7 +511,6 @@ impl Section {
             arrived: Padded(AtomicUsize::new(0)),
             epoch: Padded(AtomicUsize::new(0)),
             cancelled: AtomicBool::new(false),
-            published: AtomicBool::new(false),
             panic: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -546,26 +519,6 @@ impl Section {
     fn slot(&self, pos: usize) -> usize {
         // SAFETY: `slot_of` and `slot_data` were paired by the creator.
         unsafe { (self.slot_of)(self.slot_data, pos) }
-    }
-
-    /// A member that starts its share (`arg = pos + 1`) unparks its children
-    /// in the wake-up tree over the targets.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    fn wake_children(&self, aw: &Awake, arg: usize) {
-        let first = WAKE_FANOUT * arg;
-        if first >= self.dispatched {
-            return;
-        }
-        let mut spins = 0;
-        while !self.published.load(Ordering::Acquire) {
-            backoff(&mut spins);
-        }
-        for child in first..first + WAKE_FANOUT {
-            if child >= self.dispatched {
-                break;
-            }
-            aw.slots[self.slot(child)].wake();
-        }
     }
 
     /// Calls the section's function on the leader thread.
@@ -585,9 +538,8 @@ impl Section {
     /// the completion counter reaches zero. It is not used after the final
     /// decrement.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    unsafe fn execute_member(ptr: *const Section, arg: usize, aw: &Awake) {
+    unsafe fn execute_member(ptr: *const Section, arg: usize) {
         let sec = &*ptr;
-        sec.wake_children(aw, arg);
         let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
         if let Err(p) = r {
             sec.fail(p);

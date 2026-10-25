@@ -26,6 +26,31 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
+/// A hang is a failure: abort the whole process if the test body stalls.
+fn watchdog() -> impl Drop {
+    struct Stop(std::sync::mpsc::Sender<()>);
+    impl Drop for Stop {
+        fn drop(&mut self) {
+            let _ = self.0.send(());
+        }
+    }
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Warm the channel's thread-local state and announce readiness before
+        // the test starts counting allocations: this thread must not allocate
+        // inside a measured window.
+        let _ = rx.recv_timeout(Duration::from_millis(1));
+        let _ = ready_tx.send(());
+        if rx.recv_timeout(Duration::from_secs(45)).is_err() {
+            eprintln!("watchdog: test stalled");
+            std::process::exit(101);
+        }
+    });
+    ready_rx.recv().unwrap();
+    Stop(tx)
+}
+
 fn allocs_in(f: impl FnOnce()) -> usize {
     let before = ALLOCS.load(Ordering::SeqCst);
     f();
@@ -35,6 +60,7 @@ fn allocs_in(f: impl FnOnce()) -> usize {
 // One test: the counter is process-global.
 #[test]
 fn team_dispatch_does_not_allocate_after_warm_up() {
+    let _w = watchdog();
     let pool = Pool::builder()
         .threads(4)
         .idle_spin(Duration::from_secs(5))

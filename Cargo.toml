@@ -18,6 +18,12 @@ default = ["parallel"]
 parallel = ["dep:rayon"]
 # Test support: per-root live-task ledger and entry counters. Zero cost when off.
 ledger = []
+# Test support: hooks that pause threads inside the park/wake handshake and
+# deliberate protocol breakages (see `test_hooks`). Zero cost when off.
+test-hooks = []
+# Test support: a ring of timestamped state transitions per reserved member
+# (see `trace`). Zero cost when off.
+trace = []
 
 [dependencies]
 rayon = { version = "1.10", optional = true }
@@ -25,3 +31,41 @@ thiserror = "1.0"
 
 [lib]
 bench = false
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+libc = "0.2"
+
+[[bench]]
+name = "team_dispatch"
+harness = false
+
+[[bench]]
+name = "wake_probe"
+harness = false
+
+[[bench]]
+name = "idle_trace"
+harness = false
+required-features = ["trace", "parallel"]
+
+[[bench]]
+name = "spin_grid"
+harness = false
+required-features = ["parallel"]
+
+[[test]]
+name = "idle_clock"
+required-features = ["trace", "parallel"]
+
+[[test]]
+name = "team_hooks"
+required-features = ["test-hooks", "parallel"]
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }

@@ -69,6 +69,15 @@ jobs:
       - name: No rayon type in the public API
         run: scripts/check-no-public-rayon.sh
 
+  loom:
+    name: loom model of the park/wake handshake
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: RUSTFLAGS="--cfg loom" cargo test --release --test loom_park
+
   doc:
     name: cargo doc
     runs-on: ubuntu-latest

@@ -244,6 +244,314 @@ global-pool test green.
   is out of scope for the budget.
 - The cross-pool hand-off remains a microsecond-scale cost on a rare nesting.
 
+## Reserved awake members: `TeamExec` (prototype)
+
+`Exec::team` reserves pool workers as members of a team for the duration of a
+callback and hands the callback exclusive authority, `TeamExec<'team>`, over
+the team: the calling thread (participant 0, the leader) plus `budget - 1`
+members. It exists for barrier-bearing kernels that need all participants on
+distinct threads, and for nested teams, without a per-section Rayon dispatch.
+A token without team authority behaves exactly as described in the rest of this
+document. Two ways to hold a team exist and share one implementation of sections
+and dispatch: a scoped acquisition per call (`Exec::team`, for pools that are not
+owned by one engine) and a persistent reservation owned by the engine (`Team`,
+below), whose tokens carry the authority into the ordinary `Exec` methods.
+
+```rust
+impl Exec<'_> {
+    pub fn team<R>(&mut self, f: impl for<'team> FnOnce(TeamExec<'team>) -> R) -> Result<R, Refused>;
+    pub fn team_with<R>(&mut self, over: WaitOverride, f: impl for<'team> FnOnce(TeamExec<'team>) -> R) -> Result<R, Refused>;
+}
+impl<'team> TeamExec<'team> {            // not Clone, not Copy
+    pub fn size(&self) -> NonZeroUsize;
+    pub fn policy(&self) -> WaitPolicy;
+    pub fn with_wait(self, over: WaitOverride) -> Self;
+    pub fn reborrow(&mut self) -> TeamExec<'_>;
+    pub fn run<F: Fn(usize, usize) + Sync>(self, f: F);                 // f(index, size)
+    pub fn run_with<F: Fn(&Participant<'_>) + Sync>(self, f: F);        // adds barrier()
+    pub fn split<F>(self, sizes: &[usize], f: F) -> Result<(), Error>
+        where F: for<'c> Fn(usize, TeamExec<'c>) + Sync;
+    pub fn fork<F>(self, children: usize, f: F) where F: for<'c> Fn(usize, TeamExec<'c>) + Sync;
+}
+impl Participant<'_> { pub fn index(&self) -> usize; pub fn size(&self) -> usize;
+    pub fn barrier(&self) -> Result<(), Cancelled>; pub fn is_cancelled(&self) -> bool; }
+```
+
+### Authority and lifetimes
+
+The `'team` lifetime is the reservation. The scoped callback keeps the
+authority from escaping; entries consume it; `reborrow` locks the parent while
+the lent authority lives; `split` and `fork` consume the parent and lend
+children through `for<'c>` callbacks, so a child can neither escape nor be used
+by the parent, and a sibling cannot be reached. Compile-fail doctests cover
+`Clone`, `Copy`, reuse after an entry, escape, parent use while reborrowed,
+parent use inside a `split` callback, and child escape. `team` takes `&mut
+Exec`: the token is borrowed while the team lives (slots stay conserved) and is
+available afterwards, in particular after a refusal.
+
+### Members and acquisition
+
+A member is a pool worker running a loop as one Rayon job; while it runs the
+worker serves no other Rayon job. Each worker index owns one cache-line padded
+slot with a state: `ABSENT` (no loop), `IDLE` (loop alive, unreserved),
+`YIELD` (idle member inside `rayon::yield_now`, not claimable), `RESERVED`.
+
+1. Idle resident members are claimed with a compare-and-swap, in slot order.
+   Members inside `yield_now` are retried for at most the acquisition timeout.
+2. Missing members are requested with claim jobs spawned into the pool. A job
+   that lands on a free worker registers itself in the acquisition and starts
+   the member loop; a job that lands on a resident member serving Rayon hands
+   itself back to the pool. A worker executing any other Rayon job takes no
+   claim job, so it is simply unavailable.
+3. The leader waits at most `acquire_timeout` (default 2 ms) for free workers to
+   wake. This bounds the wait for *idle* workers; it is never a wait for a
+   running job. At the deadline the claim is closed (a late job does nothing),
+   every tentative member is released and `Refused::Unavailable` is returned
+   before any callback runs. The caller keeps a barrier-free fallback.
+4. With all members present, every participant (leader included) passes a
+   rendezvous section. All are inside it at once, so they are on distinct
+   threads: this is the acknowledgement that precedes any user section.
+
+Two acquisitions that each hold part of the free workers can both time out and
+refuse; the fallback applies. The caller may itself be a pool worker (for
+example inside a `fork` job): it leads on its own thread and the members come
+from the other workers. Members hold no thread-local state; identity is the slot
+index.
+
+### Dispatch
+
+A section is a stack object (`Section`): a type-erased pointer to the
+closure, the participant count, a padded completion counter, a sense-reversing
+barrier, a cancellation flag and an atomic cell for the first panic payload.
+The leader stores the section address and the participant index into each
+member slot and bumps its `gen` counter with release ordering; members spin on
+`gen` and `state` (pure spin, then `yield_now` between polls) and run their
+share and decrement the completion counter. After the reservation's park delay
+(the effective `idle_spin`) without work, a member parks (see below). The leader runs
+share 0, then waits for the counter. Nothing is allocated and nobody is woken
+(`tests/team_alloc_free.rs`; acquisition allocates a small `Vec` and, for
+members not already awake, the claim jobs).
+
+`split`/`fork` partition the members by team index: child `c` covers a
+contiguous index range; child 0 is led by the calling thread and the other
+children by the first member of their range, which receives `f(c, child)` as
+its share of one dispatch. The remaining members of a child wait on their own
+slots for the child leader's sections; no slot is shared between children.
+When the dispatch returns, all children finished and the members are the
+parent's again. Members the sizes leave over stay parked.
+
+### Persistent reservation: `Team` and team tokens
+
+```rust
+impl Pool {                               // Pool stays a unique owner: not Clone
+    pub fn into_team(self, width: usize) -> Result<Team, IntoTeamError>;
+    pub fn into_team_with(self, width: usize, over: WaitOverride) -> Result<Team, IntoTeamError>;
+}
+impl IntoTeamError { pub fn reason(&self) -> Refused; pub fn into_pool(self) -> Pool; }
+impl Team {                               // owns the Pool; no lifetime; Drop drops the pool
+    pub fn pool(&self) -> &Pool;          // borrow only
+    pub fn into_pool(self) -> Pool;       // releases the members, gives the pool back
+    pub fn size(&self) -> NonZeroUsize;
+    pub fn exec(&self, budget: usize) -> Exec<'_>;                     // blocks; panics on re-entry
+    pub fn try_exec(&self, budget: usize) -> Result<Exec<'_>, Refused>; // Err(Refused::Busy)
+}
+```
+
+An owner that has its pool to itself (tenferro's engine) moves the pool into a
+`Team` with `into_team`, which reserves `width - 1` members once, with the same
+acquisition and acknowledgement rendezvous as `Exec::team`, and stores the `Team`
+(or a plain `Pool` when it wants no team). `Pool` is a unique owner: it is not
+`Clone`, no method returns a second handle, and sharing a pool between callers
+stays outside this crate (for example an `Arc<Pool>` held by the caller, where
+per-call acquisition with `Exec::team` applies). The `Team` holds the `Pool` by
+value and has no lifetime and no `Arc` around the pool. When the members cannot
+all be reserved, `IntoTeamError` returns the pool together with the `Refused`
+reason and the caller falls back to plain tokens. Dropping the `Team` releases the
+members (zero idle spin, woken) and then drops the pool, which joins the
+workers; `into_pool` releases the members and returns the pool instead. The
+only internal sharing is an `Arc` of the awake-member state that claim jobs
+hold; it is not a pool handle. `exec(budget)` mints a
+root token, `budget` clamped to `1..=size`, that carries `TeamAuth`: the token's
+members, a slice of the team's with `ids.len() + 1 == budget`. The slice stays
+consistent through `limit` (narrowed), `reborrow` (copied) and `fork` (the sub-slice
+of the child's share).
+
+On a token with team authority the `Exec` methods dispatch through the same
+`section` function as `TeamExec`:
+
+| Method | Behaviour |
+| --- | --- |
+| `fork(jobs, f)` | `tasks = min(jobs, budget)`; task `k` runs on the first member of its index range of the same even plan as `split`, with the share of `split::share`; the child token carries that range's sub-team; more jobs than tasks pull from the shared counter as before |
+| `for_ranges` | the leader and the first `tasks - 1` members run the chunks; no Rayon entry |
+| `broadcast` | every participant of the budget at once on the reserved members; never refused (a `fork` child owns its members too), `can_broadcast` is true |
+| `team(f)` / `team_with` | hands out the carried (sub)team at once, no acquisition |
+| `external(f)` | enters the pool as before and hands the width (the budget). While `f` runs, the token's members are **lent**: each sets aside its spin or park and runs `rayon::yield_now` (the pool's jobs) until the call returns, then resumes team service. A lent job still running on return delays the next section until it finishes. `tests/team_owner.rs` runs four mutually waiting tasks on a team of four from inside `external`: they can only complete on four threads |
+| `limit`, `reborrow`, `budget`, `is_serial` | as on any token |
+
+Budget conservation and the ledger hold as on plain tokens: the same bodies
+count each participant as a live task for the time it runs a share, the leader
+is released while it waits, and `tests/team_ledger.rs` runs nested forks,
+for_ranges and broadcasts on team tokens against the budget. A token with a
+budget of one runs inline.
+
+**One leader at a time.** The calling thread leads every section, so minting
+serializes callers: `Team::exec` blocks on a mutex and condition variable until
+the previous root token and everything lent from it (`reborrow`) was dropped, then
+takes leadership; `try_exec` returns `Refused::Busy` instead. A thread that still
+holds a token and mints again would wait for itself, so `exec` panics. The guard
+lives in the root token and releases on drop; consuming entries (`fork(self)`)
+release it when they return, so a caller that needs the team across several
+entries keeps the token and lends it with `reborrow`. No thread-local state is
+involved (the owner's thread id is stored in the team).
+
+**Parking.** A reserved member that finds no new section for the park delay
+(the effective `idle_spin` of the reservation: the pool default or the
+`reserve_with` / `team_with` override) parks and stays reserved. All parked
+members of a pool wait on one condition variable (`park_lock`, `park_cv`), with
+a counter `parked` of members inside or entering the wait. The protocol:
+
+* A member raises `parked` (acquire-release increment), takes the lock,
+  re-checks `gen`, `state` and `lent` and waits only while none changed; it
+  lowers `parked` when it leaves.
+* A leader changes the state a member waits on (bumps `gen`, stores `IDLE`,
+  sets `lent`), then reads `parked` with an acquire-release `fetch_add(0)`. If it
+  is nonzero, the leader takes and drops the lock and calls `notify_all`. Either the member sees the changed
+  state after raising `parked`, or the leader sees `parked` (both are read-modify-writes of one atomic, so the
+  argument needs only its modification order and release sequences, not a total
+  order of SeqCst accesses, which `loom` does not model); and because the
+  leader takes the lock before notifying, the notification cannot fall between a
+  member's check and its wait (the usual condition-variable handshake).
+* With nobody parked a dispatch pays one uncontended atomic read-modify-write.
+  A broadcast also wakes parked members of other teams of the same pool, which
+  re-check and sleep again; the leader pays one syscall, not one per member.
+* Spurious wake-ups loop. There is no per-member wake state: every parked member
+  waits on the one condition variable, so no wake-up depends on the order in
+  which a leader publishes to individual members.
+
+The handshake is the small `Parker` type in `src/park.rs`, built on a `sync`
+shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
+
+* **Model check.** `tests/loom_park.rs` runs the real `Parker` under `loom` with
+  one leader and two members: a published section, a released reservation, and a
+  member that parks twice. The correctness argument therefore uses only what loom
+  models (modification order and release sequences of `parked`). CI job `loom`:
+  `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
+* **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a
+  test pause the member between raising `parked` and taking the lock, between its
+  re-check and its wait, and the leader between the state change and reading
+  `parked` (`tests/team_hooks.rs`). Deliberate breakages (`Mutation`: the member
+  skips its re-check, the leader skips the lock handoff) must stall in exactly
+  these interleavings, which shows the scenarios can see a lost wake-up; the real
+  protocol completes them in well under a second. The hooks cost nothing when the
+  feature is off.
+* Every team test has a watchdog that aborts the process when the test body
+  stalls.
+
+No allocation happens on the dispatch path. Dropping the team stores `IDLE`
+with a zero idle spin and broadcasts, so the members return to Rayon at once.
+
+**Quality of service.** `PoolBuilder::qos(Qos)` sets the class of each worker
+when it starts (`pthread_set_qos_class_self_np` on Apple targets, nothing
+elsewhere; no platform type is public). The default is `UserInitiated` on
+macOS. `threadteam` never changes the caller's class, but the calling thread
+leads every section, so `raise_current_thread_qos(Qos)` raises the calling
+thread to at least the given class and never lowers it (the current class is
+read first); an engine calls it once for its leading thread. In the wake probe
+the class (builder default, explicit `Default`, `UserInteractive`) made no
+measurable difference to the wake latency on this host. Dropping the
+team stores `IDLE` with a zero idle spin and wakes them, so the members return to
+Rayon at once.
+
+### Waiting policy
+
+`PoolBuilder::idle_spin` (default 200 ms, may be zero) and
+`PoolBuilder::idle_runs_rayon` (default `false`) set `WaitPolicy` defaults;
+`acquire_timeout` is separate. `WaitOverride` (partial policy) applies to one
+operation: `Exec::team_with` for a root reservation, `TeamExec::with_wait` for a
+scope. Children inherit the effective policy and may override it for their own
+scope. The root reservation's effective policy is stored in its members' slots
+when it ends and governs the idle interval that follows; the interval starts
+when the reservation ends, not when the member last computed. A reserved member
+never leaves on a timeout and never runs an unrelated Rayon job (it parks, still
+reserved, after the park delay), whatever the policy, so an override cannot weaken a reservation, and a child's override
+expires when the child returns and cannot release its parent's members.
+With `idle_runs_rayon`, an idle member calls `rayon::yield_now`, whose job runs
+to completion before the member is claimable again. Without it, an idle member
+leaves its worker out of Rayon service for up to `idle_spin`; a following
+`broadcast` or a Rayon job that needs every worker then waits for them, so a
+caller that alternates with such work sets a short spin or calls
+`Pool::release_idle`.
+
+**Idle clock and the default delay.** The park delay of a reserved member is
+measured on a clock that belongs to that member alone: it starts when the
+member first finds nothing to do after its own last share (or after it started,
+or was taken back from a lend), and it restarts with every share the member
+runs. A share of another member does not move it, and neither does anything the
+leader does between sections. When the clock exceeds the delay the member
+parks. Consequences:
+
+* A team that runs no section costs CPU for the delay after the team is built
+  (or after its last section), then nothing: members that spin beyond that are a
+  bug.
+* Sections less than the delay apart keep every participating member spinning
+  the whole time. That is the intended behaviour, not a leak: it is what makes a
+  dispatch cost one atomic store and no syscall (about 0.3 us, against some tens of
+  us after a park on the reference M5, see `benches/spin_grid.rs`).
+* A CPU measurement over a window of sequential work therefore depends on where
+  the window sits relative to the last section (or the construction of the team):
+  a window inside the first 200 ms reads about `width - 1` extra cores, a window
+  after it reads one. Measure CPU after a settle time longer than the delay, or
+  say what the window contains.
+
+The default is 200 ms, the same as the default blocktime of the LLVM and Intel
+OpenMP runtimes (`KMP_BLOCKTIME`): long enough that a loop of small parallel
+regions with serial work between them never pays a wake-up, short enough that a
+program that stops using the team goes quiet within a fifth of a second. The
+sweep in `benches/spin_grid.rs` (6 participants) shows the trade: with a 200 ms
+delay a dispatch after a 100 ms gap costs 12 us (members still spinning, 4.9
+cores); with a zero delay it costs 37 us after any gap and members use no CPU.
+Callers with sparse sections set a shorter delay with `idle_spin` or
+`team_with`.
+
+The clock is explicit in the code (`last_work` in `member_loop`) and visible
+with the feature `trace`, which stamps every member transition (enter, share
+begin and end, park enter and exit, lend, leave) into a preallocated ring; the
+bench `idle_trace` prints each member's spin, park and run time per phase and
+`tests/idle_clock.rs` checks that a member parks neither before the delay since
+its own last share nor never.
+
+`Pool::release_idle` bumps an epoch: idle members leave at once, reserved
+members leave when their reservation ends. It never revokes a live token and
+does not wait, so it may be called inside a reservation. Dropping the pool
+signals shutdown, which idle members honour. `Pool::resident_members` reports
+the number of awake members (diagnostic).
+
+### Unwind
+
+Every section joins all dispatched shares before `run`, `run_with`, `split` or
+`fork` returns, also on unwind (a drop guard waits on the completion counter).
+A panic in any participant is caught on its thread, stored (first one wins),
+and the section's barriers are cancelled: `Participant::barrier` returns
+`Err(Cancelled)` so peers leave instead of waiting for the panicker. After the
+join the payload is re-raised on the leader. A panic in a child leader
+propagates through the parent's section the same way. The reservation is
+released when the `team` scope ends, on unwind too.
+
+### Ledger and fork children
+
+Each participant counts as one live task of its root for the time it runs its
+share, and the leader stops counting while it waits, so live tasks never exceed
+the budget (`tests/team_ledger.rs`). A `fork` child may call `Exec::team`; it
+leads on its own thread and reserves free workers, or is refused. Merely running
+on a pool worker grants no reservation.
+
+### Not provided
+
+Reproducible reductions are left to numerical kernels (fixed logical chunks,
+chunk-owned partials, fixed merge order): the crate gives no stealing within a
+team, so a section's shares are exactly the participants. Cache-domain layout and
+pinning are not handled.
+
 ## Planned: one pool per cache domain
 
 A `Pool` built with a domain layout holds one Rayon pool per shared-cache

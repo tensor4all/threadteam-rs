@@ -1,14 +1,22 @@
 //! The pool type and its builder.
 
+use crate::awake::Awake;
 use crate::error::Error;
+use crate::policy::{Qos, WaitPolicy};
 use core::fmt;
 use core::num::NonZeroUsize;
+use core::sync::atomic::Ordering;
+use core::time::Duration;
+use std::sync::Arc;
 
 /// Default worker stack size: 16 MiB.
 ///
 /// Sized for the recursive LU and divide-and-conquer providers that run on pool
 /// workers; the same value tenferro-rs used for its own pool preset.
 const DEFAULT_STACK_BYTES: usize = 16 << 20;
+
+/// Default time an acquisition waits for idle workers to wake: 2 ms.
+const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// A fixed set of worker threads that [`Exec`](crate::Exec) tokens place work on.
 ///
@@ -17,11 +25,20 @@ const DEFAULT_STACK_BYTES: usize = 16 << 20;
 /// external pool and no accessor returning one. The pool's owner keeps the
 /// `Pool` and mints tokens from it with [`Exec::new`](crate::Exec::new).
 ///
-/// Dropping a `Pool` shuts its workers down and joins them: when `drop`
-/// returns, every worker thread has exited, so the thread-local destructors of
-/// the workers (including state set up by an [`on_start`](PoolBuilder::on_start)
-/// hook) have already run. Without the `parallel` feature there are no workers
-/// and nothing is joined.
+/// A `Pool` is a unique owner: it is not `Clone` and no method returns a second
+/// handle. An engine that wants reserved, always-awake members moves the pool
+/// into a [`Team`](crate::Team) with [`into_team`](Pool::into_team); the team owns
+/// the pool from then on (and gives it back with
+/// [`Team::into_pool`](crate::Team::into_pool)). Sharing a pool between several
+/// callers stays outside this crate (for example behind an `Arc` held by the
+/// caller), where each call acquires its members with
+/// [`Exec::team`](crate::Exec::team) or uses plain tokens.
+///
+/// Dropping a `Pool` (or the `Team` that owns it) shuts its workers down and
+/// joins them: when `drop` returns, every worker thread has exited, so the
+/// thread-local destructors of the workers (including state set up by an
+/// [`on_start`](PoolBuilder::on_start) hook) have already run. Without the
+/// `parallel` feature there are no workers and nothing is joined.
 ///
 /// A pool dropped from one of its own workers cannot wait for itself: that drop
 /// signals shutdown and returns without joining, so the workers exit shortly
@@ -45,6 +62,7 @@ pub struct Pool {
     #[cfg(feature = "parallel")]
     _joiner: Joiner,
     pub(crate) width: NonZeroUsize,
+    pub(crate) awake: Arc<Awake>,
 }
 
 impl Pool {
@@ -74,6 +92,65 @@ impl Pool {
     /// ```
     pub fn width(&self) -> NonZeroUsize {
         self.width
+    }
+
+    /// The pool-wide default [`WaitPolicy`] of idle team members.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let pool = threadteam::Pool::builder()
+    ///     .threads(1)
+    ///     .idle_spin(Duration::from_millis(5))
+    ///     .build()?;
+    /// assert_eq!(pool.wait_policy().idle_spin(), Duration::from_millis(5));
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn wait_policy(&self) -> WaitPolicy {
+        self.awake.defaults
+    }
+
+    /// Asks idle team members to return their threads to Rayon now.
+    ///
+    /// Members that are idle leave at once; members that are reserved leave
+    /// when their reservation ends, so this never revokes a live
+    /// [`TeamExec`](crate::TeamExec). The call does not wait for anything,
+    /// so it is safe to make from inside a reservation. A team acquired later
+    /// starts its members afresh.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(2).build()?;
+    /// pool.release_idle(); // nothing resident: no effect
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn release_idle(&self) {
+        self.awake.release_epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Number of workers currently kept awake as team members, reserved or
+    /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
+    /// can change at any moment.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(2).build()?;
+    /// assert_eq!(pool.resident_members(), 0);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn resident_members(&self) -> usize {
+        self.awake.resident()
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        // Idle members leave their loops so that the workers can be joined.
+        self.awake.shutdown.store(true, Ordering::Release);
     }
 }
 
@@ -129,6 +206,9 @@ pub struct PoolBuilder {
     stack_size: usize,
     thread_name: Option<Box<dyn Fn(usize) -> String>>,
     on_start: Option<Box<dyn Fn(usize) + Send + Sync>>,
+    wait: WaitPolicy,
+    acquire_timeout: Duration,
+    qos: Option<Qos>,
 }
 
 impl PoolBuilder {
@@ -138,6 +218,9 @@ impl PoolBuilder {
             stack_size: DEFAULT_STACK_BYTES,
             thread_name: None,
             on_start: None,
+            wait: WaitPolicy::DEFAULT,
+            acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
+            qos: None,
         }
     }
 
@@ -210,6 +293,91 @@ impl PoolBuilder {
         self
     }
 
+    /// Default spin time of an unreserved idle team member before it returns
+    /// its thread to Rayon. Defaults to 200 ms; zero returns it immediately.
+    ///
+    /// Operations may override it with [`WaitOverride`](crate::WaitOverride).
+    /// A reserved member never leaves on a timeout.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// let pool = threadteam::Pool::builder().threads(2).idle_spin(Duration::ZERO).build()?;
+    /// assert_eq!(pool.wait_policy().idle_spin(), Duration::ZERO);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn idle_spin(mut self, spin: Duration) -> Self {
+        self.wait = WaitPolicy::new(spin, self.wait.idle_runs_rayon());
+        self
+    }
+
+    /// Default for whether unreserved idle members run Rayon jobs while they
+    /// spin. Defaults to `false`: native team execution keeps them for the
+    /// next reservation. `true` is the compatibility mode in which an idle
+    /// member serves Rayon work (an acquisition then refuses a member that is
+    /// inside such a job instead of waiting for it).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(2).idle_runs_rayon(true).build()?;
+    /// assert!(pool.wait_policy().idle_runs_rayon());
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn idle_runs_rayon(mut self, on: bool) -> Self {
+        self.wait = WaitPolicy::new(self.wait.idle_spin(), on);
+        self
+    }
+
+    /// How long [`Exec::team`](crate::Exec::team) waits for idle workers to
+    /// wake before it refuses. Defaults to 2 ms.
+    ///
+    /// This bounds the wait for workers that are *free*; the acquisition does
+    /// not wait for a worker that is running a job, it only runs out this
+    /// time and refuses. Raise it on a loaded host to reduce spurious refusals.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// let pool = threadteam::Pool::builder()
+    ///     .threads(2)
+    ///     .acquire_timeout(Duration::from_millis(10))
+    ///     .build()?;
+    /// # let _ = pool;
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn acquire_timeout(mut self, timeout: Duration) -> Self {
+        self.acquire_timeout = timeout;
+        self
+    }
+
+    /// Scheduling class of the workers (see [`Qos`]).
+    ///
+    /// Defaults to [`Qos::UserInitiated`] on macOS and to nothing elsewhere.
+    /// The calling thread's class is not changed by this crate; an engine that
+    /// wants its leading thread raised too calls
+    /// [`raise_current_thread_qos`](crate::raise_current_thread_qos) once on it.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Pool, Qos};
+    /// let pool = Pool::builder().threads(1).qos(Qos::Default).build()?;
+    /// # let _ = pool;
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn qos(mut self, qos: Qos) -> Self {
+        self.qos = Some(qos);
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -241,6 +409,7 @@ impl PoolBuilder {
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
         let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&handles);
+        let qos = self.qos.or(Qos::PLATFORM_DEFAULT);
         let mut builder = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
             .stack_size(self.stack_size)
@@ -252,7 +421,12 @@ impl PoolBuilder {
                 if let Some(size) = thread.stack_size() {
                     b = b.stack_size(size);
                 }
-                let handle = b.spawn(move || thread.run())?;
+                let handle = b.spawn(move || {
+                    if let Some(q) = qos {
+                        q.apply_to_current_thread();
+                    }
+                    thread.run()
+                })?;
                 match sink.lock() {
                     Ok(mut guard) => guard.push(handle),
                     Err(poisoned) => poisoned.into_inner().push(handle),
@@ -280,6 +454,7 @@ impl PoolBuilder {
             inner,
             _joiner: Joiner { handles },
             width,
+            awake: Arc::new(Awake::new(width.get(), self.wait, self.acquire_timeout)),
         })
     }
 
@@ -287,6 +462,7 @@ impl PoolBuilder {
     fn build_checked(self) -> Result<Pool, Error> {
         Ok(Pool {
             width: NonZeroUsize::MIN,
+            awake: Arc::new(Awake::new(1, self.wait, self.acquire_timeout)),
         })
     }
 }
@@ -296,6 +472,8 @@ impl fmt::Debug for PoolBuilder {
         f.debug_struct("PoolBuilder")
             .field("threads", &self.threads)
             .field("stack_size", &self.stack_size)
+            .field("wait", &self.wait)
+            .field("acquire_timeout", &self.acquire_timeout)
             .finish_non_exhaustive()
     }
 }

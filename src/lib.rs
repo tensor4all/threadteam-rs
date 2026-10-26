@@ -40,18 +40,34 @@
 //! # Ok::<(), threadteam::Error>(())
 //! ```
 
+mod awake;
 mod error;
 mod exec;
 #[cfg(feature = "ledger")]
 pub mod ledger;
+mod park;
+mod policy;
 mod pool;
+mod reserve;
 mod sched;
 mod split;
+mod sync;
+mod team;
+#[cfg(feature = "test-hooks")]
+pub mod test_hooks;
+#[cfg(feature = "trace")]
+pub mod trace;
 mod track;
 
 pub use error::{Error, Refused};
 pub use exec::Exec;
+#[cfg(loom)]
+#[doc(hidden)]
+pub use park::Parker;
+pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
 pub use pool::{Pool, PoolBuilder};
+pub use reserve::{IntoTeamError, Team};
+pub use team::{Cancelled, Participant, TeamExec};
 
 #[cfg(test)]
 mod tests;

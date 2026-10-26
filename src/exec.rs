@@ -1,9 +1,15 @@
 //! The splittable placement token.
 
+use crate::awake::Awake;
+#[cfg(feature = "parallel")]
+use crate::awake::LendGuard;
 use crate::error::{Error, Refused};
+use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
+use crate::reserve::LeaderGuard;
 use crate::sched;
 use crate::split;
+use crate::team::{split_raw, spread_raw, Plan, TeamExec};
 use crate::track::Track;
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -40,7 +46,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 /// use std::sync::atomic::{AtomicUsize, Ordering};
 /// use threadteam::{Exec, Pool};
 ///
-/// let pool = Pool::builder().threads(2).build()?;
+/// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
 /// let exec = Exec::new(&pool, 2)?;
 /// let sum = AtomicUsize::new(0);
 /// exec.for_ranges(100, 1.try_into().unwrap(), |r| {
@@ -74,6 +80,18 @@ pub struct Exec<'p> {
     /// Produced by `fork` (directly or through `reborrow`).
     child: bool,
     track: Track,
+    /// Authority over reserved members, for tokens minted from a [`Team`](crate::Team).
+    team: Option<TeamAuth<'p>>,
+    /// Held by the root token of a `Team`: one leader at a time.
+    _leader: Option<LeaderGuard<'p>>,
+}
+
+/// The reserved members a token may dispatch to; `ids.len() + 1 == budget`.
+#[derive(Clone, Copy)]
+pub(crate) struct TeamAuth<'p> {
+    pub(crate) awake: &'p Awake,
+    pub(crate) ids: &'p [usize],
+    pub(crate) policy: WaitPolicy,
 }
 
 impl Exec<'static> {
@@ -97,6 +115,8 @@ impl Exec<'static> {
             budget: NonZeroUsize::MIN,
             child: false,
             track: Track::NONE,
+            team: None,
+            _leader: None,
         }
     }
 }
@@ -115,7 +135,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Error, Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 64)?;
     /// assert_eq!(exec.budget(), pool.width());
     /// assert_eq!(Exec::new(&pool, 0).unwrap_err(), Error::ZeroBudget);
@@ -128,7 +148,26 @@ impl<'p> Exec<'p> {
             budget: budget.min(pool.width()),
             child: false,
             track: Track::root(),
+            team: None,
+            _leader: None,
         })
+    }
+
+    /// A root token of a [`Team`](crate::Team): `budget` is already clamped and
+    /// `ids.len() + 1 == budget`.
+    pub(crate) fn from_team(
+        pool: &'p Pool,
+        auth: TeamAuth<'p>,
+        guard: LeaderGuard<'p>,
+    ) -> Exec<'p> {
+        Exec {
+            pool: Some(pool),
+            budget: NonZeroUsize::new(auth.ids.len() + 1).unwrap_or(NonZeroUsize::MIN),
+            child: false,
+            track: Track::root(),
+            team: Some(auth),
+            _leader: Some(guard),
+        }
     }
 
     /// The number of slots this token stands for.
@@ -170,14 +209,19 @@ impl<'p> Exec<'p> {
     /// use std::num::NonZeroUsize;
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(4).build()?;
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 4)?.limit(NonZeroUsize::new(2).unwrap());
     /// assert!(exec.budget().get() <= 2);
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn limit(self, max: NonZeroUsize) -> Exec<'p> {
+        let budget = self.budget.min(max);
         Exec {
-            budget: self.budget.min(max),
+            budget,
+            team: self.team.map(|t| TeamAuth {
+                ids: &t.ids[..budget.get() - 1],
+                ..t
+            }),
             ..self
         }
     }
@@ -206,6 +250,8 @@ impl<'p> Exec<'p> {
             budget: self.budget,
             child: self.child,
             track: self.track.alias(),
+            team: self.team,
+            _leader: None,
         }
     }
 
@@ -226,7 +272,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let hits: Vec<AtomicUsize> = (0..5).map(|_| AtomicUsize::new(0)).collect();
     /// Exec::new(&pool, 2)?.fork(5, |i, _child| {
     ///     hits[i].fetch_add(1, Ordering::Relaxed);
@@ -246,7 +292,7 @@ impl<'p> Exec<'p> {
         let _released = self.track.release();
         let next = AtomicUsize::new(0);
         let this = &self;
-        let body = |k: usize| {
+        let body = |k: usize, team_ids: Option<&[usize]>| {
             let _live = this.track.task();
             let share = split::share(budget, tasks, k);
             let child = || Exec {
@@ -255,6 +301,11 @@ impl<'p> Exec<'p> {
                 budget: NonZeroUsize::new(share).unwrap_or(NonZeroUsize::MIN),
                 child: true,
                 track: this.track.child(),
+                team: this
+                    .team
+                    .zip(team_ids)
+                    .map(|(t, ids)| TeamAuth { ids, ..t }),
+                _leader: None,
             };
             if jobs <= tasks {
                 f(k, child());
@@ -268,11 +319,20 @@ impl<'p> Exec<'p> {
                 }
             }
         };
-        match self.pool {
-            Some(pool) if tasks > 1 => sched::run_tasks(pool, tasks, &self.track, body),
+        match (self.team, self.pool) {
+            (Some(t), _) if tasks > 1 => {
+                let plan = Plan::Even {
+                    size: budget,
+                    children: tasks,
+                };
+                split_raw(Some(t.awake), t.ids, &plan, |k, ids| body(k, Some(ids)));
+            }
+            (None, Some(pool)) if tasks > 1 => {
+                sched::run_tasks(pool, tasks, &self.track, |k| body(k, None));
+            }
             _ => {
                 for k in 0..tasks {
-                    body(k);
+                    body(k, self.team.map(|t| t.ids));
                 }
             }
         }
@@ -292,7 +352,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::atomic::{AtomicUsize, Ordering};
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let covered = AtomicUsize::new(0);
     /// Exec::new(&pool, 2)?.for_ranges(10, 4.try_into().unwrap(), |r| {
     ///     covered.fetch_add(r.len(), Ordering::Relaxed);
@@ -314,8 +374,9 @@ impl<'p> Exec<'p> {
             let _live = track.task();
             f(split::chunk_range(len, chunk, k));
         };
-        match self.pool {
-            Some(pool) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
+        match (self.team, self.pool) {
+            (Some(t), _) if tasks > 1 => spread_raw(Some(t.awake), t.ids, tasks, body),
+            (None, Some(pool)) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
             _ => {
                 for k in 0..tasks {
                     body(k);
@@ -360,7 +421,7 @@ impl<'p> Exec<'p> {
     /// use std::sync::Barrier;
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 2)?;
     /// let barrier = Barrier::new(exec.budget().get());
     /// exec.broadcast(|_i| {
@@ -374,6 +435,17 @@ impl<'p> Exec<'p> {
     {
         if let Some(refused) = self.refusal() {
             return Err(refused);
+        }
+        if let Some(t) = self.team {
+            // Reserved members are exclusively this token's: every participant
+            // runs at once, also for a child produced by `fork`.
+            let _released = self.track.release();
+            let track = &self.track;
+            spread_raw(Some(t.awake), t.ids, self.budget.get(), |i| {
+                let _live = track.task();
+                f(i);
+            });
+            return Ok(());
         }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
@@ -411,7 +483,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(2).build()?;
+    /// let pool = Pool::builder().threads(2).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// let exec = Exec::new(&pool, 2)?;
     /// assert!(exec.can_broadcast());
     /// exec.fork(1, |_, child| {
@@ -427,6 +499,9 @@ impl<'p> Exec<'p> {
 
     /// The single refusal rule shared by `broadcast` and `can_broadcast`.
     fn refusal(&self) -> Option<Refused> {
+        if self.team.is_some() {
+            return None;
+        }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
             _ => return None,
@@ -465,10 +540,110 @@ impl<'p> Exec<'p> {
             if self.budget.get() > 1 {
                 let width = self.budget;
                 let _released = self.track.release();
+                // A team token lends its reserved members to the pool for the
+                // call: the library's Rayon work runs on them as well.
+                let _lent = self.team.map(|t| LendGuard::new(t.awake, t.ids));
                 return sched::enter(pool, &self.track, move || f(width));
             }
         }
         f(NonZeroUsize::MIN)
+    }
+
+    /// Reserves `budget - 1` pool members for the scope of `f` and hands `f`
+    /// the exclusive [`TeamExec`] authority over them and the calling thread.
+    ///
+    /// The calling thread is participant 0 (the leader); the members are
+    /// pool workers that stay reserved, spinning and serving no Rayon job,
+    /// until `f` returns (or unwinds). A serial or budget-one token yields a
+    /// team of one without touching the pool.
+    ///
+    /// Acquisition never waits for a Rayon job that is already running. Idle
+    /// members of an earlier team (see [`WaitPolicy`]) are claimed with a
+    /// compare-and-swap; missing ones are requested from the pool, and the
+    /// call waits at most the pool's acquisition timeout
+    /// ([`PoolBuilder::acquire_timeout`](crate::PoolBuilder::acquire_timeout))
+    /// for idle workers to wake. If not all members are there by then, every
+    /// tentative claim is released and nothing runs. Before `f` is called,
+    /// every participant has acknowledged on its own thread.
+    ///
+    /// The token stays with the caller (this takes `&mut self`), so a refused
+    /// acquisition leaves it available for a barrier-free fallback such as
+    /// [`fork`](Exec::fork). It is conserved as usual: while `f` runs the token
+    /// is borrowed.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Unavailable`] when the members could not be reserved.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Exec, Pool, Refused};
+    ///
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
+    /// let mut exec = Exec::new(&pool, 4)?;
+    /// match exec.team(|team| team.size().get()) {
+    ///     Ok(n) => assert!(n >= 1),
+    ///     Err(Refused::Unavailable) => exec.fork(4, |_, _| {}), // barrier-free fallback
+    ///     Err(_) => unreachable!(),
+    /// }
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn team<R>(
+        &mut self,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
+        self.team_with(WaitOverride::new(), f)
+    }
+
+    /// [`team`](Exec::team) with a scoped override of the waiting policy.
+    ///
+    /// The override applies to this operation only and is inherited by the
+    /// children of the team; the pool's defaults are not changed. It governs
+    /// the idle interval after this reservation ends and never weakens the
+    /// reservation itself.
+    ///
+    /// # Errors
+    ///
+    /// [`Refused::Unavailable`] when the members could not be reserved.
+    pub fn team_with<R>(
+        &mut self,
+        over: WaitOverride,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
+        if let Some(t) = self.team {
+            // Carried members: the (sub)team is available without acquisition.
+            return Ok(f(TeamExec {
+                awake: Some(t.awake),
+                ids: t.ids,
+                policy: t.policy.with(over),
+                track: self.track.alias(),
+            }));
+        }
+        let pool = match self.pool {
+            Some(pool) if self.budget.get() > 1 => pool,
+            _ => {
+                let policy = self.pool.map_or(WaitPolicy::DEFAULT, Pool::wait_policy);
+                return Ok(f(TeamExec {
+                    awake: None,
+                    ids: &[],
+                    policy: policy.with(over),
+                    track: self.track.alias(),
+                }));
+            }
+        };
+        let policy = pool.wait_policy().with(over);
+        let reservation =
+            pool.awake
+                .acquire(pool, self.budget.get() - 1, policy, policy.idle_spin())?;
+        let mut team = TeamExec {
+            awake: Some(&pool.awake),
+            ids: &reservation.ids,
+            policy,
+            track: self.track.alias(),
+        };
+        team.acknowledge();
+        Ok(f(team))
     }
 
     /// Root id of this token in the [`ledger`](crate::ledger), if it has one.
@@ -483,7 +658,7 @@ impl<'p> Exec<'p> {
     /// ```
     /// use threadteam::{Exec, Pool};
     ///
-    /// let pool = Pool::builder().threads(1).build()?;
+    /// let pool = Pool::builder().threads(1).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
     /// assert!(Exec::new(&pool, 1)?.ledger_root().is_some());
     /// assert!(Exec::serial().ledger_root().is_none());
     /// # Ok::<(), threadteam::Error>(())
@@ -500,6 +675,7 @@ impl fmt::Debug for Exec<'_> {
             .field("budget", &self.budget)
             .field("pooled", &self.pool.is_some())
             .field("child", &self.child)
+            .field("team", &self.team.is_some())
             .finish()
     }
 }

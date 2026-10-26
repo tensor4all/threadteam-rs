@@ -20,8 +20,11 @@
 //! A leader publishes a [`Section`] (a stack object) by writing its address
 //! and an argument into the member's slot and bumping `gen`; the member runs
 //! it and decrements the section's completion counter. Nothing is allocated
-//! per dispatch; a member that parked is woken by one condition-variable
-//! broadcast.
+//! per dispatch. A member that parked sleeps on the [`Parker`] of its own slot,
+//! and a leader wakes only the slots it changed: a section narrower than the
+//! team never disturbs the members it does not use (a pool-wide parker woke
+//! every sleeper on every publish, and the unused ones went back to sleep: a
+//! futex round per section that grew with the number of unused members).
 //!
 //! No thread-local state is used: a member's identity is its slot index.
 
@@ -79,6 +82,9 @@ struct Slot {
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
+    /// Where this member sleeps once its park delay has passed; woken by the
+    /// leader after it changed `gen`, `state` or `lent` of this slot.
+    park: Parker,
 }
 
 impl Slot {
@@ -92,6 +98,7 @@ impl Slot {
             idle_yield: AtomicBool::new(false),
             park_ns: AtomicU64::new(u64::MAX),
             lent: AtomicBool::new(false),
+            park: Parker::new(),
         }
     }
 }
@@ -99,8 +106,6 @@ impl Slot {
 /// Shared state of the awake members of one pool.
 pub(crate) struct Awake {
     slots: Box<[Slot]>,
-    /// Parked members sleep here; a leader that changed their state wakes them.
-    pub(crate) park: Parker,
     pub(crate) shutdown: AtomicBool,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
@@ -121,7 +126,6 @@ impl Awake {
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
-            park: Parker::new(),
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
@@ -149,22 +153,26 @@ impl Awake {
             s.idle_yield
                 .store(policy.idle_runs_rayon(), Ordering::Relaxed);
             s.state.store(IDLE, Ordering::SeqCst);
+            s.park.wake();
         }
-        self.wake_parked();
     }
 
-    /// Wakes every parked member (see [`Parker`]). Called after the state a
-    /// member waits on (`gen`, `state`, `lent`) changed with SeqCst.
+    /// Wakes every parked member (see [`Parker`]); a test hook, the entries wake
+    /// only the slots they changed.
+    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub(crate) fn wake_parked(&self) {
-        self.park.wake();
+        for s in &*self.slots {
+            s.park.wake();
+        }
     }
 
     /// Publishes `section` to its `n` targets (position `p` gets argument `p + 1`).
     ///
     /// The caller leads every target (its slot is `RESERVED` for the caller)
     /// and keeps `section` alive until its completion counter reaches zero.
-    /// Every generation is bumped, then parked members are woken by one
-    /// broadcast (a single atomic load when nobody sleeps).
+    /// Each target's generation is bumped and its own parker woken (one atomic
+    /// read-modify-write on its slot when it does not sleep); members the
+    /// section does not address are not touched.
     pub(crate) fn publish(&self, section: &Section) {
         let ptr = (section as *const Section).cast_mut();
         for pos in 0..section.dispatched {
@@ -174,8 +182,12 @@ impl Awake {
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
         }
+        // Wake after every generation is bumped, so that a spinning member
+        // starts without waiting for the wake checks of the slots after it.
+        for pos in 0..section.dispatched {
+            self.slots[section.slot(pos)].park.wake();
+        }
         trace!(self, None, Publish);
-        self.wake_parked();
     }
 
     /// Lends (or takes back) the members' threads to Rayon: while lent, a
@@ -183,10 +195,11 @@ impl Awake {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn lend(&self, ids: &[usize], on: bool) {
         for &id in ids {
-            self.slots[id].lent.store(on, Ordering::SeqCst);
-        }
-        if on {
-            self.wake_parked();
+            let s = &self.slots[id];
+            s.lent.store(on, Ordering::SeqCst);
+            if on {
+                s.park.wake();
+            }
         }
     }
 
@@ -441,7 +454,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                         let park_ns = slot.park_ns.load(Ordering::Relaxed);
                         if since.elapsed().as_nanos() >= u128::from(park_ns) {
                             trace!(aw, Some(id), ParkEnter);
-                            park_member(aw, slot, seen);
+                            park_member(slot, seen);
                             trace!(aw, Some(id), ParkExit);
                             last_work = None;
                             spins = 0;
@@ -504,8 +517,8 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
 /// Sleeps (still reserved) until a section is published, the reservation ends
 /// or the thread is lent. The handshake lives in [`Parker`].
 #[cfg(feature = "parallel")]
-fn park_member(aw: &Awake, slot: &Slot, seen: usize) {
-    aw.park.park_while(|| {
+fn park_member(slot: &Slot, seen: usize) {
+    slot.park.park_while(|| {
         slot.gen.load(Ordering::SeqCst) == seen
             && slot.state.load(Ordering::SeqCst) == RESERVED
             && !slot.lent.load(Ordering::SeqCst)

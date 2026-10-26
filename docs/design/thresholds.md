@@ -282,8 +282,8 @@ checked (0.019 and 0.084). A scalar that is not native takes the `f64` or `c64` 
 ```rust
 pub const PAYS: f64 = 3.0;
 pub enum DispatchKind { Team, InPool, Outside }
-pub struct WidthCosts;     // values at widths 2, 4, 6: new([Duration; 3]), flat(Duration), at(width)
-pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), linux_x86(), generic(), with(kind, costs), cost(kind, width)
+pub struct WidthCosts;     // values at widths 2, 4, 6: const new([Duration; 3]), const flat(Duration), at(width), min()
+pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), linux_x86(), generic(), with(kind, costs), cost(kind, width), min_cost(kind)
 impl PoolBuilder { pub fn dispatch_costs(self, c: DispatchCosts) -> Self; }
 impl Pool        { pub fn dispatch_costs(&self) -> DispatchCosts; }
 impl Exec<'_> {
@@ -301,6 +301,14 @@ estimate / k` over `1..=budget`, counting only widths at which the region pays, 
 (ties go to the smaller width). The kind is read from the token and the calling thread when asked: team
 authority (including `fork` children of a team token), else a worker of the pool (in pool), else outside. No
 thread-local state, no allocation (`tests/dispatch_cost.rs`).
+
+Lookups are cheap: `WidthCosts::new` evaluates the model once into a table of nanoseconds for widths 1 to 6 (wider
+tokens read the last entry, which is the flat model), so `at` is an index, and `pays_at` / `width_for_by` compare
+integer nanoseconds (the objective of `width_for_by` stays `f64`). `cost_lookup` bench, cores 4-11, per call:
+`at` 7.9 to 1.2 ns, `pays_at` after `at` 10.1 to 2.2 ns, `width_for` at budget 8 83 to 32 ns. `min_cost(kind)` /
+`WidthCosts::min()` is the cheapest cost over all widths: a region below `PAYS * min_cost` pays at no width, a
+rejection that stays right for a table whose cost rises with width. A test compares the table with the former
+interpolation for widths 1 to 64.
 
 Width model: linear interpolation between the widths 2, 4 and 6, the width 2 value below, and above width 6
 the width 6 value held flat (the Linux width 8 data, section 3.6, is below the width 6 value, so flat is
@@ -538,6 +546,36 @@ What the Linux data says about the design:
 * The triangular inverse rate is size dependent on Linux too (0.047 ns per `m^3` at the smallest shape, median
   0.019).
 * QR 128 on a team is 1.06 times the held row at 8 threads and 0.99 at 4: no case for changing `PAYS = 3`.
+
+#### Width dependence of a team section (root cause and fix)
+
+The table above falls with width (2.8 to 1.1 us), the opposite of a plain token. Cause: all reserved members of a
+pool slept on one pool-wide `Parker`, and every publish ended with `notify_all` on it. A member that parked
+(after the 200 ms park delay, or in the pool's idle gap) and was *not* addressed by a narrower section was woken
+by each publish, found its generation unchanged and went back to sleep: a lock, a `futex` wake of every sleeper
+and the sleepers' re-lock, per section, growing with the number of unused members (6 for `w=2` of 8; none for
+`w=8`). A narrower token is not a split (`Team::exec(w)` takes the first `w - 1` reserved members and
+`spread_raw` publishes to those only), so there was no split bookkeeping, no extra barrier and no shared counter
+involved; `strace -f -c` showed ~440k `futex` calls in 2 s. Fix (`src/awake.rs`): one `Parker` per member slot;
+`publish` bumps the targeted generations and wakes the targeted slots' parkers only; `release` / `lend` wake the
+slots they changed. Loom: `a_wake_of_one_slot_leaves_the_other_asleep_until_its_own_change`.
+
+Pool of 8, `dispatch_cost` bench (`DISPATCH_TEAM_ONLY=8`), cores 4-11, microseconds per section, before ->
+after (two runs each, the two agree within 5 %):
+
+| row | w=2 | w=4 | w=6 | w=8 |
+| --- | --- | --- | --- | --- |
+| hot, empty shares | 0.67-1.35 -> 0.47 | 1.39 -> 0.59 | 1.31 -> 0.81 | 1.14 -> 0.97 |
+| after 1 ms | 5.2 -> 0.84 | 3.8 -> 1.0 | 2.4 -> 1.07 | 1.33 -> 1.23 |
+| 10 us shares (minus 10) | 2.8 -> 0.54 | 2.24 -> 0.61 | 1.7 -> 0.77 | 1.06 -> 0.92 |
+
+The cost now rises with width like the plain tokens, and the full team is not slower (the wake checks run after
+all generations are bumped, so a spinning member starts first). Evaluated and rejected: running a narrower
+section on the whole team with empty shares for the members outside the width costs the `w=8` row at every width
+(0.97 / 1.23 / 0.92) against 0.47 to 0.81 for the targeted publish, wakes members the section does not need, and
+needs the ledger and `Participant::size` to exclude the empty shares to keep "a width-k token never runs more
+than k tasks of real work". `linux_x86()` still holds the pre-fix numbers (2.8, 2.2, 1.7): conservative, to be
+re-measured by the Linux campaign before the table is lowered (about 0.5, 0.6, 0.8).
 
 ## 4. Limits of this data
 

@@ -37,7 +37,8 @@ pub enum DispatchKind {
 /// The model: linear interpolation between the anchors, the value at width 2
 /// below it, and above width 6 the width 6 value held flat (the Linux data at
 /// width 8 is below the width 6 value, so flat is conservative and simple).
-/// Width 1 never
+/// The model is evaluated once, when the value is built (`new` and `flat` are
+/// `const`), into a table of nanoseconds, so a lookup is an index. Width 1 never
 /// reaches the model: a token of one slot has no parallel section, see
 /// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost).
 ///
@@ -53,49 +54,96 @@ pub enum DispatchKind {
 /// assert_eq!(c.at(NonZeroUsize::new(2).unwrap()), us(3));
 /// assert_eq!(c.at(NonZeroUsize::new(3).unwrap()), Duration::from_nanos(2500));
 /// assert_eq!(c.at(NonZeroUsize::new(12).unwrap()), us(1));
+/// assert_eq!(c.min(), us(1));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidthCosts {
-    /// Nanoseconds at widths 2, 4, 6.
-    ns: [u64; 3],
+    /// Nanoseconds at widths 1..=6 (index `w - 1`), the model evaluated once when
+    /// the table is built; every wider token reads the last entry.
+    ns: [u64; TABLE],
 }
+
+/// The last anchor: the model is flat from here on, so a table to this width
+/// holds the whole model.
+const TABLE: usize = 6;
 
 const ANCHORS: [u64; 3] = [2, 4, 6];
 
-fn to_ns(d: Duration) -> u64 {
-    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+const fn to_ns(d: Duration) -> u64 {
+    let n = d.as_nanos();
+    if n > u64::MAX as u128 {
+        u64::MAX
+    } else {
+        n as u64
+    }
+}
+
+/// The model at width `w` from the anchor values; the reference the table is
+/// built from (linear between anchors, flat outside).
+const fn model_ns(anchors: &[u64; 3], w: u64) -> u64 {
+    if w <= ANCHORS[0] {
+        anchors[0]
+    } else if w >= ANCHORS[2] {
+        // Flat above the last anchor.
+        anchors[2]
+    } else {
+        let i = (w > ANCHORS[1]) as usize;
+        let (w0, w1) = (ANCHORS[i], ANCHORS[i + 1]);
+        let (c0, c1) = (anchors[i] as i128, anchors[i + 1] as i128);
+        let v = c0 + (c1 - c0) * (w - w0) as i128 / (w1 - w0) as i128;
+        if v < 0 {
+            0
+        } else {
+            v as u64
+        }
+    }
 }
 
 impl WidthCosts {
     /// The costs measured at widths 2, 4 and 6.
-    pub fn new(at_2_4_6: [Duration; 3]) -> Self {
-        WidthCosts {
-            ns: at_2_4_6.map(to_ns),
+    pub const fn new(at_2_4_6: [Duration; 3]) -> Self {
+        let anchors = [to_ns(at_2_4_6[0]), to_ns(at_2_4_6[1]), to_ns(at_2_4_6[2])];
+        let mut ns = [0u64; TABLE];
+        let mut k = 0;
+        while k < TABLE {
+            ns[k] = model_ns(&anchors, k as u64 + 1);
+            k += 1;
         }
+        WidthCosts { ns }
     }
 
     /// The same cost at every anchor (the model of an unmeasured host).
-    pub fn flat(cost: Duration) -> Self {
+    pub const fn flat(cost: Duration) -> Self {
         WidthCosts::new([cost; 3])
     }
 
+    /// Nanoseconds of a section of `width` participants: one index.
+    #[inline]
+    pub(crate) fn ns_at(&self, width: NonZeroUsize) -> u64 {
+        self.ns[(width.get() - 1).min(TABLE - 1)]
+    }
+
     /// The cost of a section of `width` participants, by the model above.
+    #[inline]
     pub fn at(&self, width: NonZeroUsize) -> Duration {
-        let w = width.get() as u64;
-        let ns = if w <= ANCHORS[0] {
-            self.ns[0]
-        } else if w >= ANCHORS[2] {
-            // Flat above the last anchor.
-            self.ns[2]
-        } else {
-            let i = usize::from(w > ANCHORS[1]);
-            let (w0, w1) = (ANCHORS[i], ANCHORS[i + 1]);
-            let (c0, c1) = (i128::from(self.ns[i]), i128::from(self.ns[i + 1]));
-            let t = i128::from(w - w0);
-            let span = i128::from(w1 - w0);
-            (c0 + (c1 - c0) * t / span).max(0) as u64
-        };
-        Duration::from_nanos(ns)
+        Duration::from_nanos(self.ns_at(width))
+    }
+
+    /// The cheapest cost over all widths (the model is evaluated at every width,
+    /// so this is right also for a table whose cost rises with width). A region
+    /// whose serial estimate is below `PAYS * min()` pays at no width, which is
+    /// the cheap rejection before a per-width search.
+    #[inline]
+    pub fn min(&self) -> Duration {
+        let mut m = self.ns[0];
+        let mut k = 1;
+        while k < TABLE {
+            if self.ns[k] < m {
+                m = self.ns[k];
+            }
+            k += 1;
+        }
+        Duration::from_nanos(m)
     }
 }
 
@@ -217,7 +265,18 @@ impl DispatchCosts {
         self
     }
 
+    /// The cheapest cost of `kind` over all widths ([`WidthCosts::min`]): a
+    /// region below `PAYS * min_cost(kind)` pays at no width of that kind.
+    pub fn min_cost(&self, kind: DispatchKind) -> Duration {
+        match kind {
+            DispatchKind::Team => self.team.min(),
+            DispatchKind::InPool => self.in_pool.min(),
+            DispatchKind::Outside => self.outside.min(),
+        }
+    }
+
     /// The cost of one section of `width` participants on a token of `kind`.
+    #[inline]
     pub fn cost(&self, kind: DispatchKind, width: NonZeroUsize) -> Duration {
         match kind {
             DispatchKind::Team => self.team.at(width),
@@ -233,12 +292,19 @@ impl Default for DispatchCosts {
     }
 }
 
-fn ns_f64(d: Duration) -> f64 {
-    d.as_secs_f64() * 1e9
+/// [`PAYS`] as the integer the comparison uses (checked equal in the tests).
+const PAYS_INT: u128 = 3;
+
+/// `est_ns >= PAYS * sections * cost_ns` in integers; `cost_ns` must not be the
+/// saturated serial cost.
+#[inline]
+fn pays_ns(est_ns: u64, sections: u32, cost_ns: u64) -> bool {
+    u128::from(est_ns) >= PAYS_INT * u128::from(sections) * u128::from(cost_ns)
 }
 
 /// The one rule: parallel exactly when
-/// `estimate >= PAYS * sections * dispatch_cost`.
+/// `estimate >= PAYS * sections * dispatch_cost`, compared in integer
+/// nanoseconds.
 ///
 /// `dispatch_cost` comes from [`Exec::dispatch_cost`](crate::Exec::dispatch_cost)
 /// (or a consumer's own token type that delegates to it). `Duration::MAX`
@@ -265,7 +331,7 @@ pub fn pays_at(estimate: Duration, sections: u32, dispatch_cost: Duration) -> bo
     if sections == 0 {
         return true;
     }
-    ns_f64(estimate) >= PAYS * f64::from(sections) * ns_f64(dispatch_cost)
+    pays_ns(to_ns(estimate), sections, to_ns(dispatch_cost))
 }
 
 /// The width in `1..=budget` that minimises `sections * D(k) + estimate / k`,
@@ -290,7 +356,8 @@ pub fn width_for_by(
     budget: NonZeroUsize,
     cost: impl Fn(NonZeroUsize) -> Duration,
 ) -> NonZeroUsize {
-    let est = ns_f64(estimate);
+    let est_ns = to_ns(estimate);
+    let est = est_ns as f64;
     let mut best = NonZeroUsize::MIN;
     let mut best_obj = est;
     for k in 2..=budget.get() {
@@ -298,10 +365,14 @@ pub fn width_for_by(
             continue;
         };
         let d = cost(width);
-        if !pays_at(estimate, sections, d) {
+        if d == Duration::MAX {
             continue;
         }
-        let obj = f64::from(sections) * ns_f64(d) + est / k as f64;
+        let d_ns = to_ns(d);
+        if sections != 0 && !pays_ns(est_ns, sections, d_ns) {
+            continue;
+        }
+        let obj = f64::from(sections) * d_ns as f64 + est / k as f64;
         if obj < best_obj {
             best = width;
             best_obj = obj;
@@ -342,6 +413,90 @@ mod tests {
         // Non-monotone anchors interpolate without underflow.
         let n = WidthCosts::new([us(1), us(5), us(0)]);
         assert_eq!(n.at(nz(5)), Duration::from_nanos(2500));
+    }
+
+    /// The model as it was before the table: i128 interpolation on every call.
+    fn old_at(ns: [u64; 3], w: u64) -> u64 {
+        if w <= 2 {
+            ns[0]
+        } else if w >= 6 {
+            ns[2]
+        } else {
+            let i = usize::from(w > 4);
+            let (w0, w1) = ([2u64, 4, 6][i], [2u64, 4, 6][i + 1]);
+            let (c0, c1) = (i128::from(ns[i]), i128::from(ns[i + 1]));
+            (c0 + (c1 - c0) * i128::from(w - w0) / i128::from(w1 - w0)).max(0) as u64
+        }
+    }
+
+    #[test]
+    fn table_equals_the_interpolation_for_every_width() {
+        let tables = [
+            [3000, 2300, 1400],
+            [2800, 2200, 1700],
+            [14000, 18000, 19000],
+            [9500, 10100, 8800],
+            [3100, 3600, 3500],
+            [1000, 5000, 0],
+            [0, 0, 0],
+            [7, 3, 11],
+        ];
+        for ns in tables {
+            let c = WidthCosts::new(ns.map(Duration::from_nanos));
+            for w in 1..=64u64 {
+                assert_eq!(
+                    c.at(nz(w as usize)),
+                    Duration::from_nanos(old_at(ns, w)),
+                    "{ns:?} width {w}"
+                );
+            }
+        }
+        for d in [
+            DispatchCosts::apple_m5(),
+            DispatchCosts::linux_x86(),
+            DispatchCosts::generic(),
+        ] {
+            for kind in [
+                DispatchKind::Team,
+                DispatchKind::InPool,
+                DispatchKind::Outside,
+            ] {
+                let m = (1..=64).map(|w| d.cost(kind, nz(w))).min().unwrap();
+                assert_eq!(d.min_cost(kind), m);
+            }
+        }
+    }
+
+    #[test]
+    fn min_is_right_for_a_rising_table_and_a_falling_one() {
+        let rising = WidthCosts::new([us(2), us(5), us(9)]);
+        assert_eq!(rising.min(), us(2));
+        let falling = WidthCosts::new([us(9), us(5), us(2)]);
+        assert_eq!(falling.min(), us(2));
+        let dip = WidthCosts::new([us(9), us(1), us(9)]);
+        assert_eq!(dip.min(), us(1));
+        assert_eq!(WidthCosts::flat(us(4)).min(), us(4));
+    }
+
+    #[test]
+    fn pays_matches_the_float_rule() {
+        assert_eq!(PAYS, PAYS_INT as f64);
+        for cost in [1u64, 700, 1700, 2800, 19_000] {
+            for sections in [1u32, 2, 5] {
+                let edge = 3 * u64::from(sections) * cost;
+                for est in [edge - 1, edge, edge + 1] {
+                    let f = est as f64 >= PAYS * f64::from(sections) * cost as f64;
+                    assert_eq!(
+                        pays_at(
+                            Duration::from_nanos(est),
+                            sections,
+                            Duration::from_nanos(cost)
+                        ),
+                        f
+                    );
+                }
+            }
+        }
     }
 
     #[test]

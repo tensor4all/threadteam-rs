@@ -92,3 +92,41 @@ fn a_member_that_parks_after_the_first_wake_is_woken_by_the_second() {
         m.join().unwrap();
     });
 }
+
+/// Per-slot parkers: a leader wakes only the slot it published to; the member
+/// of another slot stays asleep until its own state changes, and is then woken
+/// by its own parker (no lost wake-up on either slot).
+#[test]
+fn a_wake_of_one_slot_leaves_the_other_asleep_until_its_own_change() {
+    model(|| {
+        let gens = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let state = Arc::new(AtomicUsize::new(RESERVED));
+        let parkers = [Arc::new(Parker::new()), Arc::new(Parker::new())];
+        let ms: Vec<_> = (0..2)
+            .map(|i| {
+                let (gen, state, parker) = (gens[i].clone(), state.clone(), parkers[i].clone());
+                thread::spawn(move || {
+                    parker.park_while(|| {
+                        gen.load(Ordering::SeqCst) == 0 && state.load(Ordering::SeqCst) == RESERVED
+                    });
+                    // Woken by its own slot: the generation moved or the
+                    // reservation ended.
+                    assert!(
+                        gen.load(Ordering::SeqCst) != 0 || state.load(Ordering::SeqCst) != RESERVED
+                    );
+                })
+            })
+            .collect();
+        // Section addressed to slot 0 only.
+        gens[0].fetch_add(1, Ordering::SeqCst);
+        parkers[0].wake();
+        // Release: every slot changed, every parker is woken.
+        state.store(IDLE, Ordering::SeqCst);
+        for p in &parkers {
+            p.wake();
+        }
+        for m in ms {
+            m.join().unwrap();
+        }
+    });
+}

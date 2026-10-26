@@ -30,7 +30,7 @@ Data: [`thresholds-data/tables.md`](thresholds-data/tables.md) (every table), ra
 "Work" is what the comparison counts. Kinds of token: **T** team token, **P** plain token (outside or
 inside its pool). A threshold written once applies to every kind of token today, which is the problem.
 
-### faer (t4a-faer `exp/par-team-lifetime` at `6788b20`; paths under `faer/src/`)
+### faer (t4a-faer `exp/par-team-lifetime` at `7b60550`; paths under `faer/src/`)
 
 Every gate is `pays(estimate, sections, width)` with `PAYS = 3` (section 3.1). The estimate is work times the
 serial rate of the family (section 2.3), `sections` is counted in the code of the gate. A shape condition that
@@ -52,17 +52,29 @@ states a concern other than cost stays and is named. Token: **T** team, **P** pl
 | same, shape conditions | `deep_rows >= 2n` (reduction deep against its `n x n` output), `>= 4 * threads` (rows per task) | not a cost, kept | |
 | `linalg/householder.rs` rank one apply (`N == 1`) | `M*K` target elements | rank one apply rate | 1 |
 | same, row split | `M*N*K` multiply-adds; shape: `M >= 2K`, `M >= 4 * threads`, chunk covers `N` | GEMM rate | 1 |
-| same, column split | `(1 or 2) * M*N*K` multiply-adds at width `n_tasks` | GEMM rate | 1 |
+| same, column split | `(1 or 2) * M*N*K` multiply-adds at the GEMM rate plus `M*K` target elements at the rank one apply rate (`cost::block_apply_estimate`), at width `n_tasks` | GEMM and rank one rates | 1 |
 | `linalg/matmul/mod.rs` matvec (both layouts) | `nrows*ncols` | matvec rate | 1 |
 | `linalg/matmul/internal/mod.rs` `spicy_matmul` | `nrows*ncols*depth` | GEMM rate | 1 |
-| `linalg/matmul/triangular.rs` product with a triangular right side | `m*n*n/2` | GEMM rate | 1 per level |
-| same, product into a triangle | `n*n*k/2` | GEMM rate | 2 per level (outer join, join in its second half) |
-| `linalg/triangular_solve.rs` (two sites) | `n*n*k/2`; the split for `k > 64 && n <= 128` is a shape rule, taken for every parallelism | GEMM rate | 1 (the join) |
+| `linalg/matmul/triangular.rs` product with a triangular right side (a join) | `m*n*n/2` | GEMM rate | 1 per level, width 2 |
+| same, product into a triangle (joins) | `n*n*k/2` | GEMM rate | 2 per level (outer join, join in its second half), width 2 |
+| `linalg/triangular_solve.rs` (two sites) | `n*n*k/2`; the split for `k > 64 && n <= 128` is a shape rule, taken for every parallelism | GEMM rate | 1 (the join), width 2 |
 | LLT, LDLT, Bunch-Kaufman with partial pivoting | no gate of their own | the product and solve gates | |
-| `bidiag_svd.rs` and `tridiag_evd.rs` joins, `triangular_inverse.rs`, norm reductions, `zip`, `sparse/linalg/matmul.rs` | none | no work gate (not converted) | |
+| `linalg/svd/bidiag_svd.rs` recursion join | `2 (n/2)^2` (two whole solves of half the size) | bidiagonal D&C rate per `m^2` | 1, width 2 |
+| same, merge products (`update_v`, `update_u`, and their join when both run) | `(k^2 + rem^2) * n` multiply-adds (`update_v`), `((k+1)^2 + (rem+1)^2) * (n+1)` (`update_u`), the sum for the join of both | GEMM rate | 1 each, width 2 |
+| `linalg/evd/tridiag_evd.rs` recursion join | `2 (n/2)^2` | tridiagonal D&C rate per `m^2` | 1, width 2 |
+| same, merge products | `(n1^2 + (n-n1)^2) * n` multiply-adds | GEMM rate | 1, width 2 |
+| `linalg/triangular_inverse.rs` join (lower and unit lower) | `2 (n/2)^3` | triangular inverse rate per `m^3` | 1, width 2 |
+| `sparse/linalg/matmul.rs` numeric product | the symbolic flop count (`SparseMatMulInfo`, already computed) | sparse product rate per multiply-add | 1, width = degree (one flat section over the column ranges) |
+| norm reductions (`norm_l2`, `norm_l2_sqr`, `norm_max`, `norm_l1`), `zip` and the elementwise kernels | no parallel region exists (no `par` argument, no Rayon call, serial pairwise SIMD reductions and loops) | nothing to gate | |
 
 `ParThreshold { Derived, Fixed(n), Never }` is the one type of every `par_threshold` field of these families
 (`Derived` is the default and is the table above; `Fixed(n)` is an explicit floor in the unit of the field).
+The new join gates have no params field (nothing was configurable there before).
+
+A join (`join_raw`, a split of the budget into two halves) is a section of **width 2**: its cost is the
+dispatch cost at width 2 (team 3.0 us, plain outside 14 us on the M5 table), not at the full degree (1.4 and 19 us
+at width 6). Evidence: a 64 x 64 triangular product on a team of 6 is 7.0 us serial and 8.1 us with the join at an
+estimate of 4.8 us (`data/probes/20261026-qr128-regions/raw/trimm.csv`).
 
 ### strided-rs (main, `d24474d`)
 
@@ -229,6 +241,14 @@ was 85.2 to 92.6 percent; 4 of 22 processes ended below 85 percent idle (74 to 7
 cause not identified), among them both Hessenberg processes, whose values (range 0.42 to 0.53 for f64) are used
 as measured and marked below.
 
+The last faer rows (block apply streaming term, divide and conquer solves, triangular inverse, sparse product)
+are from `faer-benchmark` `data/probes/20261026-qr128-regions/` (`consts/`, `raw/applyrate.csv`, `raw/apply.csv`):
+the whole serial operation at one thread over shapes `m` 64 to 512 (block apply: `M` 24 to 512, `N` 2 to 32),
+primed 250 ms, median of at least 15 repetitions, QoS `UserInitiated`, the same host protocol; 2 of the 9
+constant processes (the bidiagonal SVD on Gaussian data and the triangular inverse with c64) are marked busy in
+its `processes.log`; the first agrees with its clean rerun within 2 percent and the f64 inverse with the clean
+run within 1 percent, the c64 inverse has no clean run.
+
 | family | unit | f64 | c64 | range over shapes (f64) |
 | --- | --- | --- | --- | --- |
 | faer GEMM (and tcontract matmul) | MAC | 0.037 | 0.165 | 0.034 to 0.040 (`16^3` is 0.07) |
@@ -242,6 +262,11 @@ as measured and marked below.
 | faer matvec, column major / row major | matrix element | 0.112 / 0.087 (used: 0.100) | 0.281 / 0.425 (used: 0.340) | 0.087 to 0.138 |
 | faer rank one Householder apply | target element `M*K` | 0.212 | 0.725 | 0.204 to 0.223 |
 | faer block apply, triangular product, triangular solve | MAC | 0.037, 0.039, 0.051 (use the GEMM rate) | 0.165, 0.176, 0.187 | |
+| faer block apply, streaming term (with the GEMM term, `block_apply_estimate`) | target element `M*K` | 0.236 (the rank one rate 0.212 is used) | 0.538 (0.725 is used) | fit over `M` 24 to 512, `N` 2 to 32: median error 7 percent f64, 4 percent c64 |
+| faer bidiagonal SVD divide and conquer, whole solve (both vectors) | `m^2` (time `45 m^2 + 0.023 m^3`) | 53 | not used (real types) | 47.6 to 61.7 over `m` 64 to 512 |
+| faer tridiagonal EVD divide and conquer, whole solve (eigenvectors) | `m^2` | 31 | not used (real types) | 26.6 to 36.2 over `m` 64 to 512 |
+| faer triangular inverse, whole serial inverse | `m^3` | 0.0096 | 0.0344 | 0.0081 to 0.0125 (`m` 128 to 512; 0.022 at 64) |
+| faer sparse by sparse numeric product | symbolic multiply-add | 1.5 | 1.8 | 1.15 to 2.07 (six shapes, 4 to 40 entries per column, `n` 2000 to 20000) |
 | strided copy f64 | element | 0.090 | | 0.065 to 0.105 |
 | strided map `2x+1` f64 | element | 0.100 | | 0.073 to 0.129 |
 | strided map `exp` f64 | element | 1.38 | | 1.36 to 1.39 |
@@ -312,7 +337,7 @@ Steady-state defaults (Apple M5 Max, 6 threads, `UserInitiated`), microseconds, 
 The values of section 2.3 are named constants with a reference to the bench that produces them. faer:
 `utils::cost::ns_per_mac` (GEMM) and `utils::cost::rate` (`Rate { real, cplx }`: `LU_FULL_PIVOT`,
 `BUNCH_KAUFMAN`, `QR_COL_PIVOT`, `BIDIAG`, `HESSENBERG`, `TRIDIAG`, `MATVEC`, `HOUSEHOLDER_RANK_ONE`,
-`GEMM_MAC`), `NS_PER_SWAP = 0.55`. Planned for the other crates: `NS_PER_ELEM_COPY = 0.090`,
+`GEMM_MAC`, `BIDIAG_SVD_DC`, `TRIDIAG_EVD_DC`, `TRIANGULAR_INVERSE`, `SPARSE_MATMUL`), `NS_PER_SWAP = 0.55`. Planned for the other crates: `NS_PER_ELEM_COPY = 0.090`,
 `NS_PER_ELEM_MAP = 0.100`, `NS_PER_ELEM_EXP = 1.38`, `NS_PER_ELEM_SUM = 0.081`; tcontract's `NS_PER_FLOP`
 becomes 0.0185 and `muladds_per_ns` 27 (from 10). The throughput does not depend on the token, so one set serves
 all kinds.
@@ -352,12 +377,19 @@ and 237 thousand; tridiagonalization 12 thousand and 168 thousand (of the triang
 thousand matrix elements. The previous constants were `192 * 256 = 49152` elements for the last four families on
 every token.
 
+Joins are sections of width 2 (3.0 us on a team, 14 us outside the pool, so 9 us and 42 us of estimated work):
+the triangular inverse joins from `n` about 154 on a team and 260 outside the pool (`2 (n/2)^3` at 0.0096 ns), the
+divide and conquer joins from `n` about 20 and 40 (`2 (n/2)^2` at 53 ns, f64), the triangular product joins at
+`m*n*n/2` of 247 thousand multiply-adds on a team (`n` about 79) and 1.15 million outside. The numeric sparse
+product is one flat section over the column ranges at the full degree: 2.8 thousand multiply-adds on a team,
+38 thousand outside the pool (1.5 ns each). The block apply column split on a team of 6 starts at `M = 80` for a
+basis of 8 columns (estimate 4.6 us, measured serial 4.7 us).
+
 ### 3.4 What changed and what remains
 
 Done in `threadteam`: the API above, the defaults table, tests, `placement.md` and the README table.
 
-Done in faer (`exp/par-team-lifetime`, `6788b20`): every gate of the inventory table of section 1 except the ones
-the last row names.
+Done in faer (`exp/par-team-lifetime`, `7b60550`): every gate of the inventory table of section 1.
 
 * GEMM floors (`matmul/mod.rs`, `utils/team.rs`): `pays(estimate, 1, width)` with the GEMM rate of the dtype
   (`utils::cost::ns_per_mac`; the team route used to compare `m*n*k` with the real floor for complex products).
@@ -375,10 +407,26 @@ the last row names.
   --lib` with `std rayon threadteam` and with default features passes except the three known `strict_triangle`
   cases.
 
-Remaining work in faer: the divide and conquer joins of `bidiag_svd.rs` and `tridiag_evd.rs`,
-`triangular_inverse.rs`, the norm reductions, `zip` and `sparse/linalg/matmul.rs` have no work gate. The f32 and
-c32 rates of the families other than the GEMM are halved, not measured. The Hessenberg constant is from processes
-marked busy.
+* Joins (`utils::cost::join_pays`, one section of width 2 per join, `sections` counted per site): the recursion and
+  merge joins of `bidiag_svd.rs` and `tridiag_evd.rs`, the join of `triangular_inverse.rs`, and (changed from the
+  full degree) the joins of the triangular products and of the split triangular solve. The sparse numeric product
+  (`sparse/linalg/matmul.rs`) is gated on its symbolic flop count and runs its column ranges as one range when
+  the rule fails. The block apply column split is estimated as `2 M N K` multiply-adds at the GEMM rate plus `M K`
+  target elements at the rank one apply rate (`cost::block_apply_estimate`): median error 7 percent over the
+  measured bases, against a single GEMM rate that was 0.6 to 0.8 of the measured time at `N = 8`.
+* The norm reductions, `zip` and the elementwise kernels have no parallel region (no `par` argument, no Rayon call),
+  so there is nothing to gate; a parallel norm would be a new feature.
+* `utils::cost::par_pays` and `ParThreshold::region_pays` return false for a sequential token before computing the
+  estimate (a `128 x 128` QR asks 500 times).
+* Probe feature `par-trace`: `utils::cost::trace` records every gate decision (site, dimensions, units, sections,
+  estimate, dispatch cost, decision).
+
+Remaining work in faer: the f32 and c32 rates of the families other than the GEMM are halved, not measured. The
+Hessenberg constant is from processes marked busy. The rate of a family falls with the size (the triangular inverse
+is 0.022 ns per `m^3` at 64 and 0.0095 at 256), so a model with one constant under estimates the halves of a small
+join (5.0 us against 11.6 us at `n = 128`); a size dependent rate would be a second constant per family.
+`ParShape::pays` has no kind of section for a split of a team (the LU swap stage splits cost about 13 us), so the
+width 2 cost of a join is the best available number, not a measured cost of `Team::split`.
 
 Remaining work in the other repositories (later task):
 
@@ -422,10 +470,31 @@ times in microseconds are in the probe README):
 | EVD (eigh) 128, 256, 512 | 1.24, 0.81, 0.69 | 1.01, 0.81, 0.66 | 1.23, 0.79, 0.69 | 1.01, 0.81, 0.66 |
 
 The plain token is no longer slower than serial at 128 and 256 for QR and at 128 for the eigensolver. QR at 128 on
-a team is worse than before (86 us to 102 us, serial 120 us); the cause is not established (candidate: the
-Householder regions of the blocked QR at shapes whose GEMM rate is below the L2 resident rate of the constant,
-`16^3` is 0.07 ns per MAC against 0.037). SVD at 128 is 0.82 for every 6 thread row, before and after: the
-parallel joins of `bidiag_svd` have no gate.
+a team was worse than before (86 us to 102 us, serial 120 us); the cause is established below.
+
+QR 128 on a team and the join gates (`data/probes/20261026-qr128-regions/`, same host and protocol, 2 to 8 passes
+per cell, many of them marked busy by the desktop session; ratio to one thread serial, before is `6788b20`, after is
+`7b60550`; microseconds and every raw file are in the probe README):
+
+| cell | plain before | plain after | team before | team after |
+| --- | --- | --- | --- | --- |
+| QR 128, 256, 512 | 1.02, 1.14, 0.68 | 1.02, 1.16, 0.71 | 0.82, 0.61, 0.41 | 0.80, 0.62, 0.47 (check: 0.41 to 0.47, noise) |
+| SVD (U, V) 128, 256, 512 | 0.88, 0.88, 0.75 | 0.83, 0.87, 0.76 | 0.76, 0.61, 0.44 | 0.76, 0.63, 0.42 |
+| EVD (eigenvectors) 128, 256, 512 | 0.98, 0.86, 0.67 | 0.99, 0.85, 0.66 | 0.97, 0.56, 0.39 | 0.98, 0.58, 0.39 |
+| triangular inverse 128, 256, 512 | 6.62, 1.67, 0.96 | 1.00, 1.00, 0.90 | 0.81, 0.48, 0.29 | 1.04, 0.52, 0.31 |
+| sparse product (4 per column) 500, 2000, 8000 | 15.0, 3.09, 0.83 | 1.02, 1.01, 0.84 | 0.44, 0.27, 0.25 | 0.47, 0.28, 0.25 |
+
+Cause of QR 128 (evidence: a decision trace of the 512 gate decisions of one factorization, and forced parallel
+against serial timing of every block apply it contains): of those gates only the column split of the block apply
+(`N = 8`, `M = 56` to 128) changed its decision between `9cd64f0` (10 of 59 parallel) and `6788b20` (5). Its estimate
+(`2 M N K` multiply-adds at the GEMM rate) was 0.58 to 0.77 of the measured serial time because the apply also
+streams its target; with the GEMM term plus a streaming term at the rank one apply rate it is 0.85 to 1.05, and the
+split starts at `M = 80` (7 of 59 parallel), 100 us against 105 us in one process. The three regions left serial
+(`M` 56, 64, 72) gain 1.1, 0.9 and 2.0 us when forced parallel and have estimates of 2.2, 2.9 and 3.7 us against the
+rule's 4.2 us: that is the margin of `PAYS = 3` (break-even is about 1.2 times the dispatch at width 6), the rule is
+kept, and 4 us of the remaining distance to the 87 to 94 us of `9cd64f0` is theirs. `sections = 1` was right.
+
+Norm and `zip` cases are not in the table: they have no parallel region.
 
 ## 4. Limits of this data
 

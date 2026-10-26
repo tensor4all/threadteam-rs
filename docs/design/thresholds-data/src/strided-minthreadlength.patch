@@ -1,0 +1,13 @@
+diff --git a/strided-perm/src/lib.rs b/strided-perm/src/lib.rs
+index 11c309d..fdef2fc 100644
+--- a/strided-perm/src/lib.rs
++++ b/strided-perm/src/lib.rs
+@@ -40,7 +40,7 @@ pub use fuse::{plan_bilateral_fusion, BilateralFusionPlan, FusionPlanError};
+ /// one task at or below it, and `strided-basic` re-exports this constant for
+ /// its own entries. Matches Julia's `MINTHREADLENGTH = 1 << 15`; see
+ /// `docs/design/erased-execution-policy.md` for the decision record.
+-pub const MINTHREADLENGTH: usize = 1 << 15;
++pub const MINTHREADLENGTH: usize = 1 << 4;
+ 
+ // Constants
+ pub const BLOCK_MEMORY_SIZE: usize = 32 * 1024;

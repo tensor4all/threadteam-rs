@@ -552,6 +552,49 @@ chunk-owned partials, fixed merge order): the crate gives no stealing within a
 team, so a section's shares are exactly the participants. Cache-domain layout and
 pinning are not handled.
 
+## Dispatch cost and the parallel rule
+
+A token states what one parallel section costs it; a kernel states how long its
+region takes on one thread (`docs/design/thresholds.md` has the data). A region
+runs in parallel when
+
+```
+serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
+```
+
+* `Exec::dispatch_cost(width)` and `TeamExec::dispatch_cost(width)` return
+  `D(width)`, the steady-state cost of one section (back to back, shares that
+  carry work). A serial token, `width < 2`, or a team of one gives
+  `Duration::MAX`; `width` is clamped to the budget.
+* The kind of token is read at call time: team authority (`Team` tokens and their
+  `fork` children) is `DispatchKind::Team`; a plain token whose caller is a worker
+  of its pool is `InPool`; a plain token called from outside is `Outside`. No
+  thread-local state is involved and nothing allocates.
+* `DispatchCosts` holds one `WidthCosts` per kind (values at widths 2, 4 and 6,
+  linear in between, flat above 6).
+  `DispatchCosts::for_class(HostClass)` is the row of a host class, and
+  `DispatchCosts::host_default()` the row of `HostClass::detect()`. Classes are keyed by the kernel dispatch the
+  machine takes, not by the CPU model: `x86_64-avx512` (runtime `avx512f`), `x86_64-avx2` (`avx2` + `fma`),
+  `x86_64-scalar`, `aarch64-apple` (aarch64 on macOS), `aarch64`, `generic`; detected once per process.
+  `x86_64-avx512` holds the measured Ryzen row (team 0.6/0.7/0.9, in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us),
+  `aarch64-apple` the measured Apple M5 row, and every class without a measurement the conservative flat
+  `generic` row (3, 15, 40 microseconds). The rates of the consumer crates (strided-rs, tcontract-rs, faer) are
+  tables of their own, keyed by the same class names, and a class's rates and dispatch costs come from the same
+  machine in the same clock state: boost on/off moves both by about 1.66x and leaves the ratio stable within a
+  few percent (`faer-benchmark` `raw-exec3-boost`, `tables-*-exec3-boost.md`). Each crate carries an identical
+  `HostClass` and `detect()`, kept in sync with `threadteam`'s by hand.
+  `PoolBuilder::dispatch_costs` overrides it.
+* `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
+  `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,
+  sections)` (and `width_for_by` for a consumer's own cost function) returns the
+  width in `1..=budget` that minimises `sections * D(k) + estimate / k` among the
+  widths that pay, or 1.
+* `sections` is the number of dispatches the region really performs. It is a
+  count, not a tuning knob: a region that enters the token twice declares 2.
+* The costs are steady-state values. The wake penalty after members parked (about
+  27 microseconds on the measured host) is documented and is not folded into
+  `PAYS` or the table.
+
 ## Planned: one pool per cache domain
 
 A `Pool` built with a domain layout holds one Rayon pool per shared-cache

@@ -46,6 +46,11 @@ name = "team_dispatch"
 harness = false
 
 [[bench]]
+name = "dispatch_cost"
+harness = false
+required-features = ["parallel"]
+
+[[bench]]
 name = "wake_probe"
 harness = false
 
@@ -69,3 +74,7 @@ required-features = ["test-hooks", "parallel"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[[bench]]
+name = "cost_lookup"
+harness = false

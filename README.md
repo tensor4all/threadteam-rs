@@ -54,10 +54,13 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | `Exec::for_ranges(len, grain, f)` | at most `budget` tasks, ranges of at least `grain` except possibly the last |
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
 | `Exec::can_broadcast()` | non-consuming: true exactly when `broadcast` would not refuse right now; ask before building an expensive setup |
+| `Exec::carries_team()` | true when the token has team authority (minted by a `Team` or a child of one); `team()` then returns the carried team without acquisition, so a consumer that wants a `TeamExec` asks this and keeps `external` for plain tokens |
 | `Exec::team(f)` / `team_with(over, f)` | reserve `budget - 1` awake pool members for a scope and run barrier-bearing sections through `TeamExec` (`run`, `run_with`, `split`, `fork`, `reborrow`), or `Err(Refused::Unavailable)`; see the design record |
 | `Pool::into_team(width)` -> `Team` (owns the pool; `IntoTeamError` gives it back), `Team::exec(budget)` / `try_exec`, `Team::pool`, `Team::into_pool` | persistent reservation for an engine that owns its pool (`Pool` is not `Clone`); minted tokens are ordinary `Exec`s whose `fork`, `for_ranges`, `broadcast`, `team` dispatch on the reserved members; one leader at a time (`exec` blocks, `try_exec` -> `Refused::Busy`); idle members park while reserved |
 | `PoolBuilder::qos(Qos)`, `raise_current_thread_qos(Qos)` | worker QoS on macOS (default `UserInitiated`); raise the leading thread without ever lowering it |
 | `PoolBuilder::idle_spin`, `idle_runs_rayon`, `acquire_timeout`; `Pool::release_idle` | waiting policy of idle team members |
+| `DispatchCosts`, `PoolBuilder::dispatch_costs`, `Exec::dispatch_cost(width)`, `TeamExec::dispatch_cost(width)` | cost of one parallel section per kind of token (team, in pool, outside), steady state; one row per `HostClass` (`HostClass::detect()`, keyed by kernel dispatch: `x86_64-avx512`, `x86_64-avx2`, `x86_64-scalar`, `aarch64-apple`, `aarch64`, `generic`), `DispatchCosts::for_class(class)`; measured rows for `x86_64-avx512` and `aarch64-apple`, every other class takes the conservative `generic` row (3 / 15 / 40 us); `DispatchCosts::host_default()` is the detected class's row; `Duration::MAX` when serial; override per pool |
+| `pays_at(est, sections, cost)`, `Exec::pays(est, sections, width)`, `Exec::width_for(est, sections)`, `width_for_by`, `PAYS` | the one rule: parallel iff `est >= PAYS * sections * D(width)`; `width_for` minimises `sections * D(k) + est / k` |
 | `Exec::external(f)` | enter the pool once and hand the budget as a plain width to an outside library (faer, a vendor BLAS); how it divides the width is that library's concern |
 
 ## Contracts

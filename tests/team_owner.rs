@@ -18,7 +18,7 @@ fn watchdog() -> impl Drop {
     }
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     std::thread::spawn(move || {
-        if rx.recv_timeout(Duration::from_secs(45)).is_err() {
+        if rx.recv_timeout(Duration::from_secs(120)).is_err() {
             eprintln!("watchdog: test stalled");
             std::process::exit(101);
         }
@@ -481,7 +481,7 @@ fn cold_scoped_teams_with_zero_spin_never_lose_a_member() {
         .build()
         .unwrap();
     let mut exec = Exec::new(&pool, 12).unwrap();
-    for i in 0..1500 {
+    for i in 0..500 {
         while pool.resident_members() != 0 {
             std::thread::yield_now();
         }

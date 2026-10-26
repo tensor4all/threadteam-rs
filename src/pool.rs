@@ -1,6 +1,7 @@
 //! The pool type and its builder.
 
 use crate::awake::Awake;
+use crate::cost::DispatchCosts;
 use crate::error::Error;
 use crate::policy::{Qos, WaitPolicy};
 use core::fmt;
@@ -131,6 +132,20 @@ impl Pool {
         self.awake.release_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
+    /// The [`DispatchCosts`] of this pool's tokens.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{DispatchCosts, Pool};
+    /// let pool = Pool::builder().threads(1).build()?;
+    /// assert_eq!(pool.dispatch_costs(), DispatchCosts::host_default());
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn dispatch_costs(&self) -> DispatchCosts {
+        self.awake.costs
+    }
+
     /// Number of workers currently kept awake as team members, reserved or
     /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
     /// can change at any moment.
@@ -209,6 +224,7 @@ pub struct PoolBuilder {
     wait: WaitPolicy,
     acquire_timeout: Duration,
     qos: Option<Qos>,
+    costs: DispatchCosts,
 }
 
 impl PoolBuilder {
@@ -221,6 +237,7 @@ impl PoolBuilder {
             wait: WaitPolicy::DEFAULT,
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             qos: None,
+            costs: DispatchCosts::host_default(),
         }
     }
 
@@ -378,6 +395,34 @@ impl PoolBuilder {
         self
     }
 
+    /// Overrides the [`DispatchCosts`] of this pool's tokens.
+    ///
+    /// Defaults to [`DispatchCosts::host_default`]. The costs feed
+    /// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost) and everything built on
+    /// it (`pays`, `width_for`); they never change how work is placed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use std::time::Duration;
+    /// use threadteam::{DispatchCosts, DispatchKind, Exec, HostClass, Pool, WidthCosts};
+    ///
+    /// let costs = DispatchCosts::for_class(HostClass::Generic)
+    ///     .with(DispatchKind::Outside, WidthCosts::flat(Duration::from_micros(7)));
+    /// let pool = Pool::builder().threads(2).dispatch_costs(costs).build()?;
+    /// let exec = Exec::new(&pool, 2)?;
+    /// // Without the `parallel` feature the pool has width 1: no section, no cost.
+    /// let expected = if pool.width().get() >= 2 { Duration::from_micros(7) } else { Duration::MAX };
+    /// assert_eq!(exec.dispatch_cost(NonZeroUsize::new(2).unwrap()), expected);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn dispatch_costs(mut self, costs: DispatchCosts) -> Self {
+        self.costs = costs;
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -454,7 +499,12 @@ impl PoolBuilder {
             inner,
             _joiner: Joiner { handles },
             width,
-            awake: Arc::new(Awake::new(width.get(), self.wait, self.acquire_timeout)),
+            awake: Arc::new(Awake::new(
+                width.get(),
+                self.wait,
+                self.acquire_timeout,
+                self.costs,
+            )),
         })
     }
 
@@ -462,7 +512,7 @@ impl PoolBuilder {
     fn build_checked(self) -> Result<Pool, Error> {
         Ok(Pool {
             width: NonZeroUsize::MIN,
-            awake: Arc::new(Awake::new(1, self.wait, self.acquire_timeout)),
+            awake: Arc::new(Awake::new(1, self.wait, self.acquire_timeout, self.costs)),
         })
     }
 }

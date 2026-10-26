@@ -412,7 +412,9 @@ impl PoolBuilder {
     ///     .with(DispatchKind::Outside, WidthCosts::flat(Duration::from_micros(7)));
     /// let pool = Pool::builder().threads(2).dispatch_costs(costs).build()?;
     /// let exec = Exec::new(&pool, 2)?;
-    /// assert_eq!(exec.dispatch_cost(NonZeroUsize::new(2).unwrap()), Duration::from_micros(7));
+    /// // Without the `parallel` feature the pool has width 1: no section, no cost.
+    /// let expected = if pool.width().get() >= 2 { Duration::from_micros(7) } else { Duration::MAX };
+    /// assert_eq!(exec.dispatch_cost(NonZeroUsize::new(2).unwrap()), expected);
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[must_use]

@@ -35,8 +35,9 @@ pub enum DispatchKind {
 /// Dispatch cost of one kind of token at the measured widths 2, 4 and 6.
 ///
 /// The model: linear interpolation between the anchors, the value at width 2
-/// below it, and above width 6 the width 6 value grown in proportion to the
-/// width (a wider team wakes and joins more participants). Width 1 never
+/// below it, and above width 6 the width 6 value held flat (the Linux data at
+/// width 8 is below the width 6 value, so flat is conservative and simple).
+/// Width 1 never
 /// reaches the model: a token of one slot has no parallel section, see
 /// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost).
 ///
@@ -51,7 +52,7 @@ pub enum DispatchKind {
 /// let c = WidthCosts::new([us(3), us(2), us(1)]);
 /// assert_eq!(c.at(NonZeroUsize::new(2).unwrap()), us(3));
 /// assert_eq!(c.at(NonZeroUsize::new(3).unwrap()), Duration::from_nanos(2500));
-/// assert_eq!(c.at(NonZeroUsize::new(12).unwrap()), us(2));
+/// assert_eq!(c.at(NonZeroUsize::new(12).unwrap()), us(1));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidthCosts {
@@ -84,10 +85,8 @@ impl WidthCosts {
         let ns = if w <= ANCHORS[0] {
             self.ns[0]
         } else if w >= ANCHORS[2] {
-            // Proportional growth above the last anchor.
-            (u128::from(self.ns[2]) * u128::from(w) / u128::from(ANCHORS[2]))
-                .try_into()
-                .unwrap_or(u64::MAX)
+            // Flat above the last anchor.
+            self.ns[2]
         } else {
             let i = usize::from(w > ANCHORS[1]);
             let (w0, w1) = (ANCHORS[i], ANCHORS[i + 1]);
@@ -103,8 +102,8 @@ impl WidthCosts {
 /// Dispatch costs of a pool's three kinds of token.
 ///
 /// [`host_default`](DispatchCosts::host_default) holds measured values for the
-/// host class it knows (Apple silicon on macOS, QoS `UserInitiated`, the pool
-/// default) and a conservative generic table for every other host. A pool owner
+/// host classes it knows (Apple silicon on macOS, QoS `UserInitiated`, the pool
+/// default; x86_64 Linux) and a conservative generic table for every other host. A pool owner
 /// that measured its own host overrides them with
 /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs).
 ///
@@ -161,6 +160,20 @@ impl DispatchCosts {
         }
     }
 
+    /// Measured on an AMD Ryzen AI 9 HX 470 under Linux, 8 threads on cores
+    /// 4-11, boost off (2.0 GHz), from the back to back sections whose shares
+    /// carry 10 us of work (`faer-benchmark`
+    /// `data/probes/20261026-awake-team-linux`, `docs/design/thresholds.md`
+    /// section 3.6), in microseconds at widths 2, 4, 6: team 2.8, 2.2, 1.7;
+    /// in pool 3.1, 3.6, 3.5; outside 9.5, 10.1, 8.8.
+    pub fn linux_x86() -> Self {
+        DispatchCosts {
+            team: WidthCosts::new([us_f(2.8), us_f(2.2), us_f(1.7)]),
+            in_pool: WidthCosts::new([us_f(3.1), us_f(3.6), us_f(3.5)]),
+            outside: WidthCosts::new([us_f(9.5), us_f(10.1), us_f(8.8)]),
+        }
+    }
+
     /// The conservative table of a host that is not measured: 3 us for a team,
     /// 15 us in the pool and 40 us from outside, at every width. It errs towards
     /// staying serial.
@@ -173,14 +186,21 @@ impl DispatchCosts {
     }
 
     /// The table of this host class: [`apple_m5`](Self::apple_m5) on macOS with
-    /// an aarch64 CPU, [`generic`](Self::generic) elsewhere (Linux and x86_64
-    /// are not measured yet).
+    /// an aarch64 CPU, [`linux_x86`](Self::linux_x86) on Linux with an x86_64
+    /// CPU, [`generic`](Self::generic) elsewhere.
     pub fn host_default() -> Self {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
             Self::apple_m5()
         }
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+        {
+            Self::linux_x86()
+        }
+        #[cfg(not(any(
+            all(target_os = "macos", target_arch = "aarch64"),
+            all(target_os = "linux", target_arch = "x86_64")
+        )))]
         {
             Self::generic()
         }
@@ -316,7 +336,9 @@ mod tests {
         assert_eq!(c.at(nz(1)), us(3));
         assert_eq!(c.at(nz(3)), Duration::from_nanos(2500));
         assert_eq!(c.at(nz(5)), Duration::from_nanos(1500));
-        assert_eq!(c.at(nz(12)), us(2));
+        // Flat above the last anchor.
+        assert_eq!(c.at(nz(8)), us(1));
+        assert_eq!(c.at(nz(12)), us(1));
         // Non-monotone anchors interpolate without underflow.
         let n = WidthCosts::new([us(1), us(5), us(0)]);
         assert_eq!(n.at(nz(5)), Duration::from_nanos(2500));

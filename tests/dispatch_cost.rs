@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use threadteam::{pays_at, DispatchCosts, DispatchKind, Exec, Pool, WidthCosts, PAYS};
+use threadteam::{pays_at, DispatchCosts, DispatchKind, Exec, HostClass, Pool, WidthCosts, PAYS};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -41,7 +41,7 @@ fn us(n: u64) -> Duration {
 
 /// Distinct flat costs per kind so that each answer names its kind.
 fn costs() -> DispatchCosts {
-    DispatchCosts::generic()
+    DispatchCosts::for_class(HostClass::Generic)
         .with(DispatchKind::Team, WidthCosts::flat(us(1)))
         .with(DispatchKind::InPool, WidthCosts::flat(us(10)))
         .with(DispatchKind::Outside, WidthCosts::flat(us(100)))
@@ -154,7 +154,7 @@ fn width_model_is_flat_above_the_last_anchor() {
     assert_eq!(c.at(nz(8)), us(1));
     assert_eq!(c.at(nz(64)), us(1));
     // Linux row: width 8 measured below width 6, the model holds width 6.
-    let l = DispatchCosts::linux_x86();
+    let l = DispatchCosts::for_class(HostClass::X86_64Avx512);
     for (kind, w6) in [
         (DispatchKind::Team, 900),
         (DispatchKind::InPool, 3_500),
@@ -171,18 +171,55 @@ fn width_model_is_flat_above_the_last_anchor() {
 }
 
 #[test]
-fn linux_x86_row_and_host_default() {
-    let l = DispatchCosts::linux_x86();
+fn class_rows_and_host_default() {
     let ns = |x: f64| Duration::from_nanos((x * 1000.0) as u64);
+    let l = DispatchCosts::for_class(HostClass::X86_64Avx512);
     assert_eq!(l.cost(DispatchKind::Team, nz(2)), ns(0.6));
     assert_eq!(l.cost(DispatchKind::Team, nz(4)), ns(0.7));
     assert_eq!(l.cost(DispatchKind::InPool, nz(4)), ns(3.6));
     assert_eq!(l.cost(DispatchKind::Outside, nz(2)), ns(9.7));
-    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-    assert_eq!(DispatchCosts::host_default(), l);
-    #[cfg(not(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "aarch64")
-    )))]
-    assert_eq!(DispatchCosts::host_default(), DispatchCosts::generic());
+    let m = DispatchCosts::for_class(HostClass::Aarch64Apple);
+    assert_eq!(m.cost(DispatchKind::Team, nz(2)), ns(3.0));
+    assert_eq!(m.cost(DispatchKind::InPool, nz(4)), ns(11.0));
+    assert_eq!(m.cost(DispatchKind::Outside, nz(6)), ns(19.0));
+    // Classes without a measurement take the generic row: 3, 15, 40 us flat.
+    for class in [
+        HostClass::X86_64Avx2,
+        HostClass::X86_64Scalar,
+        HostClass::Aarch64,
+        HostClass::Generic,
+    ] {
+        let g = DispatchCosts::for_class(class);
+        assert_eq!(g, DispatchCosts::for_class(HostClass::Generic), "{class:?}");
+        for w in [2, 4, 6, 8, 64] {
+            assert_eq!(g.cost(DispatchKind::Team, nz(w)), ns(3.0));
+            assert_eq!(g.cost(DispatchKind::InPool, nz(w)), ns(15.0));
+            assert_eq!(g.cost(DispatchKind::Outside, nz(w)), ns(40.0));
+        }
+    }
+    // The default is the row of the detected class, and detection is stable.
+    let c = HostClass::detect();
+    assert_eq!(c, HostClass::detect());
+    assert_eq!(DispatchCosts::host_default(), DispatchCosts::for_class(c));
+    #[cfg(target_arch = "x86_64")]
+    assert!(matches!(
+        c,
+        HostClass::X86_64Avx512 | HostClass::X86_64Avx2 | HostClass::X86_64Scalar
+    ));
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    assert_eq!(c, HostClass::Aarch64Apple);
+    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+    assert_eq!(c, HostClass::Aarch64);
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    assert_eq!(c, HostClass::Generic);
+}
+
+#[test]
+fn class_names() {
+    assert_eq!(HostClass::X86_64Avx512.name(), "x86_64-avx512");
+    assert_eq!(HostClass::X86_64Avx2.name(), "x86_64-avx2");
+    assert_eq!(HostClass::X86_64Scalar.name(), "x86_64-scalar");
+    assert_eq!(HostClass::Aarch64Apple.name(), "aarch64-apple");
+    assert_eq!(HostClass::Aarch64.name(), "aarch64");
+    assert_eq!(HostClass::Generic.name(), "generic");
 }

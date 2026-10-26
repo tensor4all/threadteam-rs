@@ -7,6 +7,7 @@
 
 use core::num::NonZeroUsize;
 use core::time::Duration;
+use std::sync::OnceLock;
 
 /// The one multiple of the stack: a region runs in parallel when its serial
 /// estimate is at least `PAYS * sections * dispatch_cost`.
@@ -147,12 +148,85 @@ impl WidthCosts {
     }
 }
 
+/// The class of the machine, keyed by the kernel dispatch it will take, not by
+/// the CPU model. Detected once per process by [`HostClass::detect`].
+///
+/// The same enum and the same `detect` are kept in sync by hand in
+/// `strided-rs`, `tcontract-rs` and `faer`'s cost tables: each crate owns a
+/// table of its own kernels keyed by this class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum HostClass {
+    /// `x86_64` with AVX-512F at run time (`x86_64-avx512`).
+    X86_64Avx512,
+    /// `x86_64` with AVX2 and FMA, without AVX-512F (`x86_64-avx2`).
+    X86_64Avx2,
+    /// Any other `x86_64` (`x86_64-scalar`).
+    X86_64Scalar,
+    /// `aarch64` on macOS (`aarch64-apple`).
+    Aarch64Apple,
+    /// Any other `aarch64` (`aarch64`).
+    Aarch64,
+    /// Everything else (`generic`).
+    Generic,
+}
+
+impl HostClass {
+    /// The class of this host, detected at the first call and cached
+    /// (`OnceLock`; `is_x86_feature_detected!` on x86_64).
+    pub fn detect() -> Self {
+        static CLASS: OnceLock<HostClass> = OnceLock::new();
+        *CLASS.get_or_init(Self::detect_uncached)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn detect_uncached() -> Self {
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            HostClass::X86_64Avx512
+        } else if std::arch::is_x86_feature_detected!("avx2")
+            && std::arch::is_x86_feature_detected!("fma")
+        {
+            HostClass::X86_64Avx2
+        } else {
+            HostClass::X86_64Scalar
+        }
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
+    fn detect_uncached() -> Self {
+        HostClass::Aarch64Apple
+    }
+
+    #[cfg(all(target_arch = "aarch64", not(target_os = "macos")))]
+    fn detect_uncached() -> Self {
+        HostClass::Aarch64
+    }
+
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    fn detect_uncached() -> Self {
+        HostClass::Generic
+    }
+
+    /// The class name used in the docs and the tables: `x86_64-avx512`,
+    /// `x86_64-avx2`, `x86_64-scalar`, `aarch64-apple`, `aarch64`, `generic`.
+    pub const fn name(self) -> &'static str {
+        match self {
+            HostClass::X86_64Avx512 => "x86_64-avx512",
+            HostClass::X86_64Avx2 => "x86_64-avx2",
+            HostClass::X86_64Scalar => "x86_64-scalar",
+            HostClass::Aarch64Apple => "aarch64-apple",
+            HostClass::Aarch64 => "aarch64",
+            HostClass::Generic => "generic",
+        }
+    }
+}
+
 /// Dispatch costs of a pool's three kinds of token.
 ///
-/// [`host_default`](DispatchCosts::host_default) holds measured values for the
-/// host classes it knows (Apple silicon on macOS, QoS `UserInitiated`, the pool
-/// default; x86_64 Linux) and a conservative generic table for every other host. A pool owner
-/// that measured its own host overrides them with
+/// [`for_class`](DispatchCosts::for_class) holds measured rows for the host
+/// classes it knows (`x86_64-avx512`; `aarch64-apple`, QoS `UserInitiated`, the
+/// pool default) and a conservative generic row for every other class;
+/// [`host_default`](DispatchCosts::host_default) picks the row of the detected
+/// class. A pool owner that measured its own host overrides them with
 /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs).
 ///
 /// The values are *steady state*: sections back to back, with shares that carry
@@ -196,64 +270,52 @@ impl DispatchCosts {
         }
     }
 
-    /// Measured on an Apple M5 Max, 6 threads, QoS `UserInitiated`, from the
-    /// back to back sections whose shares carry 10 us of work
-    /// (`docs/design/thresholds-data/`), in microseconds at widths 2, 4, 6:
-    /// team 3.0, 2.3, 1.4; in pool 6.0, 11, 5.5; outside 14, 18, 19.
-    pub fn apple_m5() -> Self {
-        DispatchCosts {
-            team: WidthCosts::new([us_f(3.0), us_f(2.3), us_f(1.4)]),
-            in_pool: WidthCosts::new([us_f(6.0), us_f(11.0), us_f(5.5)]),
-            outside: WidthCosts::new([us_f(14.0), us_f(18.0), us_f(19.0)]),
+    /// The row of a host class. Both the dispatch costs of a row and the rates
+    /// of the consumer crates' tables for the same class come from one machine
+    /// in one clock state, so a class is never mixed across crates' tables.
+    ///
+    /// * [`HostClass::X86_64Avx512`]: measured on an AMD Ryzen AI 9 HX 470
+    ///   under Linux, 8 threads on cores 4-11, boost off (2.0 GHz), from the
+    ///   back to back sections whose shares carry 10 us of work (`faer-benchmark`
+    ///   `data/probes/20261026-awake-team-linux`, `docs/design/thresholds.md`
+    ///   section 3.6), in microseconds at widths 2, 4, 6: team 0.6, 0.7, 0.9;
+    ///   in pool 3.0, 3.6, 3.5; outside 9.7, 10.1, 8.7. The team row is the one
+    ///   measured after the per-member parker fix. Width 8 measured 0.98 us on
+    ///   a team, 8 % above the flat model (0.9).
+    /// * [`HostClass::Aarch64Apple`]: measured on an Apple M5 Max, 6 threads,
+    ///   QoS `UserInitiated`, from the back to back sections whose shares
+    ///   carry 10 us of work (`docs/design/thresholds-data/`), at widths 2, 4,
+    ///   6: team 3.0, 2.3, 1.4; in pool 6.0, 11, 5.5; outside 14, 18, 19.
+    /// * Every other class has no measurement and takes the conservative
+    ///   generic row: 3 us for a team, 15 us in the pool and 40 us from
+    ///   outside, at every width. It errs towards staying serial.
+    pub fn for_class(class: HostClass) -> Self {
+        match class {
+            HostClass::X86_64Avx512 => DispatchCosts {
+                team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
+                in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
+                outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
+            },
+            HostClass::Aarch64Apple => DispatchCosts {
+                team: WidthCosts::new([us_f(3.0), us_f(2.3), us_f(1.4)]),
+                in_pool: WidthCosts::new([us_f(6.0), us_f(11.0), us_f(5.5)]),
+                outside: WidthCosts::new([us_f(14.0), us_f(18.0), us_f(19.0)]),
+            },
+            HostClass::X86_64Avx2
+            | HostClass::X86_64Scalar
+            | HostClass::Aarch64
+            | HostClass::Generic => DispatchCosts {
+                team: WidthCosts::flat(us_f(3.0)),
+                in_pool: WidthCosts::flat(us_f(15.0)),
+                outside: WidthCosts::flat(us_f(40.0)),
+            },
         }
     }
 
-    /// Measured on an AMD Ryzen AI 9 HX 470 under Linux, 8 threads on cores
-    /// 4-11, boost off (2.0 GHz), from the back to back sections whose shares
-    /// carry 10 us of work (`faer-benchmark`
-    /// `data/probes/20261026-awake-team-linux`, `docs/design/thresholds.md`
-    /// section 3.6), in microseconds at widths 2, 4, 6: team 0.6, 0.7, 0.9;
-    /// in pool 3.0, 3.6, 3.5; outside 9.7, 10.1, 8.7. The team row is the one
-    /// measured after the per-member parker fix. Width 8 measured 0.98 us on a
-    /// team, 8 % above the flat model (0.9).
-    pub fn linux_x86() -> Self {
-        DispatchCosts {
-            team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
-            in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
-            outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
-        }
-    }
-
-    /// The conservative table of a host that is not measured: 3 us for a team,
-    /// 15 us in the pool and 40 us from outside, at every width. It errs towards
-    /// staying serial.
-    pub fn generic() -> Self {
-        DispatchCosts {
-            team: WidthCosts::flat(us_f(3.0)),
-            in_pool: WidthCosts::flat(us_f(15.0)),
-            outside: WidthCosts::flat(us_f(40.0)),
-        }
-    }
-
-    /// The table of this host class: [`apple_m5`](Self::apple_m5) on macOS with
-    /// an aarch64 CPU, [`linux_x86`](Self::linux_x86) on Linux with an x86_64
-    /// CPU, [`generic`](Self::generic) elsewhere.
+    /// The row of the host class this process runs on
+    /// (`for_class(HostClass::detect())`).
     pub fn host_default() -> Self {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        {
-            Self::apple_m5()
-        }
-        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-        {
-            Self::linux_x86()
-        }
-        #[cfg(not(any(
-            all(target_os = "macos", target_arch = "aarch64"),
-            all(target_os = "linux", target_arch = "x86_64")
-        )))]
-        {
-            Self::generic()
-        }
+        Self::for_class(HostClass::detect())
     }
 
     /// These costs with the table of `kind` replaced.
@@ -396,7 +458,7 @@ mod tests {
 
     #[test]
     fn anchors_are_returned_exactly() {
-        let c = DispatchCosts::apple_m5();
+        let c = DispatchCosts::for_class(HostClass::Aarch64Apple);
         assert_eq!(c.cost(DispatchKind::Team, nz(2)), us_f(3.0));
         assert_eq!(c.cost(DispatchKind::Team, nz(4)), us_f(2.3));
         assert_eq!(c.cost(DispatchKind::Team, nz(6)), us_f(1.4));
@@ -454,9 +516,9 @@ mod tests {
             }
         }
         for d in [
-            DispatchCosts::apple_m5(),
-            DispatchCosts::linux_x86(),
-            DispatchCosts::generic(),
+            DispatchCosts::for_class(HostClass::Aarch64Apple),
+            DispatchCosts::for_class(HostClass::X86_64Avx512),
+            DispatchCosts::for_class(HostClass::Generic),
         ] {
             for kind in [
                 DispatchKind::Team,

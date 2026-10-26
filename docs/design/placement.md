@@ -572,9 +572,17 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   thread-local state is involved and nothing allocates.
 * `DispatchCosts` holds one `WidthCosts` per kind (values at widths 2, 4 and 6,
   linear in between, flat above 6).
-  `DispatchCosts::host_default()` is the measured Apple M5 table on macOS with
-  aarch64, the measured Ryzen table (`linux_x86()`) on Linux with x86_64, and a
-  conservative flat table (3, 15, 40 microseconds) elsewhere;
+  `DispatchCosts::for_class(HostClass)` is the row of a host class, and
+  `DispatchCosts::host_default()` the row of `HostClass::detect()`. Classes are keyed by the kernel dispatch the
+  machine takes, not by the CPU model: `x86_64-avx512` (runtime `avx512f`), `x86_64-avx2` (`avx2` + `fma`),
+  `x86_64-scalar`, `aarch64-apple` (aarch64 on macOS), `aarch64`, `generic`; detected once per process.
+  `x86_64-avx512` holds the measured Ryzen row (team 0.6/0.7/0.9, in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us),
+  `aarch64-apple` the measured Apple M5 row, and every class without a measurement the conservative flat
+  `generic` row (3, 15, 40 microseconds). The rates of the consumer crates (strided-rs, tcontract-rs, faer) are
+  tables of their own, keyed by the same class names, and a class's rates and dispatch costs come from the same
+  machine in the same clock state: boost on/off moves both by about 1.66x and leaves the ratio stable within a
+  few percent (`faer-benchmark` `raw-exec3-boost`, `tables-*-exec3-boost.md`). Each crate carries an identical
+  `HostClass` and `detect()`, kept in sync with `threadteam`'s by hand.
   `PoolBuilder::dispatch_costs` overrides it.
 * `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
   `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,

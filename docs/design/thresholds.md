@@ -283,7 +283,7 @@ checked (0.019 and 0.084). A scalar that is not native takes the `f64` or `c64` 
 pub const PAYS: f64 = 3.0;
 pub enum DispatchKind { Team, InPool, Outside }
 pub struct WidthCosts;     // values at widths 2, 4, 6: const new([Duration; 3]), const flat(Duration), at(width), min()
-pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), linux_x86(), generic(), with(kind, costs), cost(kind, width), min_cost(kind)
+pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), for_class(HostClass), with(kind, costs), cost(kind, width), min_cost(kind)
 impl PoolBuilder { pub fn dispatch_costs(self, c: DispatchCosts) -> Self; }
 impl Pool        { pub fn dispatch_costs(&self) -> DispatchCosts; }
 impl Exec<'_> {
@@ -522,7 +522,7 @@ pool of 8, median of 3 processes, microseconds per section:
 After the per-member parker fix (see "Width dependence" below; same bench, pool of 8, 10 us share rows, median of 3
 processes, all accepted; `tables-dispatch-exec2.md`), the team row is 0.6, 0.7, 0.9 us at widths 2, 4, 6 and 0.98 at
 w=8; in pool 3.0, 3.6, 3.5 and outside 9.7, 10.1, 8.7 were re-measured and are essentially unchanged. The table
-above predates the parker fix; `linux_x86()` holds the post-fix row. The flat model above width 6 gives 0.9 us for a
+above predates the parker fix; `for_class(HostClass::X86_64Avx512)` holds the post-fix row. The flat model above width 6 gives 0.9 us for a
 team at w=8, 8 % optimistic against the measured 0.98; the model is left as it is.
 
 | kind | w=2 | w=4 | w=6 | w=8 |
@@ -531,16 +531,14 @@ team at w=8, 8 % optimistic against the measured 0.98; the model is left as it i
 | plain in pool | 3.0 | 3.6 | 3.5 | |
 | plain outside | 9.7 | 10.1 | 8.7 | |
 
-The table is `DispatchCosts::linux_x86()` in `cost.rs`, and `host_default()` returns it on Linux with x86_64:
+The row is `DispatchCosts::for_class(HostClass::X86_64Avx512)` in `cost.rs`, and `host_default()` returns it on a host whose runtime detection finds `avx512f` (the other x86_64 classes, `x86_64-avx2` and `x86_64-scalar`, take the generic row until measured). The row and the rates of the consumer crates for the same class come from this machine at 2.0 GHz (boost off); boost on moves both by about 1.66x with a stable ratio (`raw-exec3-boost`, `tables-*-exec3-boost.md`):
 
 ```rust
-pub fn linux_x86() -> Self {
-    DispatchCosts {
-        team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
-        in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
-        outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
-    }
-}
+HostClass::X86_64Avx512 => DispatchCosts {
+    team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
+    in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
+    outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
+},
 ```
 
 What the Linux data says about the design:
@@ -586,7 +584,7 @@ all generations are bumped, so a spinning member starts first). Evaluated and re
 section on the whole team with empty shares for the members outside the width costs the `w=8` row at every width
 (0.97 / 1.23 / 0.92) against 0.47 to 0.81 for the targeted publish, wakes members the section does not need, and
 needs the ledger and `Participant::size` to exclude the empty shares to keep "a width-k token never runs more
-than k tasks of real work". `linux_x86()` now holds the post-fix row (0.6, 0.7, 0.9), re-measured by the Linux
+than k tasks of real work". the `x86_64-avx512` row now holds the post-fix row (0.6, 0.7, 0.9), re-measured by the Linux
 campaign.
 
 ## 4. Limits of this data

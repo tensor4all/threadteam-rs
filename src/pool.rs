@@ -406,9 +406,9 @@ impl PoolBuilder {
     /// ```
     /// use std::num::NonZeroUsize;
     /// use std::time::Duration;
-    /// use threadteam::{DispatchCosts, DispatchKind, Exec, Pool, WidthCosts};
+    /// use threadteam::{DispatchCosts, DispatchKind, Exec, HostClass, Pool, WidthCosts};
     ///
-    /// let costs = DispatchCosts::generic()
+    /// let costs = DispatchCosts::for_class(HostClass::Generic)
     ///     .with(DispatchKind::Outside, WidthCosts::flat(Duration::from_micros(7)));
     /// let pool = Pool::builder().threads(2).dispatch_costs(costs).build()?;
     /// let exec = Exec::new(&pool, 2)?;

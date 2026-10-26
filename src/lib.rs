@@ -60,7 +60,7 @@ pub mod test_hooks;
 pub mod trace;
 mod track;
 
-pub use cost::{pays_at, width_for_by, DispatchCosts, DispatchKind, WidthCosts, PAYS};
+pub use cost::{pays_at, width_for_by, DispatchCosts, DispatchKind, HostClass, WidthCosts, PAYS};
 pub use error::{Error, Refused};
 pub use exec::Exec;
 #[cfg(loom)]

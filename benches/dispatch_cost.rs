@@ -144,6 +144,14 @@ fn main() {
                 w,
                 after_gap_ns(Duration::from_millis(1), 60, || call(&mut tok)),
             );
+            // `DISPATCH_GAP300=1`: also after 300 ms (members parked), about 4 s per width.
+            if std::env::var_os("DISPATCH_GAP300").is_some() {
+                put(
+                    "team/gap300ms",
+                    w,
+                    after_gap_ns(Duration::from_millis(300), 12, || call(&mut tok)),
+                );
+            }
             put(
                 "team/load10us-minus-10us",
                 w,

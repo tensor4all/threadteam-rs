@@ -428,6 +428,19 @@ a counter `parked` of members inside or entering the wait. The protocol:
   waits on the one condition variable, so no wake-up depends on the order in
   which a leader publishes to individual members.
 
+**Wake shape.** Each member slot has its own `Parker` (a leader wakes only the
+slots it changed). The wake of a published section is a tree over its targets
+in the heap layout (node 0 the leader, node `a` the target with argument `a`,
+children `F*a+1 ..= F*a+F`): the leader bumps every generation (children before
+parents), wakes its own children, and a member that starts a share wakes its
+children before it runs it. A spinning member starts from its generation and is
+never delayed by the tree. Measured on Linux (thresholds.md 3.6, "Wake tree"),
+each level costs a parked core's whole wake latency (about 55 us) against about
+3 us per member woken serially, so the default fan-out is 64: flat for every team
+a host can hold. Loom: `a_parked_parent_wakes_its_parked_child`,
+`a_spinning_child_starts_without_a_wake_and_is_woken_harmlessly`,
+`a_spinning_parent_still_wakes_its_parked_child`.
+
 The handshake is the small `Parker` type in `src/park.rs`, built on a `sync`
 shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
 

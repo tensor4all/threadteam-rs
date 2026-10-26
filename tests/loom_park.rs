@@ -130,3 +130,77 @@ fn a_wake_of_one_slot_leaves_the_other_asleep_until_its_own_change() {
         }
     });
 }
+
+/// Wake tree: the leader bumps the child's generation, then the parent's, and
+/// wakes only the parent; the parent, once it sees its generation, wakes its
+/// child. `parent_parks` / `child_parks` choose whether each of them sleeps or
+/// spins (a spinning member sees its generation without any wake, and a
+/// spinning parent still wakes a parked child).
+fn tree_model(parent_parks: bool, child_parks: bool) {
+    model(move || {
+        let gens = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let state = Arc::new(AtomicUsize::new(RESERVED));
+        let parkers = [Arc::new(Parker::new()), Arc::new(Parker::new())];
+        // Member 1 (parent): waits for its own generation, then wakes member 2.
+        let parent = {
+            let (gens, parkers, state) = (gens.clone(), parkers.clone(), state.clone());
+            let wait = {
+                let (gen, state, parker) = (gens[0].clone(), state.clone(), parkers[0].clone());
+                move || {
+                    if parent_parks {
+                        parker.park_while(|| {
+                            gen.load(Ordering::SeqCst) == 0
+                                && state.load(Ordering::SeqCst) == RESERVED
+                        });
+                    } else {
+                        while gen.load(Ordering::SeqCst) == 0 {
+                            thread::yield_now();
+                        }
+                    }
+                }
+            };
+            thread::spawn(move || {
+                wait();
+                parkers[1].wake();
+            })
+        };
+        // Member 2 (child).
+        let child = {
+            let (gen, state, parker) = (gens[1].clone(), state.clone(), parkers[1].clone());
+            thread::spawn(move || {
+                if child_parks {
+                    parker.park_while(|| {
+                        gen.load(Ordering::SeqCst) == 0 && state.load(Ordering::SeqCst) == RESERVED
+                    });
+                } else {
+                    while gen.load(Ordering::SeqCst) == 0 {
+                        thread::yield_now();
+                    }
+                }
+                assert_ne!(gen.load(Ordering::SeqCst), 0);
+            })
+        };
+        // Leader: the child's generation first, then the parent's; wakes the
+        // parent only.
+        gens[1].fetch_add(1, Ordering::SeqCst);
+        gens[0].fetch_add(1, Ordering::SeqCst);
+        parkers[0].wake();
+        parent.join().unwrap();
+        child.join().unwrap();
+    });
+}
+
+#[test]
+fn a_parked_parent_wakes_its_parked_child() {
+    tree_model(true, true);
+}
+
+#[test]
+fn a_spinning_child_starts_without_a_wake_and_is_woken_harmlessly() {
+    tree_model(true, false);
+}
+
+#[test]
+fn a_spinning_parent_still_wakes_its_parked_child() {
+    tree_model(false, true);
+}

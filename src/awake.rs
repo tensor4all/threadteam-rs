@@ -103,6 +103,24 @@ impl Slot {
     }
 }
 
+/// Fan-out of the wake tree. `THREADTEAM_WAKE_FANOUT` overrides it (experiments).
+///
+/// 64 makes the wake flat for every realistic team (the leader wakes every
+/// target itself): measured on the Ryzen AI 9 HX 470, each tree level costs a
+/// whole wake-up latency of a parked core (about 55 us), against about 3 us
+/// per extra member woken serially, so a tree of fan-out 2 or 4 loses at
+/// widths 4 to 8 (thresholds.md 3.6, "Wake tree"). The tree stays for hosts
+/// with teams of tens of members, where the serial part could win.
+const WAKE_FANOUT: usize = 64;
+
+fn wake_fanout() -> usize {
+    std::env::var("THREADTEAM_WAKE_FANOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(WAKE_FANOUT)
+        .max(2)
+}
+
 /// Shared state of the awake members of one pool.
 pub(crate) struct Awake {
     slots: Box<[Slot]>,
@@ -110,6 +128,8 @@ pub(crate) struct Awake {
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
+    /// Fan-out of the wake tree over a section's targets (at least 2).
+    wake_fanout: usize,
     pub(crate) costs: crate::cost::DispatchCosts,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
@@ -129,6 +149,7 @@ impl Awake {
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
+            wake_fanout: wake_fanout(),
             costs,
             acquire_timeout,
             #[cfg(feature = "trace")]
@@ -170,24 +191,41 @@ impl Awake {
     ///
     /// The caller leads every target (its slot is `RESERVED` for the caller)
     /// and keeps `section` alive until its completion counter reaches zero.
-    /// Each target's generation is bumped and its own parker woken (one atomic
-    /// read-modify-write on its slot when it does not sleep); members the
-    /// section does not address are not touched.
+    /// Every target's generation is bumped by the leader, so a spinning member
+    /// starts at once whatever its place in the wake tree. Only the *parked*
+    /// ones need a wake, and they are woken as a tree over the arguments
+    /// (node `0` is the leader, node `a >= 1` the target at position `a - 1`;
+    /// the children of node `a` are `F * a + 1 ..= F * a + F`): the leader
+    /// wakes its own `F` children here, and every member that starts a share
+    /// wakes its children ([`Awake::wake_children`]) before it runs the share.
+    /// The generations are bumped from the last position down, so that the
+    /// bump of a child precedes (in the leader's order) the bump of its
+    /// parent, and a parent that sees its own bump cannot wake a child whose
+    /// generation is still unchanged. Members the section does not address are
+    /// not touched.
     pub(crate) fn publish(&self, section: &Section) {
         let ptr = (section as *const Section).cast_mut();
-        for pos in 0..section.dispatched {
+        for pos in (0..section.dispatched).rev() {
             let s = &self.slots[section.slot(pos)];
             s.arg.store(pos + 1, Ordering::Relaxed);
             s.ptr.store(ptr, Ordering::Relaxed);
             // fetch_add: always the latest value, whichever thread led before.
             s.gen.fetch_add(1, Ordering::SeqCst);
         }
-        // Wake after every generation is bumped, so that a spinning member
-        // starts without waiting for the wake checks of the slots after it.
-        for pos in 0..section.dispatched {
-            self.slots[section.slot(pos)].park.wake();
-        }
+        // Wake after every generation is bumped.
+        self.wake_children(section, 0);
         trace!(self, None, Publish);
+    }
+
+    /// Wakes the parker of each child of tree node `node` (`0` the leader, `a`
+    /// the target with argument `a`); a spinning child costs one atomic
+    /// read-modify-write.
+    pub(crate) fn wake_children(&self, section: &Section, node: usize) {
+        let first = self.wake_fanout * node + 1;
+        let last = (first + self.wake_fanout - 1).min(section.dispatched);
+        for a in first..=last {
+            self.slots[section.slot(a - 1)].park.wake();
+        }
     }
 
     /// Lends (or takes back) the members' threads to Rayon: while lent, a
@@ -466,6 +504,10 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                     last_work = None;
                     let ptr = slot.ptr.load(Ordering::Relaxed);
                     let arg = slot.arg.load(Ordering::Relaxed);
+                    // SAFETY: the leader keeps the section alive until its
+                    // completion counter reaches zero, which happens only
+                    // after this member's share decrements it.
+                    aw.wake_children(unsafe { &*ptr }, arg);
                     trace!(aw, Some(id), SectionBegin);
                     // SAFETY: the leader keeps the section alive until its
                     // completion counter reaches zero, which happens only

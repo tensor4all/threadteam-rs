@@ -589,6 +589,30 @@ needs the ledger and `Participant::size` to exclude the empty shares to keep "a 
 than k tasks of real work". `linux_x86()` now holds the post-fix row (0.6, 0.7, 0.9), re-measured by the Linux
 campaign.
 
+#### Wake tree (tried, measured, kept flat by default)
+
+Goal: the leader wakes each parked member itself (about 3 us per extra member, serial), so wake the parked members
+as a tree over the targeted slots. Implemented in `src/awake.rs` (`publish`, `wake_children`, fan-out `F`,
+`THREADTEAM_WAKE_FANOUT` for experiments): the leader bumps every generation (last position first), wakes its `F`
+children; a member that starts a share wakes its own children before running it. A spinning member (parent or
+child) starts from its own generation, unchanged latency; only a parked child waits for its parent.
+
+Pool of 8, cores 4-11, microseconds, two runs (`dispatch_cost` with `DISPATCH_GAP300=1`, `wake_probe` with
+`WAKE_PROBE_POOL=8 WAKE_PROBE_ONLY=2,4,8`):
+
+| row | w=2 | w=4 | w=6 | w=8 |
+| --- | --- | --- | --- | --- |
+| gap300ms, flat (F=64) | 56, 44 | 76, 59 | 62, 84 | 90, 65 |
+| gap300ms, F=4 | 75, 75 | 57, 79 | 127, 128 | 106, 138 |
+| gap300ms, F=2 | 57, 55 | 133, 102 | 120, 105 | 188, 183 |
+| wake_probe parked total, flat / F=4 / F=2 | 56 / 56 / 56 | 72 / 71 / 121 | | 65 / 132 / 169 |
+| hot, 10 us share rows (any F) | unchanged (0.47-0.49 hot, 0.55-0.62 loaded at w=2; 0.95-1.18 hot at w=8) | | | |
+
+The tree loses: a woken parked core must leave its C-state and be scheduled before it can wake its own children,
+so every level costs a full wake latency (about 55 to 60 us), while the serial wake it replaces costs 3 us per
+member. The break-even is at about 55 / 3 = 18 serially woken members, more than this host has parked cores in a
+team (a pool of 8 here). Default fan-out 64, i.e. flat; the spinning rows are unaffected at every fan-out.
+
 ## 4. Limits of this data
 
 * One host, rough, 6 threads only (widths 2 and 4 only for the dispatch cost), one process per mode

@@ -34,9 +34,15 @@ struct Stats {
     max: f64,
 }
 
+fn env_usize(k: &str) -> Option<usize> {
+    std::env::var(k).ok().and_then(|v| v.parse().ok())
+}
+
 fn probe(w: usize, qos: Option<Qos>, pause: Duration, team: bool) -> Stats {
+    // `WAKE_PROBE_POOL=<n>`: a pool (and team) of n threads, the token of width w.
+    let np = env_usize("WAKE_PROBE_POOL").unwrap_or(w);
     let mut b = Pool::builder()
-        .threads(w)
+        .threads(np)
         .idle_spin(Duration::from_millis(2))
         .acquire_timeout(Duration::from_secs(5));
     if let Some(q) = qos {
@@ -48,7 +54,7 @@ fn probe(w: usize, qos: Option<Qos>, pause: Duration, team: bool) -> Stats {
     // The plain variant gets its own pool: a pool whose members are reserved
     // would leave plain tokens a single free worker.
     let (tm, pool) = if team {
-        (Some(pool.into_team(w).unwrap()), None)
+        (Some(pool.into_team(np).unwrap()), None)
     } else {
         (None, Some(pool))
     };
@@ -171,6 +177,30 @@ fn main() {
         "load average at start {l:?}; caller thread QoS: {}",
         qos_of_current()
     );
+    // `WAKE_PROBE_ONLY=2,4,8` (with `WAKE_PROBE_POOL`): only the team rows of
+    // the builder-default QoS, at these widths.
+    if let Ok(list) = std::env::var("WAKE_PROBE_ONLY") {
+        println!(
+            "{:>5} {:<8} {:>9} {:>9} {:>8} {:>10}",
+            "width", "state", "total", "slowest", "late>1ms", "max"
+        );
+        for w in list.split(',').filter_map(|v| v.parse::<usize>().ok()) {
+            for (state, pause) in [
+                ("spinning", Duration::from_micros(100)),
+                ("parked", Duration::from_millis(12)),
+            ] {
+                let s = probe(w, None, pause, true);
+                println!(
+                    "{w:>5} {state:<8} {:>9.1} {:>9.1} {:>7.0}% {:>10.1}",
+                    s.total / 1e3,
+                    s.slowest / 1e3,
+                    s.late * 100.0,
+                    s.max / 1e3
+                );
+            }
+        }
+        return;
+    }
     println!();
     println!("raw park/unpark on plain threads (serial unpark), microseconds");
     println!(

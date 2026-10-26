@@ -15,12 +15,15 @@
 //! after the default 200 ms idle spin).
 //!
 //! `cargo bench --bench dispatch_cost -- [csv-path]`
+//!
+//! `DISPATCH_TEAM_ONLY=<n>` measures only the team rows, on a pool of `n` threads and widths
+//! 2, 4, 6 and `n` (hot, after 1 ms, and a hot loop of 10 us shares), about 4 s per width; `DISPATCH_WIDTH=<w>` keeps one width.
 
 use std::hint::black_box;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use threadteam::{raise_current_thread_qos, Exec, Pool, Qos};
+use threadteam::{raise_current_thread_qos, Exec, Pool, Qos, WaitOverride};
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
@@ -99,6 +102,58 @@ fn main() {
         println!("{name:<28} w={w} {ns:>10.0} ns");
         rows.push((name.to_string(), w, ns));
     };
+
+    if let Some(n) = std::env::var("DISPATCH_TEAM_ONLY")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        // `DISPATCH_PARK_MS=<ms>` overrides the park delay (default 200 ms).
+        let over = match std::env::var("DISPATCH_PARK_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(ms) => WaitOverride::new().idle_spin(Duration::from_millis(ms)),
+            None => WaitOverride::new(),
+        };
+        let tsize = std::env::var("DISPATCH_TEAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(n);
+        let team = build(n).into_team_with(tsize, over).expect("team");
+        let mut widths = vec![2usize, 4, 6];
+        if !widths.contains(&n) {
+            widths.push(n);
+        }
+        let only = std::env::var("DISPATCH_WIDTH")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok());
+        for w in widths
+            .into_iter()
+            .filter(|&w| w <= n && only.is_none_or(|o| o == w))
+        {
+            let mut tok = team.exec(w);
+            let call = |tok: &mut Exec<'_>| {
+                tok.reborrow().for_ranges(w, one, |_| {
+                    black_box(());
+                })
+            };
+            // Hot for long enough (0.4 s) that members the width does not use have parked.
+            put("team/hot", w, per_call_ns(9, 100_000, || call(&mut tok)));
+            put(
+                "team/gap1ms",
+                w,
+                after_gap_ns(Duration::from_millis(1), 60, || call(&mut tok)),
+            );
+            put(
+                "team/load10us-minus-10us",
+                w,
+                per_call_ns(9, 10_000, || {
+                    tok.reborrow().for_ranges(w, one, |_| spin_for(LOAD_NS))
+                }) - LOAD_NS as f64,
+            );
+        }
+        return;
+    }
 
     // Team token: pool of 6, one persistent team, tokens of width 2/4/6 minted from it.
     {

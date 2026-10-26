@@ -496,11 +496,53 @@ kept, and 4 us of the remaining distance to the 87 to 94 us of `9cd64f0` is thei
 
 Norm and `zip` cases are not in the table: they have no parallel region.
 
+### 3.6 Linux row (x86_64, quiet host, tensor4all-meta#51)
+
+`faer-benchmark` `bench/awake-team-linux`, `data/probes/20261026-awake-team-linux/` (README and `tables.md` there):
+AMD Ryzen AI 9 HX 470 (12 cores, two L3 domains), Linux, **boost off** (every core at 2.0 GHz), governor and EPP
+`performance`, measured on cores 4-11 with the observer on the other L3 domain, idle guard on the whole measured
+domain, 101 processes all accepted at the first attempt. Same benches and the same 10 us share rows as section 2.1,
+pool of 8, median of 3 processes, microseconds per section:
+
+| kind | w=2 | w=4 | w=6 | w=8 |
+| --- | --- | --- | --- | --- |
+| team | 2.8 | 2.2 | 1.7 | 1.1 |
+| plain in pool | 3.1 | 3.6 | 3.5 | 3.0 |
+| plain outside | 9.5 | 10.1 | 8.8 | 6.7 |
+
+Candidate table (not yet in `cost.rs`; `host_default()` still returns `generic()` on Linux):
+
+```rust
+pub fn linux_x86() -> Self {
+    DispatchCosts {
+        team: WidthCosts::new([us_f(2.8), us_f(2.2), us_f(1.7)]),
+        in_pool: WidthCosts::new([us_f(3.1), us_f(3.6), us_f(3.5)]),
+        outside: WidthCosts::new([us_f(9.5), us_f(10.1), us_f(8.8)]),
+    }
+}
+```
+
+What the Linux data says about the design:
+
+* The team cost is the M5's (1.1 to 2.8 us); a plain token costs about half the M5's. Parked members are dearer:
+  a team after a 300 ms gap costs 82 to 84 us (M5 27), the first share starts 63 to 83 us after a park.
+* The width model above the last anchor is 2 times pessimistic: width 8 measures 1.11 us on a team, 3.0 in the
+  pool and 6.7 outside against 2.21, 4.69 and 11.7 from `cost(6) * 8 / 6`. With the generic table this refuses a
+  team GEMM of `64^3` at width 8 (estimate 9.7 us against `3 * 4.0`) that pays at width 4 (0.32 of serial).
+* Every gate measured follows `estimate >= PAYS * sections * D` exactly; the deviations are in the inputs: the
+  generic table on Linux, the M5 serial rates (the 2.0 GHz rates here are 1.4 to 3.7 times larger: GEMM 0.064 ns
+  per MAC f64, 0.257 c64, 0.032 f32, 0.128 c32), and strided's class assignment (a contiguous `copy_into` and every
+  opaque `map_into` closure, `exp` included, are gated as `Map`).
+* The triangular inverse rate is size dependent on Linux too (0.047 ns per `m^3` at the smallest shape, median
+  0.019).
+* QR 128 on a team is 1.06 times the held row at 8 threads and 0.99 at 4: no case for changing `PAYS = 3`.
+
 ## 4. Limits of this data
 
 * One host, rough, 6 threads only (widths 2 and 4 only for the dispatch cost), one process per mode
-  and shape and per round, the desktop session running (see the host table). x86_64 and Linux are not
-  measured; the table is keyed by host class so that a Linux table can be added without an API change.
+  and shape and per round, the desktop session running (see the host table). Linux x86_64 is measured in
+  section 3.6 (boost off); the table is keyed by host class so that a Linux table can be added without an API
+  change.
 * The dispatch cost is measured with 10 us shares; a 1 us share would show a different join time.
 * The break-even is located on a grid (for GEMM 8 to 16 points per decade); thresholds in section 3.3
   are derived, not fitted, and are checked against the grid only.

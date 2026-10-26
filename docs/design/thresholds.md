@@ -283,7 +283,7 @@ checked (0.019 and 0.084). A scalar that is not native takes the `f64` or `c64` 
 pub const PAYS: f64 = 3.0;
 pub enum DispatchKind { Team, InPool, Outside }
 pub struct WidthCosts;     // values at widths 2, 4, 6: new([Duration; 3]), flat(Duration), at(width)
-pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), generic(), with(kind, costs), cost(kind, width)
+pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), apple_m5(), linux_x86(), generic(), with(kind, costs), cost(kind, width)
 impl PoolBuilder { pub fn dispatch_costs(self, c: DispatchCosts) -> Self; }
 impl Pool        { pub fn dispatch_costs(&self) -> DispatchCosts; }
 impl Exec<'_> {
@@ -303,7 +303,8 @@ authority (including `fork` children of a team token), else a worker of the pool
 thread-local state, no allocation (`tests/dispatch_cost.rs`).
 
 Width model: linear interpolation between the widths 2, 4 and 6, the width 2 value below, and above width 6
-the width 6 value grown in proportion to the width. A host that is not measured gets the flat generic table
+the width 6 value held flat (the Linux width 8 data, section 3.6, is below the width 6 value, so flat is
+conservative; it replaced growth in proportion to the width). A host that is not measured gets the flat generic table
 (team 3, in pool 15, outside 40 microseconds), which errs towards staying serial.
 
 faer: `ParShape::Team(n, DispatchCosts)` carries the costs of its token (copied by `Par::shape`);
@@ -510,7 +511,7 @@ pool of 8, median of 3 processes, microseconds per section:
 | plain in pool | 3.1 | 3.6 | 3.5 | 3.0 |
 | plain outside | 9.5 | 10.1 | 8.8 | 6.7 |
 
-Candidate table (not yet in `cost.rs`; `host_default()` still returns `generic()` on Linux):
+The table is `DispatchCosts::linux_x86()` in `cost.rs`, and `host_default()` returns it on Linux with x86_64:
 
 ```rust
 pub fn linux_x86() -> Self {
@@ -526,7 +527,8 @@ What the Linux data says about the design:
 
 * The team cost is the M5's (1.1 to 2.8 us); a plain token costs about half the M5's. Parked members are dearer:
   a team after a 300 ms gap costs 82 to 84 us (M5 27), the first share starts 63 to 83 us after a park.
-* The width model above the last anchor is 2 times pessimistic: width 8 measures 1.11 us on a team, 3.0 in the
+* The width model above the last anchor was 2 times pessimistic (it has since been changed to hold the width 6
+  value flat, section 3.1): width 8 measures 1.11 us on a team, 3.0 in the
   pool and 6.7 outside against 2.21, 4.69 and 11.7 from `cost(6) * 8 / 6`. With the generic table this refuses a
   team GEMM of `64^3` at width 8 (estimate 9.7 us against `3 * 4.0`) that pays at width 4 (0.32 of serial).
 * Every gate measured follows `estimate >= PAYS * sections * D` exactly; the deviations are in the inputs: the

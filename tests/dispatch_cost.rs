@@ -6,7 +6,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use threadteam::{DispatchCosts, DispatchKind, Exec, Pool, WidthCosts, PAYS};
+use threadteam::{pays_at, DispatchCosts, DispatchKind, Exec, Pool, WidthCosts, PAYS};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -145,4 +145,44 @@ fn decision_functions_do_not_allocate() {
     let after = ALLOCS.load(Ordering::SeqCst);
     COUNT_HERE.with(|c| c.set(false));
     assert_eq!(after, before, "acc = {acc}");
+}
+
+#[test]
+fn width_model_is_flat_above_the_last_anchor() {
+    let c = WidthCosts::new([us(3), us(2), us(1)]);
+    assert_eq!(c.at(nz(6)), us(1));
+    assert_eq!(c.at(nz(8)), us(1));
+    assert_eq!(c.at(nz(64)), us(1));
+    // Linux row: width 8 measured below width 6, the model holds width 6.
+    let l = DispatchCosts::linux_x86();
+    for (kind, w6) in [
+        (DispatchKind::Team, 1_700),
+        (DispatchKind::InPool, 3_500),
+        (DispatchKind::Outside, 8_800),
+    ] {
+        assert_eq!(l.cost(kind, nz(8)), Duration::from_nanos(w6));
+    }
+    // A team GEMM 64^3 (about 9.7 us) pays at width 8.
+    assert!(pays_at(
+        Duration::from_nanos(9_700),
+        1,
+        l.cost(DispatchKind::Team, nz(8))
+    ));
+}
+
+#[test]
+fn linux_x86_row_and_host_default() {
+    let l = DispatchCosts::linux_x86();
+    let ns = |x: f64| Duration::from_nanos((x * 1000.0) as u64);
+    assert_eq!(l.cost(DispatchKind::Team, nz(2)), ns(2.8));
+    assert_eq!(l.cost(DispatchKind::Team, nz(4)), ns(2.2));
+    assert_eq!(l.cost(DispatchKind::InPool, nz(4)), ns(3.6));
+    assert_eq!(l.cost(DispatchKind::Outside, nz(2)), ns(9.5));
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    assert_eq!(DispatchCosts::host_default(), l);
+    #[cfg(not(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )))]
+    assert_eq!(DispatchCosts::host_default(), DispatchCosts::generic());
 }

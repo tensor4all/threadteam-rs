@@ -571,9 +571,10 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   of its pool is `InPool`; a plain token called from outside is `Outside`. No
   thread-local state is involved and nothing allocates.
 * `DispatchCosts` holds one `WidthCosts` per kind (values at widths 2, 4 and 6,
-  linear in between, proportional to the width above 6).
+  linear in between, flat above 6).
   `DispatchCosts::host_default()` is the measured Apple M5 table on macOS with
-  aarch64 and a conservative flat table (3, 15, 40 microseconds) elsewhere;
+  aarch64, the measured Ryzen table (`linux_x86()`) on Linux with x86_64, and a
+  conservative flat table (3, 15, 40 microseconds) elsewhere;
   `PoolBuilder::dispatch_costs` overrides it.
 * `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
   `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,

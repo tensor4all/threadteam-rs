@@ -212,13 +212,15 @@ impl DispatchCosts {
     /// 4-11, boost off (2.0 GHz), from the back to back sections whose shares
     /// carry 10 us of work (`faer-benchmark`
     /// `data/probes/20261026-awake-team-linux`, `docs/design/thresholds.md`
-    /// section 3.6), in microseconds at widths 2, 4, 6: team 2.8, 2.2, 1.7;
-    /// in pool 3.1, 3.6, 3.5; outside 9.5, 10.1, 8.8.
+    /// section 3.6), in microseconds at widths 2, 4, 6: team 0.6, 0.7, 0.9;
+    /// in pool 3.0, 3.6, 3.5; outside 9.7, 10.1, 8.7. The team row is the one
+    /// measured after the per-member parker fix. Width 8 measured 0.98 us on a
+    /// team, 8 % above the flat model (0.9).
     pub fn linux_x86() -> Self {
         DispatchCosts {
-            team: WidthCosts::new([us_f(2.8), us_f(2.2), us_f(1.7)]),
-            in_pool: WidthCosts::new([us_f(3.1), us_f(3.6), us_f(3.5)]),
-            outside: WidthCosts::new([us_f(9.5), us_f(10.1), us_f(8.8)]),
+            team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
+            in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
+            outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
         }
     }
 

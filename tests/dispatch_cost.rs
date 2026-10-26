@@ -156,9 +156,9 @@ fn width_model_is_flat_above_the_last_anchor() {
     // Linux row: width 8 measured below width 6, the model holds width 6.
     let l = DispatchCosts::linux_x86();
     for (kind, w6) in [
-        (DispatchKind::Team, 1_700),
+        (DispatchKind::Team, 900),
         (DispatchKind::InPool, 3_500),
-        (DispatchKind::Outside, 8_800),
+        (DispatchKind::Outside, 8_700),
     ] {
         assert_eq!(l.cost(kind, nz(8)), Duration::from_nanos(w6));
     }
@@ -174,10 +174,10 @@ fn width_model_is_flat_above_the_last_anchor() {
 fn linux_x86_row_and_host_default() {
     let l = DispatchCosts::linux_x86();
     let ns = |x: f64| Duration::from_nanos((x * 1000.0) as u64);
-    assert_eq!(l.cost(DispatchKind::Team, nz(2)), ns(2.8));
-    assert_eq!(l.cost(DispatchKind::Team, nz(4)), ns(2.2));
+    assert_eq!(l.cost(DispatchKind::Team, nz(2)), ns(0.6));
+    assert_eq!(l.cost(DispatchKind::Team, nz(4)), ns(0.7));
     assert_eq!(l.cost(DispatchKind::InPool, nz(4)), ns(3.6));
-    assert_eq!(l.cost(DispatchKind::Outside, nz(2)), ns(9.5));
+    assert_eq!(l.cost(DispatchKind::Outside, nz(2)), ns(9.7));
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     assert_eq!(DispatchCosts::host_default(), l);
     #[cfg(not(any(

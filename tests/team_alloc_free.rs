@@ -174,4 +174,46 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
     for round in 0..20 {
         assert_eq!(allocs_in(|| token_phases(&team)), 0, "pinned round {round}");
     }
+    drop(team);
+
+    // A zero spin budget: every join and barrier wait that does not finish at
+    // once goes to sleep on the pool's parker (`docs/design/waiting.md`), and
+    // every member waits for work asleep. Neither the sleep nor the wake-up
+    // allocates. The shares are uneven, so that waiters do sleep.
+    let pool = Pool::builder()
+        .threads(4)
+        .spin_polls(0)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let team = pool.into_team(4).unwrap();
+    let mut exec = team.exec(4);
+    let sleeping_phases = |exec: &mut Exec<'_>| {
+        exec.reborrow()
+            .team(|mut t| {
+                t.reborrow().run(|i, _| {
+                    if i == 1 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                });
+                t.reborrow().run_with(|p| {
+                    if p.index() == 2 {
+                        std::thread::sleep(Duration::from_micros(200));
+                    }
+                    p.barrier().unwrap();
+                    sink.fetch_add(p.index(), Ordering::Relaxed);
+                });
+            })
+            .unwrap();
+    };
+    for _ in 0..50 {
+        sleeping_phases(&mut exec);
+    }
+    for round in 0..20 {
+        assert_eq!(
+            allocs_in(|| sleeping_phases(&mut exec)),
+            0,
+            "sleeping round {round}"
+        );
+    }
 }

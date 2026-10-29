@@ -765,17 +765,14 @@ impl<'p> Exec<'p> {
             // child, a reborrow or a sub-team re-pins nothing of its own.
             if self._leader.is_some() {
                 // Root-scope entry, on the executing thread: the root pressure
-                // and the members' park delay are decided by *this* thread's CPU
+                // and the members' spin budget are decided by *this* thread's CPU
                 // set. A token minted on another thread (or another mask) is
                 // paced by the thread that enters the scope, exactly as its pin
                 // section is placed by that thread. Descendants inherit it.
                 let oversubscribed = crate::pin::oversubscribed(team.size().get());
                 team.over = oversubscribed;
                 if let Some(awake) = team.awake {
-                    awake.set_park_ns(
-                        team.ids,
-                        crate::pin::park_delay(team.policy, oversubscribed),
-                    );
+                    awake.set_spin_budget(team.ids, awake.spin_budget(oversubscribed));
                 }
                 if let Some(auth) = self.team.as_mut() {
                     auth.over = oversubscribed;
@@ -804,14 +801,12 @@ impl<'p> Exec<'p> {
         // placement of the participants and whether the scope is
         // oversubscribed, whatever the pool's pinning setting.
         let oversubscribed = crate::pin::oversubscribed(self.budget.get());
-        let park_spin = if oversubscribed {
-            Duration::ZERO
-        } else {
-            policy.idle_spin()
-        };
-        let reservation = pool
-            .awake
-            .acquire(pool, self.budget.get() - 1, policy, park_spin)?;
+        let reservation = pool.awake.acquire(
+            pool,
+            self.budget.get() - 1,
+            policy,
+            pool.awake.spin_budget(oversubscribed),
+        )?;
         let mut team = TeamExec {
             awake: Some(&pool.awake),
             ids: &reservation.ids,

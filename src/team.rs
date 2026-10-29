@@ -79,13 +79,16 @@ impl Participant<'_> {
 ///   `budget - 1` pool workers. Before any section runs, every participant
 ///   acknowledged on its own thread (a rendezvous), so barriers inside
 ///   sections cannot deadlock for lack of threads.
-/// * Reserved members spin with one PAUSE per poll, then park once the park
-///   delay (`idle_spin`) has passed since their own last share; they run no
-///   unrelated Rayon job and do not leave on a timeout, also between sections
-///   and during a long serial phase of the leader. They are returned when the
-///   scope ends. In a root scope with more participants than CPUs in the
-///   caller's affinity mask the delay is zero, so they park after a short spin
-///   instead of holding a CPU.
+/// * Every wait of a team is a staged episode (`docs/design/waiting.md`): a
+///   reserved member waiting for work, the leader in a section's join, and a
+///   participant in a barrier spin with one PAUSE per poll for the pool's spin
+///   budget ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)), yield
+///   a few times, then sleep until woken. Members run no unrelated Rayon job and
+///   do not leave on a timeout, also between sections and during a long serial
+///   phase of the leader; they are returned when the scope ends. In a root scope
+///   with more participants than CPUs in the caller's affinity mask, or in a
+///   pool whose waiters were recently descheduled, the spin is throttled to 100
+///   polls, so waiters free their CPUs quickly.
 /// * If the pool pins members
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
@@ -571,6 +574,7 @@ where
         slot_call::<S>,
         (slot_of as *const S).cast(),
         geometry,
+        awake.map(|a| &a.waits),
     );
     let dispatched = geometry.dispatched;
     let guard = JoinGuard(&sec);

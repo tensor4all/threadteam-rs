@@ -22,7 +22,7 @@
 //! The same CPU set decides whether a root scope is *oversubscribed* (see
 //! [`available`]): a team of more participants than the caller's mask has CPUs
 //! parks its members early instead of spinning (see `awake.rs`), and
-//! [`oversubscribed`] and [`park_delay`] are what the root-scope entries use.
+//! [`oversubscribed`] is what the root-scope entries use.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -59,17 +59,6 @@ pub(crate) fn available() -> usize {
 /// thread's set.
 pub(crate) fn oversubscribed(participants: usize) -> bool {
     participants > available()
-}
-
-/// The park delay of the reserved members of a root scope, in nanoseconds:
-/// zero when the scope is oversubscribed (park after the short spin), the
-/// scope's policy delay otherwise.
-pub(crate) fn park_delay(policy: crate::policy::WaitPolicy, oversubscribed: bool) -> u64 {
-    if oversubscribed {
-        0
-    } else {
-        u64::try_from(policy.idle_spin().as_nanos()).unwrap_or(u64::MAX)
-    }
 }
 
 /// Pins the calling thread onto the `k`-th CPU of `set` (wrapping).

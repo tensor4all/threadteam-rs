@@ -31,6 +31,19 @@ const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 /// pool.
 const PIN_PARTICIPANTS_DEFAULT: bool = false;
 
+/// Default spin budget of a wait, in polls (one PAUSE, or YIELD on aarch64,
+/// per poll); see `docs/design/waiting.md`. On x86-64 a poll measured about
+/// 24 ns on Zen 3 (EPYC 7713P), so 12288 polls are about 300 µs, and longer on
+/// CPUs whose PAUSE is slower (Skylake and later Intel cores: about 2x). On
+/// aarch64 a YIELD is much cheaper than a PAUSE; the larger default aims at the
+/// same order of time and is not measured yet. libgomp's default is 300000
+/// polls ("about 3 ms").
+const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
+    1 << 17
+} else {
+    12_288
+};
+
 /// A fixed set of worker threads that [`Exec`](crate::Exec) tokens place work on.
 ///
 /// `Pool` is the only way to make a pool. It wraps the scheduler privately: no
@@ -172,6 +185,12 @@ impl Pool {
         self.awake.pin
     }
 
+    /// The spin budget of this pool's team waits, in polls
+    /// ([`PoolBuilder::spin_polls`]).
+    pub fn spin_polls(&self) -> u32 {
+        self.awake.waits.spin_polls
+    }
+
     /// Number of workers currently kept awake as team members, reserved or
     /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
     /// can change at any moment.
@@ -252,6 +271,7 @@ pub struct PoolBuilder {
     qos: Option<Qos>,
     costs: DispatchCosts,
     pin_participants: bool,
+    spin_polls: u32,
 }
 
 impl PoolBuilder {
@@ -266,6 +286,7 @@ impl PoolBuilder {
             qos: None,
             costs: DispatchCosts::host_default(),
             pin_participants: PIN_PARTICIPANTS_DEFAULT,
+            spin_polls: SPIN_POLLS_DEFAULT,
         }
     }
 
@@ -340,6 +361,8 @@ impl PoolBuilder {
 
     /// Default spin time of an unreserved idle team member before it returns
     /// its thread to Rayon. Defaults to 200 ms; zero returns it immediately.
+    /// The member also returns once it has polled for the pool's spin budget
+    /// ([`spin_polls`](Self::spin_polls)), whichever comes first.
     ///
     /// Operations may override it with [`WaitOverride`](crate::WaitOverride).
     /// A reserved member never leaves on a timeout.
@@ -531,6 +554,30 @@ impl PoolBuilder {
         self
     }
 
+    /// Spin budget of a team wait, in polls of one PAUSE (YIELD on aarch64):
+    /// how long a reserved member waiting for work, a leader in a section's
+    /// join, or a participant in a barrier spins before it yields a few times
+    /// and then sleeps until woken (`docs/design/waiting.md`; the shape of
+    /// libgomp's `GOMP_SPINCOUNT`). A count, so a waiter that is descheduled
+    /// does not spend it while it waits for its CPU. Zero sleeps after the
+    /// yields. An oversubscribed scope, or a pool whose waiters were recently
+    /// descheduled, uses at most 100 polls. It also bounds how long an idle
+    /// member released by a team keeps polling before it returns to Rayon,
+    /// together with [`idle_spin`](Self::idle_spin).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(2).spin_polls(4096).build()?;
+    /// assert_eq!(pool.spin_polls(), 4096);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn spin_polls(mut self, polls: u32) -> Self {
+        self.spin_polls = polls;
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -613,6 +660,7 @@ impl PoolBuilder {
                 self.acquire_timeout,
                 self.costs,
                 self.pin_participants,
+                self.spin_polls,
             )),
         })
     }
@@ -627,6 +675,7 @@ impl PoolBuilder {
                 self.acquire_timeout,
                 self.costs,
                 self.pin_participants,
+                self.spin_polls,
             )),
         })
     }

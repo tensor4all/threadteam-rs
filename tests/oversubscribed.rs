@@ -1,21 +1,19 @@
 //! A root team scope that has more participants than CPUs in the caller's set
-//! parks its members after a short spin instead of spinning for the whole park
-//! delay, and its nested sections keep that knowledge.
+//! parks its members, and its nested sections keep working, with members that
+//! sleep and wake between them.
 //!
-//! Nothing here is a wall-clock bound on the members: the park delay of the
-//! policy is set far above the deadline of the hang guard, so *reaching* the
-//! park proves the scope used its own (zero) delay, whatever the host's speed,
-//! and the wait itself is a poll of the trace with no upper bound.
+//! These are sleeping and waking smoke tests. The pool's spin budget is lifted
+//! to `u32::MAX` polls (minutes), so a member parks within the hang guard only
+//! through a short budget: the throttled one the oversubscribed scope chose, or
+//! the pressure heuristic of a loaded host (`docs/design/waiting.md`). Which
+//! budget a root scope chooses is checked directly in
+//! `src/tests/placement.rs`.
 #![cfg(all(feature = "trace", feature = "parallel", target_os = "linux"))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use threadteam::trace::{self, Kind};
 use threadteam::Pool;
-
-/// The policy's park delay. Far above `DEADLINE`: a member that waited for it
-/// could not park within the deadline.
-const PARK_DELAY: Duration = Duration::from_secs(60);
 
 /// Only a hang guard.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -86,10 +84,9 @@ fn members_that_ran(events: &[trace::Event]) -> Vec<usize> {
 /// Polls (hang guard only) until every member that ran a share has a
 /// `ParkEnter` later than its own last `SectionEnd`.
 ///
-/// No upper bound on how late: what the deadline rules out is the opposite —
-/// with `PARK_DELAY` = 60 s, a member that kept the policy's delay cannot park
-/// before it, so parking within `DEADLINE` can only come from the scope's own
-/// (zero) delay.
+/// No upper bound on how late. With the pool's budget lifted to `u32::MAX`
+/// polls, parking within `DEADLINE` comes from a short budget (see the module
+/// documentation).
 fn wait_until_members_parked(team: &threadteam::Team) {
     let start = Instant::now();
     loop {
@@ -119,7 +116,7 @@ fn wait_until_members_parked(team: &threadteam::Team) {
         }
         assert!(
             start.elapsed() < DEADLINE,
-            "no member parked within {DEADLINE:?}: the scope kept the policy's {PARK_DELAY:?} delay"
+            "no member parked within {DEADLINE:?}: the scope kept the pool's lifted spin budget"
         );
         std::thread::sleep(Duration::from_millis(2));
     }
@@ -142,7 +139,7 @@ fn an_oversubscribed_root_scope_parks_its_members_quickly() {
 
     let pool = Pool::builder()
         .threads(4)
-        .idle_spin(PARK_DELAY)
+        .spin_polls(u32::MAX)
         .acquire_timeout(Duration::from_secs(10))
         .build()
         .unwrap();
@@ -185,7 +182,7 @@ fn the_scope_that_enters_decides_the_park_delay_not_the_mint() {
     // with the policy's 60 s park delay.
     let pool = Pool::builder()
         .threads(3)
-        .idle_spin(PARK_DELAY)
+        .spin_polls(u32::MAX)
         .acquire_timeout(Duration::from_secs(10))
         .build()
         .unwrap();

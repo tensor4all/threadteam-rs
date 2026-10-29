@@ -11,7 +11,9 @@ use core::time::Duration;
 ///
 /// * `idle_spin`: how long an idle member keeps spinning, ready to be claimed
 ///   again without a Rayon wake-up, before it returns its thread to Rayon.
-///   Zero returns it immediately.
+///   Zero returns it immediately. The pool's spin budget of polls
+///   ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)) bounds it
+///   too, whichever ends first.
 /// * `idle_runs_rayon`: whether the spinning member runs queued Rayon jobs in
 ///   the meantime. When it does, a job it picked up runs to completion
 ///   (including nested work) before the member is claimable again, and an

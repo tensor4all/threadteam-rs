@@ -67,6 +67,9 @@ pub use exec::Exec;
 #[cfg(loom)]
 #[doc(hidden)]
 pub use park::Parker;
+#[cfg(loom)]
+#[doc(hidden)]
+pub use park::{Barrier, Completion, Waiter};
 pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
 pub use pool::{Pool, PoolBuilder};
 pub use reserve::{IntoTeamError, Team};

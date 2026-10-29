@@ -1,5 +1,9 @@
-//! The idle clock of a reserved member (feature `trace`): the time since the
-//! member's own last share (or since it started, or since it woke from a park).
+//! The idle episodes of a reserved member (feature `trace`): after its own last
+//! share (or its start, or a wake-up) a member spins for the pool's spin budget
+//! of polls, yields a few times and parks (`docs/design/waiting.md`). The budget
+//! is a count, so no wall-clock lower bound on a park exists; the gating of the
+//! count itself is unit tested (`src/tests/waiting.rs`). Here the budget is zero
+//! and the test checks the episode's order and the wake-up.
 //!
 //! Everything here is judged by the **order of a member's own trace events**,
 //! never by a wall-clock bound on how fast the leader gets around to the next
@@ -8,11 +12,11 @@
 //! slot ids are read from the trace as well, because the acquisition may claim
 //! any free slots.
 //!
-//! * Never before the delay: for every park of member `m` at time `t`,
-//!   `t - max(m's last share end, m's last wake-up, m's start) >= SPIN`. This
-//!   holds for every park in the whole test.
-//! * After the delay: once no section arrives, every member parks; polled until
-//!   it happens, with no upper bound on how late.
+//! * A park follows an anchor: every `ParkEnter` of member `m` comes after one of
+//!   `m`'s own `SectionEnd`, `ParkExit` or `Enter` events, with no other
+//!   `ParkEnter` of `m` in between (one park per idle episode).
+//! * Once no section arrives, every member parks; polled until it happens, with
+//!   no upper bound on how late.
 //! * A following section wakes every member that was parked: the number of
 //!   `ParkExit`s rises by the number of members parked at that moment.
 #![cfg(all(feature = "trace", feature = "parallel"))]
@@ -21,8 +25,6 @@ use std::time::{Duration, Instant};
 use threadteam::trace::{self, Kind};
 use threadteam::Pool;
 
-const SPIN: Duration = Duration::from_millis(40);
-
 /// Only a hang guard: no assertion below is a bound on how long the members or
 /// the leader take.
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -30,7 +32,7 @@ const DEADLINE: Duration = Duration::from_secs(10);
 fn team(width: usize) -> threadteam::Team {
     Pool::builder()
         .threads(width)
-        .idle_spin(SPIN)
+        .spin_polls(0)
         .acquire_timeout(Duration::from_secs(10))
         .build()
         .unwrap()
@@ -109,8 +111,9 @@ fn every_member_parked_after_its_last_share(events: &[trace::Event]) -> bool {
         })
 }
 
-/// Asserts the "never before the delay" property over every park in the trace.
-fn assert_no_park_before_the_delay(team: &threadteam::Team) {
+/// Asserts that every park follows its own anchor (a share end, a wake-up or the
+/// start) with no second park in the same idle episode.
+fn assert_one_park_per_episode(team: &threadteam::Team) {
     let events = member_events(team);
     let parks: Vec<_> = events
         .iter()
@@ -118,36 +121,39 @@ fn assert_no_park_before_the_delay(team: &threadteam::Team) {
         .collect();
     assert!(!parks.is_empty(), "no member parked at all");
     for park in parks {
-        // The park delay runs from the later of the member's own last share
-        // end, its own last wake-up and its start.
-        let anchor = events
+        let before: Vec<_> = events
             .iter()
             .filter(|e| e.member == park.member && e.ns <= park.ns)
-            .filter(|e| matches!(e.kind, Kind::SectionEnd | Kind::ParkExit | Kind::Enter))
-            .map(|e| e.ns)
-            .max();
-        let Some(anchor) = anchor else {
-            panic!("member {} parked without an anchor event", park.member);
-        };
+            .filter(|e| {
+                matches!(
+                    e.kind,
+                    Kind::SectionEnd | Kind::ParkExit | Kind::Enter | Kind::ParkEnter
+                )
+            })
+            .collect();
+        // The last event before this park (itself excluded) is an anchor.
+        let prev = before
+            .iter()
+            .rev()
+            .find(|e| !std::ptr::eq(**e, park))
+            .unwrap_or_else(|| panic!("member {} parked without an anchor event", park.member));
         assert!(
-            park.ns - anchor >= SPIN.as_nanos() as u64,
-            "member {} parked {} us after its own last share, wake-up or start",
-            park.member,
-            (park.ns - anchor) / 1000
+            prev.kind != Kind::ParkEnter,
+            "member {} parked twice in one idle episode",
+            park.member
         );
     }
 }
 
 #[test]
-fn members_park_after_the_park_delay_since_their_own_last_share_or_wake() {
+fn members_park_once_per_idle_episode_and_wake_on_the_next_section() {
     let team = team(3);
     let mut exec = team.exec(3);
     if team.size().get() < 3 {
         return;
     }
-    // Sections a few milliseconds apart for about 150 ms. This does *not*
-    // assert that nobody parks: on a loaded host the leader's sleeps can wake
-    // late enough for a member to idle through its delay, and that is allowed.
+    // Sections a few milliseconds apart: with a zero budget the members park
+    // between them, and every section wakes them.
     for _ in 0..30 {
         exec.reborrow().broadcast(|_| {}).unwrap();
         std::thread::sleep(Duration::from_millis(5));
@@ -162,9 +168,8 @@ fn members_park_after_the_park_delay_since_their_own_last_share_or_wake() {
         team.size().get() - 1,
         "every member ran a share: {members:?}"
     );
-    // The "not before" property holds for every park of the whole test, the
-    // ones inside the phase of regular sections included.
-    assert_no_park_before_the_delay(&team);
+    // One park per idle episode, over the whole test.
+    assert_one_park_per_episode(&team);
     // A following section wakes every member that is parked now: the wake-ups
     // are exactly the parked members' `ParkExit`s.
     let parked = parked_now(&team);
@@ -178,7 +183,9 @@ fn members_park_after_the_park_delay_since_their_own_last_share_or_wake() {
     wait_until("every parked member woke", || {
         count(&team, Kind::ParkExit) >= exits + parked
     });
-    // The clock restarts from the share they just ran: a later park is again at
-    // least SPIN after it.
-    assert_no_park_before_the_delay(&team);
+    // The episode restarts from the share they just ran.
+    wait_until("every member parked again", || {
+        parked_now(&team) == team.size().get() - 1
+    });
+    assert_one_park_per_episode(&team);
 }

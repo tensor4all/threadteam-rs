@@ -11,10 +11,12 @@
 //! ```
 //!
 //! * `ABSENT`: no loop on this worker.
-//! * `RESERVED`: owned by one leader; the member spins on `gen` and runs the
-//!   section the leader published. It neither runs Rayon jobs nor leaves.
-//! * `IDLE`: loop alive but unreserved; spins for the policy's idle time, then
-//!   leaves (`ABSENT`). Claimable by a compare-and-swap, with no waiting.
+//! * `RESERVED`: owned by one leader; the member waits for `gen` (spin, yield,
+//!   then park) and runs the section the leader published. It neither runs
+//!   Rayon jobs nor leaves.
+//! * `IDLE`: loop alive but unreserved; polls for the policy's idle time or
+//!   the pool's spin budget, whichever ends first, then leaves (`ABSENT`).
+//!   Claimable by a compare-and-swap, with no waiting.
 //! * `YIELD`: an idle member inside `rayon::yield_now`; not claimable.
 //!
 //! A leader publishes a [`Section`] (a stack object) by writing its address
@@ -31,7 +33,7 @@
 use crate::error::Refused;
 use crate::park::Parker;
 use crate::policy::WaitPolicy;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::any::Any;
 use std::time::Duration;
 
@@ -50,17 +52,13 @@ const IDLE: usize = 1;
 const YIELD: usize = 2;
 const RESERVED: usize = 3;
 
-/// Alignment that keeps a hot atomic on its own cache line pair (128 bytes
-/// covers Apple Silicon and adjacent-line prefetch on x86).
-#[repr(align(128))]
-pub(crate) struct Padded<T>(pub(crate) T);
-
 /// Pure spin for a while, then yield the CPU between polls.
 ///
 /// Used where progress needs cooperation with other threads on the same CPUs:
 /// `acquire`, the cold claim, and the loops that are not reserved dispatch
-/// polls (`IDLE`, and the states a loop is leaving). Reserved members and a
-/// leader waiting on a section poll with [`spin_wait`] instead.
+/// polls (`IDLE`, and the states a loop is leaving). Reserved members, and a
+/// leader or participant waiting on a section, wait in staged episodes instead
+/// ([`crate::park::Waiter`]).
 #[inline]
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn backoff(spins: &mut u32) {
@@ -69,43 +67,6 @@ pub(crate) fn backoff(spins: &mut u32) {
         std::hint::spin_loop();
     } else {
         std::thread::yield_now();
-    }
-}
-
-/// One PAUSE per poll (YIELD on aarch64), never a yield.
-///
-/// The wait of a reserved member polling `gen`, and of a leader in
-/// `Section::join` / `Section::barrier`, in a scope that is not oversubscribed:
-/// a thread that only spins with PAUSE stays runnable but does not repeatedly
-/// re-enter the scheduler, so a stacked pair can be separated and a share does
-/// not pay for a `sched_yield` on every poll. A parked member is woken by the
-/// leader through [`Parker`].
-#[inline]
-pub(crate) fn spin_wait() {
-    std::hint::spin_loop();
-}
-
-/// How many polls a joined section spins before it yields, in an oversubscribed
-/// scope (more participants than CPUs in the caller's set).
-const OVERSUBSCRIBED_SPINS: u32 = 100;
-
-/// One poll of a leader waiting on a section.
-///
-/// Not oversubscribed: [`spin_wait`]. Oversubscribed: about
-/// [`OVERSUBSCRIBED_SPINS`] PAUSE spins, then one `yield_now` per poll, so the
-/// waiting participants do not hold every CPU while their peers are queued
-/// behind them (the shape libomp takes when it detects oversubscription).
-#[inline]
-fn wait_poll(over: bool, polls: &mut u32) {
-    if !over {
-        spin_wait();
-        return;
-    }
-    if *polls >= OVERSUBSCRIBED_SPINS {
-        std::thread::yield_now();
-    } else {
-        *polls += 1;
-        std::hint::spin_loop();
     }
 }
 
@@ -120,8 +81,9 @@ struct Slot {
     /// Idle policy written by the releasing leader before `IDLE` is stored.
     idle_spin_ns: AtomicU64,
     idle_yield: AtomicBool,
-    /// How long a reserved member spins without work before it parks.
-    park_ns: AtomicU64,
+    /// Spin budget, in polls, of this reserved member's waits for work (see
+    /// `docs/design/waiting.md`); written by the leader at root-scope entry.
+    spin_budget: AtomicU32,
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
@@ -129,8 +91,8 @@ struct Slot {
     /// of this slot touches it (see [`crate::pin::SavedMask`]).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     saved: crate::pin::SavedMask,
-    /// Where this member sleeps once its park delay has passed; woken by the
-    /// leader after it changed `gen`, `state` or `lent` of this slot.
+    /// Where this member sleeps once its spin and yields are spent; woken by
+    /// the leader after it changed `gen`, `state` or `lent` of this slot.
     park: Parker,
 }
 
@@ -143,7 +105,7 @@ impl Slot {
             arg: AtomicUsize::new(0),
             idle_spin_ns: AtomicU64::new(0),
             idle_yield: AtomicBool::new(false),
-            park_ns: AtomicU64::new(u64::MAX),
+            spin_budget: AtomicU32::new(crate::park::THROTTLED_POLLS),
             lent: AtomicBool::new(false),
             saved: crate::pin::SavedMask::new(),
             park: Parker::new(),
@@ -151,9 +113,24 @@ impl Slot {
     }
 }
 
+/// The waiting state of one pool (`docs/design/waiting.md`).
+pub(crate) struct Waits {
+    /// Where leaders sleep in `join` and participants in `barrier`. One per
+    /// pool: a member may wake it after its last decrement, when the section
+    /// may already be gone, and the pool outlives every member loop.
+    pub(crate) sync: Parker,
+    /// Recent scheduling pressure seen by this pool's waiters.
+    pub(crate) pressure: crate::park::Pressure,
+    /// Spin budget of a wait, in polls (`PoolBuilder::spin_polls`).
+    pub(crate) spin_polls: u32,
+}
+
 /// Shared state of the awake members of one pool.
 pub(crate) struct Awake {
     slots: Box<[Slot]>,
+    /// What the joins and barriers of this pool's sections sleep on, and the
+    /// pool's spin budget and scheduling pressure (`docs/design/waiting.md`).
+    pub(crate) waits: Waits,
     pub(crate) shutdown: AtomicBool,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
@@ -174,9 +151,15 @@ impl Awake {
         acquire_timeout: Duration,
         costs: crate::cost::DispatchCosts,
         pin: bool,
+        spin_polls: u32,
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
+            waits: Waits {
+                sync: Parker::new(),
+                pressure: crate::park::Pressure::new(),
+                spin_polls,
+            },
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
@@ -209,15 +192,30 @@ impl Awake {
         }
     }
 
-    /// Sets the park delay of the given reserved members, in nanoseconds.
+    /// Spin budget, in polls, of a wait in a root scope: the pool's budget, or
+    /// the throttled one when the scope is oversubscribed.
+    pub(crate) fn spin_budget(&self, over: bool) -> u32 {
+        if over {
+            crate::park::THROTTLED_POLLS.min(self.waits.spin_polls)
+        } else {
+            self.waits.spin_polls
+        }
+    }
+
+    /// The spin budget a member slot currently has (tests).
+    #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+    pub(crate) fn slot_spin_budget(&self, id: usize) -> u32 {
+        self.slots[id].spin_budget.load(Ordering::Relaxed)
+    }
+
+    /// Sets the spin budget of the given reserved members' waits for work.
     ///
-    /// A root team scope writes it once at entry: zero (park after the short
-    /// spin) when the scope is oversubscribed, the effective `idle_spin`
-    /// otherwise. Nothing else changes it, so a member keeps the value of the
+    /// A root team scope writes it once at entry ([`Self::spin_budget`] of its
+    /// pressure). Nothing else changes it, so a member keeps the value of the
     /// scope it was reserved for.
-    pub(crate) fn set_park_ns(&self, ids: &[usize], ns: u64) {
+    pub(crate) fn set_spin_budget(&self, ids: &[usize], polls: u32) {
         for &id in ids {
-            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
+            self.slots[id].spin_budget.store(polls, Ordering::Relaxed);
         }
     }
 
@@ -295,7 +293,7 @@ impl Awake {
         pool: &crate::pool::Pool,
         need: usize,
         policy: WaitPolicy,
-        park_spin: Duration,
+        spin_budget: u32,
     ) -> Result<Reservation, Refused> {
         let mut ids = Vec::with_capacity(need);
         // Idle members are claimed with a compare-and-swap. A member that is
@@ -331,10 +329,7 @@ impl Awake {
                 return Err(Refused::Unavailable);
             }
         }
-        let ns = u64::try_from(park_spin.as_nanos()).unwrap_or(u64::MAX);
-        for &id in &ids {
-            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
-        }
+        self.set_spin_budget(&ids, spin_budget);
         Ok(Reservation {
             awake: std::sync::Arc::clone(self),
             ids,
@@ -486,25 +481,29 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
 /// The member loop. Returns when the idle policy, `release_idle` or shutdown
 /// returns the thread to Rayon.
 ///
-/// Idle clock of a reserved member: `last_work` is the instant at which this
-/// member first found nothing to do after its last share (or after it started,
-/// or was taken back from Rayon). It belongs to the member alone, a share of
-/// another member does not move it, and it is read only while polling. When it
-/// is older than the member's park delay the member parks and stays reserved;
-/// a member whose team runs no section therefore costs CPU for the park delay
-/// at most, then nothing. The delay is zero in an oversubscribed root scope, so
-/// `polls` and `spins` are reset at the start of each idle episode there: the
-/// member then spins one short episode of `polls` and parks.
+/// A reserved member waits for work in episodes (`docs/design/waiting.md`): an
+/// episode starts when it first finds nothing to do after its last share (or
+/// after it started, or was taken back from Rayon), spins for the slot's spin
+/// budget in polls, yields a few times, then parks and stays reserved. The
+/// budget is a count, so a member that is descheduled does not spend it while
+/// it waits for its CPU; a long gap between its clock reads ends the spin at
+/// once (see [`crate::park::Pressure`]).
+///
+/// An unreserved (`IDLE`) member returns to Rayon after the policy's
+/// `idle_spin` of wall time or after the pool's spin budget of polls, whichever
+/// comes first, so a team released between calls does not keep every CPU busy
+/// for the whole `idle_spin`.
 #[cfg(feature = "parallel")]
 fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
+    use crate::park::{Step, Waiter};
     use std::time::Instant;
     let slot = &aw.slots[id];
     let mut idle_since: Option<Instant> = None;
-    let mut last_work: Option<Instant> = None;
+    let mut idle_polls = 0u64;
+    let mut waiter: Option<Waiter<'_>> = None;
     let mut was_lent = false;
     let mut reserved = true;
     let mut spins = 0u32;
-    let mut polls = 0u32;
     trace!(aw, Some(id), Enter);
     loop {
         let state = slot.state.load(Ordering::Acquire);
@@ -526,7 +525,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                     trace!(aw, Some(id), LentBegin);
                 }
                 idle_since = None;
-                last_work = None;
+                waiter = None;
                 // Serve the pool's jobs; resume team service when taken back.
                 if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
                     for _ in 0..32 {
@@ -542,31 +541,21 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 idle_since = None;
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
-                    let fresh = last_work.is_none();
-                    let since = *last_work.get_or_insert_with(Instant::now);
-                    if fresh {
-                        // A new idle episode: the park check counts from here.
-                        spins = 0;
-                        polls = 0;
-                    }
-                    spin_wait();
-                    polls = polls.wrapping_add(1);
-                    if polls & 0x3F == 0 {
-                        let park_ns = slot.park_ns.load(Ordering::Relaxed);
-                        if since.elapsed().as_nanos() >= u128::from(park_ns) {
-                            trace!(aw, Some(id), ParkEnter);
-                            park_member(slot, seen);
-                            trace!(aw, Some(id), ParkExit);
-                            last_work = None;
-                            spins = 0;
-                            polls = 0;
-                        }
+                    let w = waiter.get_or_insert_with(|| {
+                        Waiter::new(
+                            slot.spin_budget.load(Ordering::Relaxed),
+                            Some(&aw.waits.pressure),
+                        )
+                    });
+                    if w.step() == Step::Sleep {
+                        trace!(aw, Some(id), ParkEnter);
+                        park_member(slot, seen);
+                        trace!(aw, Some(id), ParkExit);
+                        waiter = None;
                     }
                 } else {
                     seen = g;
-                    spins = 0;
-                    polls = 0;
-                    last_work = None;
+                    waiter = None;
                     let ptr = slot.ptr.load(Ordering::Relaxed);
                     let arg = slot.arg.load(Ordering::Relaxed);
                     // SAFETY: the leader keeps the section alive until its
@@ -578,16 +567,23 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                         slot.saved.save_if_unpinned();
                     }
                     trace!(aw, Some(id), SectionBegin);
-                    // SAFETY: as above.
+                    // SAFETY: as above; `aw` outlives this loop, so the wake
+                    // after the last decrement does not touch the section.
                     unsafe { Section::execute_member(ptr, arg) };
                     trace!(aw, Some(id), SectionEnd);
                 }
             }
             IDLE => {
+                waiter = None;
+                if idle_since.is_none() {
+                    idle_polls = 0;
+                }
                 let since = *idle_since.get_or_insert_with(Instant::now);
+                idle_polls += 1;
                 let spin_ns = slot.idle_spin_ns.load(Ordering::Relaxed);
                 let leave = aw.shutdown.load(Ordering::Relaxed)
                     || aw.release_epoch.load(Ordering::Relaxed) != epoch
+                    || idle_polls > u64::from(aw.waits.spin_polls)
                     || since.elapsed().as_nanos() >= u128::from(spin_ns);
                 if leave {
                     if slot
@@ -654,19 +650,22 @@ pub(crate) struct Section {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pin: bool,
     /// Dispatched participants that have not finished.
-    remaining: Padded<AtomicUsize>,
-    arrived: Padded<AtomicUsize>,
-    epoch: Padded<AtomicUsize>,
-    cancelled: AtomicBool,
+    done: crate::park::Completion,
+    barrier: crate::park::Barrier,
+    cancelled: crate::sync::AtomicBool,
+    /// The pool's waiting state; null when the section has no pool (nothing is
+    /// dispatched, and its single participant never waits).
+    waits: *const Waits,
     /// First panic payload, boxed twice so that it fits an `AtomicPtr`.
     /// (A `Mutex` would allocate on first use on some platforms.)
     panic: AtomicPtr<Box<dyn Any + Send>>,
 }
 
-// SAFETY: `data` points to a `Sync` closure that outlives the section; every
-// other field is an atomic, a plain flag written before the section is
-// published (and read only after a member observed the publishing `gen` with
-// acquire ordering), or a function pointer.
+// SAFETY: `data` points to a `Sync` closure that outlives the section; `waits`
+// points to the pool's `Waits` (in `Awake`, which outlives every section and
+// member loop) and is only read; every other field is an atomic, a plain flag
+// written before the section is published (and read only after a member
+// observed the publishing `gen` with acquire ordering), or a function pointer.
 unsafe impl Sync for Section {}
 
 /// The geometry of a section: its shares, its participants, and the flags of
@@ -690,6 +689,7 @@ impl Section {
         slot_of: unsafe fn(*const (), usize) -> usize,
         slot_data: *const (),
         geometry: Geometry,
+        waits: Option<&Waits>,
     ) -> Self {
         let Geometry {
             dispatched,
@@ -706,10 +706,10 @@ impl Section {
             slot_data,
             over,
             pin,
-            remaining: Padded(AtomicUsize::new(dispatched)),
-            arrived: Padded(AtomicUsize::new(0)),
-            epoch: Padded(AtomicUsize::new(0)),
-            cancelled: AtomicBool::new(false),
+            done: crate::park::Completion::new(dispatched),
+            barrier: crate::park::Barrier::new(size),
+            cancelled: crate::sync::AtomicBool::new(false),
+            waits: waits.map_or(core::ptr::null(), |w| w as *const Waits),
             panic: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -738,17 +738,51 @@ impl Section {
     /// decrement.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     unsafe fn execute_member(ptr: *const Section, arg: usize) {
-        let sec = &*ptr;
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
-        if let Err(p) = r {
-            sec.fail(p);
+        // The pool's waiting state outlives the section: read it now, use it
+        // after the decrement that may let the leader free the section.
+        let waits = (*ptr).waits;
+        {
+            let sec = &*ptr;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
+            if let Err(p) = r {
+                sec.fail(p);
+            }
         }
-        (*ptr).remaining.0.fetch_sub(1, Ordering::Release);
+        crate::park::Completion::finish(
+            core::ptr::addr_of!((*ptr).done),
+            waits.as_ref().map(|w| &w.sync),
+        );
+    }
+
+    /// The pool's waiting state, if the section has a pool.
+    fn waits(&self) -> Option<&Waits> {
+        // SAFETY: `waits` is null or points into the pool's `Awake`, which
+        // outlives the section.
+        unsafe { self.waits.as_ref() }
+    }
+
+    /// A wait episode of this section's join or barrier.
+    fn waiter(&self) -> crate::park::Waiter<'_> {
+        match self.waits() {
+            Some(w) => crate::park::Waiter::new(
+                if self.over {
+                    crate::park::THROTTLED_POLLS.min(w.spin_polls)
+                } else {
+                    w.spin_polls
+                },
+                Some(&w.pressure),
+            ),
+            None => crate::park::Waiter::new(u32::MAX, None),
+        }
     }
 
     /// Records a participant's panic and cancels barriers.
     pub(crate) fn fail(&self, payload: Box<dyn Any + Send>) {
-        self.cancelled.store(true, Ordering::Release);
+        // SeqCst, then wake: barrier waiters may sleep on the pool's parker.
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(w) = self.waits() {
+            w.sync.wake();
+        }
         let fresh = Box::into_raw(Box::new(payload));
         if self
             .panic
@@ -780,42 +814,24 @@ impl Section {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Waits until every dispatched participant has finished.
-    ///
-    /// Polls with [`spin_wait`] (one PAUSE, no yield) unless the root scope is
-    /// oversubscribed, where it spins about 100 times and then yields per poll.
+    /// Waits until every dispatched participant has finished: a staged wait
+    /// (spin, yield, then sleep on the pool's parker until the last member's
+    /// decrement wakes it), throttled when the root scope is oversubscribed.
     pub(crate) fn join(&self) {
-        let mut polls = 0;
-        while self.remaining.0.load(Ordering::Acquire) != 0 {
-            wait_poll(self.over, &mut polls);
+        if self.done.is_done() {
+            return;
         }
+        let mut waiter = self.waiter();
+        self.done.wait(self.waits().map(|w| &w.sync), &mut waiter);
     }
 
     /// Sense-reversing barrier over the section's participants; `false` when
-    /// a participant failed, so that peers can leave instead of waiting.
+    /// a participant failed, so that peers can leave instead of waiting. Waits
+    /// like [`Self::join`].
     pub(crate) fn barrier(&self) -> bool {
-        if self.is_cancelled() {
-            return false;
-        }
-        if self.size == 1 {
-            return true;
-        }
-        let epoch = self.epoch.0.load(Ordering::Acquire);
-        if self.arrived.0.fetch_add(1, Ordering::AcqRel) + 1 == self.size {
-            self.arrived.0.store(0, Ordering::Relaxed);
-            self.epoch.0.store(epoch.wrapping_add(1), Ordering::Release);
-            return true;
-        }
-        let mut polls = 0;
-        loop {
-            if self.epoch.0.load(Ordering::Acquire) != epoch {
-                return true;
-            }
-            if self.is_cancelled() {
-                return false;
-            }
-            wait_poll(self.over, &mut polls);
-        }
+        let mut waiter = self.waiter();
+        self.barrier
+            .arrive(&self.cancelled, self.waits().map(|w| &w.sync), &mut waiter)
     }
 }
 

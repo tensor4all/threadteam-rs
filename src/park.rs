@@ -20,7 +20,7 @@
 //! the latter and the exact code is model-checked. With nobody parked a wake is
 //! one uncontended atomic read-modify-write.
 
-use crate::sync::{AtomicUsize, Condvar, Mutex, Ordering};
+use crate::sync::{AtomicBool, AtomicU64, AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Places where a test can pause a thread (feature `test-hooks`).
 #[doc(hidden)]
@@ -139,6 +139,274 @@ impl Parker {
                 drop(self.lock.lock().unwrap_or_else(|e| e.into_inner()));
             }
             self.cv.notify_all();
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Staged waits (`docs/design/waiting.md`): a bounded spin, a few yields, then a
+// sleep on a `Parker`. The join and the barrier of a section use them through
+// [`Completion`] and [`Barrier`], which are the exact code `loom` checks.
+
+/// Polls of a wait that start with the throttled budget: the scope is
+/// oversubscribed, or the pool saw a waiter descheduled recently. libgomp's
+/// throttled spin count has the same value.
+pub(crate) const THROTTLED_POLLS: u32 = 100;
+
+/// Yields between the spin and the sleep. Each lets a thread queued on the same
+/// CPU run without a futex round trip.
+const YIELD_POLLS: u32 = if cfg!(loom) { 0 } else { 16 };
+
+/// A spinning waiter reads the clock once per this many polls.
+const CHECK_EVERY: u32 = 64;
+
+/// A gap between two clock reads of a spinning waiter longer than this means the
+/// waiter was descheduled while it spun: 64 polls take well under 10 µs, and a
+/// scheduler slice is 0.75 ms or more.
+const PREEMPT_GAP_NS: u64 = 200_000;
+
+/// How long a pool keeps starting its waits throttled after a waiter was
+/// descheduled.
+const CONTENDED_HOLD_NS: u64 = 100_000_000;
+
+/// What a waiting thread does after one [`Waiter::step`].
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Step {
+    /// It polled (spun or yielded); poll the condition again.
+    Poll,
+    /// The spin and the yields are spent: sleep until woken.
+    Sleep,
+}
+
+/// Recent scheduling pressure on one pool's waiters.
+///
+/// A waiter that finds a long gap between two of its clock reads was
+/// descheduled while it spun: something else ran on its CPU (another thread of
+/// the team, a foreign process, or interrupts and VM steal; the signal does not
+/// tell them apart). It records the time, and for [`CONTENDED_HOLD_NS`] every
+/// wait of the pool starts throttled, so the pool's waiters free CPUs quickly
+/// while that pressure lasts.
+#[doc(hidden)]
+pub struct Pressure {
+    base: std::time::Instant,
+    /// Nanoseconds since `base` until which waits start throttled.
+    until: AtomicU64,
+}
+
+impl Default for Pressure {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pressure {
+    /// No pressure recorded yet.
+    pub fn new() -> Self {
+        Pressure {
+            base: std::time::Instant::now(),
+            until: AtomicU64::new(0),
+        }
+    }
+
+    pub(crate) fn now(&self) -> u64 {
+        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    /// Records a descheduled waiter at `now`. A later deadline is never
+    /// shortened by an older observation.
+    pub(crate) fn note(&self, now: u64) {
+        self.until
+            .fetch_max(now.saturating_add(CONTENDED_HOLD_NS), Ordering::Relaxed);
+    }
+
+    pub(crate) fn active(&self, now: u64) -> bool {
+        self.until.load(Ordering::Relaxed) > now
+    }
+
+    /// Whether any pressure was ever recorded (tests).
+    #[cfg(test)]
+    pub(crate) fn recorded(&self) -> bool {
+        self.until.load(Ordering::Relaxed) != 0
+    }
+}
+
+/// One wait episode: up to `budget` spin polls (one PAUSE, or YIELD on
+/// aarch64, each), then [`YIELD_POLLS`] yields, then sleep.
+///
+/// The budget is a count: a waiter that is descheduled does not spend it while
+/// it waits for its CPU. Every [`CHECK_EVERY`] polls it reads the clock. At the
+/// first read it adopts the throttled budget if the pool is under
+/// [`Pressure`]; a long gap between reads ends the spin at once and records the
+/// pressure. A wait that ends within 64 polls never reads the clock.
+#[doc(hidden)]
+pub struct Waiter<'a> {
+    budget: u32,
+    polls: u32,
+    yields: u32,
+    pressure: Option<&'a Pressure>,
+    last: Option<u64>,
+}
+
+impl<'a> Waiter<'a> {
+    /// A wait episode with a spin of `budget` polls.
+    pub fn new(budget: u32, pressure: Option<&'a Pressure>) -> Self {
+        Waiter {
+            budget,
+            polls: 0,
+            yields: 0,
+            pressure,
+            last: None,
+        }
+    }
+
+    /// One poll of the episode; [`Step::Sleep`] once the spin and the yields
+    /// are spent (and on every call after that).
+    #[inline]
+    pub fn step(&mut self) -> Step {
+        if self.polls < self.budget {
+            self.polls += 1;
+            if self.polls.is_multiple_of(CHECK_EVERY) {
+                self.checkpoint();
+            }
+            std::hint::spin_loop();
+            return Step::Poll;
+        }
+        if self.yields < YIELD_POLLS {
+            self.yields += 1;
+            std::thread::yield_now();
+            return Step::Poll;
+        }
+        Step::Sleep
+    }
+
+    #[cold]
+    fn checkpoint(&mut self) {
+        let Some(p) = self.pressure else { return };
+        let now = p.now();
+        match self.last {
+            None if p.active(now) => self.budget = self.budget.min(THROTTLED_POLLS.max(self.polls)),
+            Some(last) if now.saturating_sub(last) > PREEMPT_GAP_NS => {
+                p.note(now);
+                self.budget = self.polls;
+            }
+            _ => {}
+        }
+        self.last = Some(now);
+    }
+}
+
+#[repr(align(128))]
+struct Pad<T>(T);
+
+/// The dispatched shares of a section that have not finished. The leader's
+/// join waits on it; the member that finishes the last share wakes the leader.
+#[doc(hidden)]
+pub struct Completion {
+    remaining: Pad<AtomicUsize>,
+}
+
+impl Completion {
+    /// `n` shares outstanding.
+    pub fn new(n: usize) -> Self {
+        Completion {
+            remaining: Pad(AtomicUsize::new(n)),
+        }
+    }
+
+    /// Whether every share has finished.
+    pub fn is_done(&self) -> bool {
+        self.remaining.0.load(Ordering::Acquire) == 0
+    }
+
+    /// One share finished; the last one wakes a sleeping leader through `sync`.
+    ///
+    /// # Safety
+    ///
+    /// `this` is valid when called. It is not dereferenced after the decrement,
+    /// because the leader may free it as soon as it observes zero; `sync` must
+    /// outlive the call independently of `this`.
+    pub unsafe fn finish(this: *const Completion, sync: Option<&Parker>) {
+        // SeqCst: the state change of the `Parker` protocol (rule 2).
+        if (*this).remaining.0.fetch_sub(1, Ordering::SeqCst) == 1 {
+            if let Some(sync) = sync {
+                sync.wake();
+            }
+        }
+    }
+
+    /// Waits until every share has finished: spin, yield, then sleep on `sync`.
+    pub fn wait(&self, sync: Option<&Parker>, waiter: &mut Waiter<'_>) {
+        while !self.is_done() {
+            if waiter.step() == Step::Sleep {
+                match sync {
+                    Some(sync) => sync.park_while(|| self.remaining.0.load(Ordering::SeqCst) != 0),
+                    None => std::hint::spin_loop(),
+                }
+            }
+        }
+    }
+}
+
+/// The sense-reversing barrier of a section's participants.
+#[doc(hidden)]
+pub struct Barrier {
+    size: usize,
+    arrived: Pad<AtomicUsize>,
+    epoch: Pad<AtomicUsize>,
+}
+
+impl Barrier {
+    /// A barrier over `size` participants.
+    pub fn new(size: usize) -> Self {
+        Barrier {
+            size,
+            arrived: Pad(AtomicUsize::new(0)),
+            epoch: Pad(AtomicUsize::new(0)),
+        }
+    }
+
+    /// Waits until all `size` participants arrived, or `cancelled` is raised
+    /// (then `false`). The last arrival opens the barrier and wakes sleepers
+    /// through `sync`; whoever raises `cancelled` must wake `sync` too.
+    pub fn arrive(
+        &self,
+        cancelled: &AtomicBool,
+        sync: Option<&Parker>,
+        waiter: &mut Waiter<'_>,
+    ) -> bool {
+        if cancelled.load(Ordering::Acquire) {
+            return false;
+        }
+        if self.size == 1 {
+            return true;
+        }
+        let epoch = self.epoch.0.load(Ordering::Acquire);
+        if self.arrived.0.fetch_add(1, Ordering::AcqRel) + 1 == self.size {
+            self.arrived.0.store(0, Ordering::Relaxed);
+            // SeqCst: the state change of the `Parker` protocol (rule 2).
+            self.epoch.0.store(epoch.wrapping_add(1), Ordering::SeqCst);
+            if let Some(sync) = sync {
+                sync.wake();
+            }
+            return true;
+        }
+        loop {
+            if self.epoch.0.load(Ordering::Acquire) != epoch {
+                return true;
+            }
+            if cancelled.load(Ordering::Acquire) {
+                return false;
+            }
+            if waiter.step() == Step::Sleep {
+                match sync {
+                    Some(sync) => sync.park_while(|| {
+                        self.epoch.0.load(Ordering::SeqCst) == epoch
+                            && !cancelled.load(Ordering::SeqCst)
+                    }),
+                    None => std::hint::spin_loop(),
+                }
+            }
         }
     }
 }

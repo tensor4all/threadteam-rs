@@ -6,7 +6,9 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use threadteam::{pays_at, DispatchCosts, DispatchKind, Exec, HostClass, Pool, WidthCosts, PAYS};
+use threadteam::{
+    pays_at, width_for_by, DispatchCosts, DispatchKind, Exec, HostClass, Pool, WidthCosts, PAYS,
+};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
@@ -148,26 +150,60 @@ fn decision_functions_do_not_allocate() {
 }
 
 #[test]
-fn width_model_is_flat_above_the_last_anchor() {
+fn width_model_extrapolates_above_the_last_anchor() {
     let c = WidthCosts::new([us(3), us(2), us(1)]);
     assert_eq!(c.at(nz(6)), us(1));
-    assert_eq!(c.at(nz(8)), us(1));
-    assert_eq!(c.at(nz(64)), us(1));
-    // Linux row: width 8 measured below width 6, the model holds width 6.
+    // Above the last anchor the cost grows with the width, never flat.
+    assert_eq!(c.at(nz(8)), Duration::from_nanos(1333));
+    assert_eq!(c.at(nz(64)), Duration::from_nanos(10_666));
+    // Linux row: the team carries the measured width-8 anchor; in pool and
+    // outside have no anchor there and extrapolate from width 6.
     let l = DispatchCosts::for_class(HostClass::X86_64Avx512);
-    for (kind, w6) in [
-        (DispatchKind::Team, 900),
-        (DispatchKind::InPool, 3_500),
-        (DispatchKind::Outside, 8_700),
-    ] {
-        assert_eq!(l.cost(kind, nz(8)), Duration::from_nanos(w6));
-    }
+    assert_eq!(l.cost(DispatchKind::Team, nz(8)), Duration::from_nanos(980));
+    assert_eq!(
+        l.cost(DispatchKind::InPool, nz(8)),
+        Duration::from_nanos(4666)
+    );
+    assert_eq!(
+        l.cost(DispatchKind::Outside, nz(8)),
+        Duration::from_nanos(11_600)
+    );
     // A team GEMM 64^3 (about 9.7 us) pays at width 8.
     assert!(pays_at(
         Duration::from_nanos(9_700),
         1,
         l.cost(DispatchKind::Team, nz(8))
     ));
+}
+
+/// A row measured up to width 64 replaces the extrapolation where it has data.
+#[test]
+fn anchors_beyond_six_reach_the_decision_functions() {
+    let row = WidthCosts::from_anchors(&[
+        (2, us(8)),
+        (4, us(4)),
+        (8, us(2)),
+        (16, us(1)),
+        (32, Duration::from_nanos(500)),
+        (64, Duration::from_nanos(500)),
+    ])
+    .expect("valid anchors");
+    let costs = DispatchCosts::for_class(HostClass::Generic).with(DispatchKind::Team, row);
+    assert_eq!(costs.cost(DispatchKind::Team, nz(6)), us(3));
+    assert_eq!(
+        costs.cost(DispatchKind::Team, nz(64)),
+        Duration::from_nanos(500)
+    );
+    // 24 us: obj(6) = 3 + 4 = 7 us against obj(64) = 0.5 + 0.375 us, and the
+    // anchors above six are what the search reads.
+    assert_eq!(
+        width_for_by(us(24), 1, nz(64), |k| costs.cost(DispatchKind::Team, k)).get(),
+        64
+    );
+    assert_eq!(
+        costs.min_cost(DispatchKind::Team),
+        Duration::from_nanos(500)
+    );
 }
 
 #[test]
@@ -182,7 +218,8 @@ fn class_rows_and_host_default() {
     assert_eq!(m.cost(DispatchKind::Team, nz(2)), ns(3.0));
     assert_eq!(m.cost(DispatchKind::InPool, nz(4)), ns(11.0));
     assert_eq!(m.cost(DispatchKind::Outside, nz(6)), ns(19.0));
-    // Classes without a measurement take the generic row: 3, 15, 40 us flat.
+    // Classes without a measurement take the generic row: 3, 15, 40 us at the
+    // anchors 2, 4, 6 and proportional to the width above them.
     for class in [
         HostClass::X86_64Avx2,
         HostClass::X86_64Scalar,
@@ -191,10 +228,30 @@ fn class_rows_and_host_default() {
     ] {
         let g = DispatchCosts::for_class(class);
         assert_eq!(g, DispatchCosts::for_class(HostClass::Generic), "{class:?}");
-        for w in [2, 4, 6, 8, 64] {
-            assert_eq!(g.cost(DispatchKind::Team, nz(w)), ns(3.0));
-            assert_eq!(g.cost(DispatchKind::InPool, nz(w)), ns(15.0));
-            assert_eq!(g.cost(DispatchKind::Outside, nz(w)), ns(40.0));
+        // The three anchors of the generic row are equal; above the last anchor
+        // the cost still grows with the width.
+        for (w, team, in_pool, outside) in [
+            (2, 3_000, 15_000, 40_000),
+            (4, 3_000, 15_000, 40_000),
+            (6, 3_000, 15_000, 40_000),
+            (8, 4_000, 20_000, 53_333),
+            (64, 32_000, 160_000, 426_666),
+        ] {
+            assert_eq!(
+                g.cost(DispatchKind::Team, nz(w)),
+                Duration::from_nanos(team),
+                "{class:?} team width {w}"
+            );
+            assert_eq!(
+                g.cost(DispatchKind::InPool, nz(w)),
+                Duration::from_nanos(in_pool),
+                "{class:?} in pool width {w}"
+            );
+            assert_eq!(
+                g.cost(DispatchKind::Outside, nz(w)),
+                Duration::from_nanos(outside),
+                "{class:?} outside width {w}"
+            );
         }
     }
     // The default is the row of the detected class, and detection is stable.

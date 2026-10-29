@@ -570,15 +570,25 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   `fork` children) is `DispatchKind::Team`; a plain token whose caller is a worker
   of its pool is `InPool`; a plain token called from outside is `Outside`. No
   thread-local state is involved and nothing allocates.
-* `DispatchCosts` holds one `WidthCosts` per kind (values at widths 2, 4 and 6,
-  linear in between, flat above 6).
+* `DispatchCosts` holds one `WidthCosts` per kind. A `WidthCosts` stores the
+  measured anchors of its row (widths 2, 4 and 6 from `new` / `flat`, or any
+  strictly increasing widths from 2 to `u16::MAX` from `from_anchors`, at most
+  `WidthCosts::MAX_ANCHORS` = 12 of them): the value at the first anchor below
+  it, linear interpolation between two anchors, and **linear extrapolation above
+  the largest anchor**, `cost(w_m) * w / w_m`. A wide section therefore never pays
+  the cost of the largest measured anchor; a row measured at width 8 keeps its
+  measured value there instead of the extrapolation. The model is evaluated on
+  every lookup by a scan over at most 12 anchors (no table, no allocation).
   `DispatchCosts::for_class(HostClass)` is the row of a host class, and
   `DispatchCosts::host_default()` the row of `HostClass::detect()`. Classes are keyed by the kernel dispatch the
   machine takes, not by the CPU model: `x86_64-avx512` (runtime `avx512f`), `x86_64-avx2` (`avx2` + `fma`),
   `x86_64-scalar`, `aarch64-apple` (aarch64 on macOS), `aarch64`, `generic`; detected once per process.
-  `x86_64-avx512` holds the measured Ryzen row (team 0.6/0.7/0.9, in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us),
-  `aarch64-apple` the measured Apple M5 row, and every class without a measurement the conservative flat
-  `generic` row (3, 15, 40 microseconds). The rates of the consumer crates (strided-rs, tcontract-rs, faer) are
+  `x86_64-avx512` holds the measured Ryzen row (team 0.6/0.7/0.9 at widths 2/4/6 and the measured 0.98 at width 8,
+  in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us), `aarch64-apple` the measured Apple M5 row at widths 2, 4 and 6, and
+  every class without a measurement the conservative generic row (3, 15, 40 microseconds at the anchors; the
+  extrapolation charges 32, 160 and 427 microseconds at width 64). A consumer that measured its own host at more
+  widths overrides the row with `WidthCosts::from_anchors` (up to `WidthCosts::MAX_ANCHORS` = 12 anchors). The rates
+  of the consumer crates (strided-rs, tcontract-rs, faer) are
   tables of their own, keyed by the same class names, and a class's rates and dispatch costs come from the same
   machine in the same clock state: boost on/off moves both by about 1.66x and leaves the ratio stable within a
   few percent (`faer-benchmark` `raw-exec3-boost`, `tables-*-exec3-boost.md`). Each crate carries an identical

@@ -282,7 +282,9 @@ checked (0.019 and 0.084). A scalar that is not native takes the `f64` or `c64` 
 ```rust
 pub const PAYS: f64 = 3.0;
 pub enum DispatchKind { Team, InPool, Outside }
-pub struct WidthCosts;     // values at widths 2, 4, 6: const new([Duration; 3]), const flat(Duration), at(width), min()
+pub struct WidthCosts;     // measured anchors: const new([Duration; 3]) (widths 2, 4, 6), const flat(Duration),
+                           //   const from_anchors(&[(usize, Duration)]) -> Option<Self>, const MAX_ANCHORS = 12,
+                           //   at(width), min()
 pub struct DispatchCosts;  // new(team, in_pool, outside), host_default(), for_class(HostClass), with(kind, costs), cost(kind, width), min_cost(kind)
 impl PoolBuilder { pub fn dispatch_costs(self, c: DispatchCosts) -> Self; }
 impl Pool        { pub fn dispatch_costs(&self) -> DispatchCosts; }
@@ -302,18 +304,30 @@ estimate / k` over `1..=budget`, counting only widths at which the region pays, 
 authority (including `fork` children of a team token), else a worker of the pool (in pool), else outside. No
 thread-local state, no allocation (`tests/dispatch_cost.rs`).
 
-Lookups are cheap: `WidthCosts::new` evaluates the model once into a table of nanoseconds for widths 1 to 6 (wider
-tokens read the last entry, which is the flat model), so `at` is an index, and `pays_at` / `width_for_by` compare
-integer nanoseconds (the objective of `width_for_by` stays `f64`). `cost_lookup` bench, cores 4-11, per call:
-`at` 7.9 to 1.2 ns, `pays_at` after `at` 10.1 to 2.2 ns, `width_for` at budget 8 83 to 32 ns. `min_cost(kind)` /
-`WidthCosts::min()` is the cheapest cost over all widths: a region below `PAYS * min_cost` pays at no width, a
-rejection that stays right for a table whose cost rises with width. A test compares the table with the former
-interpolation for widths 1 to 64.
+Lookups are cheap: a `WidthCosts` stores its measured anchors (integers, widths and nanoseconds) and `at` is a
+forward scan over at most `MAX_ANCHORS` = 12 of them, so the lookup allocates nothing and `pays_at` /
+`width_for_by` compare integer nanoseconds (the objective of `width_for_by` stays `f64`). `cost_lookup` bench on
+cores 4-11 (previous phase, flat table whose `at` was an index): `at` 7.9 to 1.2 ns, `pays_at` after `at` 10.1 to
+2.2 ns, `width_for` at budget 8 83 to 32 ns. The anchor scan costs an integer division per interpolated width where
+the table held the value: on the 4-core run of issue #6 (cores 56-59, best of 9 x 2M calls, same bench file on both
+trees) `at` 0.89 -> 7.35 ns, `width_for` budget 8 25.8 -> 72.9 ns and budget 64 222 -> 553 ns, `min_cost`
+6.0 -> 4.3 ns, a by-value `DispatchCosts` copy 4.5 -> 12.6 ns (144 -> 384 bytes), `Exec::dispatch_cost` on a team
+3.3 -> 8.8 ns. That stays far below one section, which the rows above charge 0.6 to 427 us, but a consumer that
+calls `width_for` on every tiny region should use `min_cost` first. `min_cost(kind)` /
+`WidthCosts::min()` is the cheapest cost over all widths: the minimum over the anchors (neither interpolation nor
+the extrapolation can undershoot the anchor it starts from), so a region below `PAYS * min_cost` pays at no width.
+A test compares the rows with the former interpolation for widths 1 to 6 and pins the extrapolation above them.
 
-Width model: linear interpolation between the widths 2, 4 and 6, the width 2 value below, and above width 6
-the width 6 value held flat (the Linux width 8 data, section 3.6, is below the width 6 value, so flat is
-conservative; it replaced growth in proportion to the width). A host that is not measured gets the flat generic table
-(team 3, in pool 15, outside 40 microseconds), which errs towards staying serial.
+Width model: the value at the first anchor below it, linear interpolation between two anchors, and above the
+**largest** anchor `w_m` linear extrapolation, `cost(w_m) * w / w_m` (issue #6). The largest anchor is 6 for the
+rows built with `new` (widths 2, 4 and 6); the `x86_64-avx512` team row also carries the measured width-8 anchor,
+and `from_anchors` accepts measured anchors up to `u16::MAX`, so a row measured on a many-core host replaces the
+extrapolation where it has data. Above the last anchor the cost is never flat: a wide section is charged at least
+in proportion to its width, so `width_for` no longer answers the full width just because the largest anchor pays (a
+flat 1 us row gives 1, 2, 4 and 8 us at widths 6, 12, 24 and 48; a 24 us region on such a row selects width 12 of a
+budget 64). Section 3.6 keeps the historical reason for the earlier flat model. A host that is not measured gets the
+flat generic row (team 3, in pool 15, outside 40 microseconds at the anchors 2, 4 and 6, and the width proportion
+above), which errs towards staying serial.
 
 faer: `ParShape::Team(n, DispatchCosts)` carries the costs of its token (copied by `Par::shape`);
 `ParShape::dispatch_cost(width)` and `pays(estimate, sections, width)` delegate to threadteam for team shapes.
@@ -522,8 +536,10 @@ pool of 8, median of 3 processes, microseconds per section:
 After the per-member parker fix (see "Width dependence" below; same bench, pool of 8, 10 us share rows, median of 3
 processes, all accepted; `tables-dispatch-exec2.md`), the team row is 0.6, 0.7, 0.9 us at widths 2, 4, 6 and 0.98 at
 w=8; in pool 3.0, 3.6, 3.5 and outside 9.7, 10.1, 8.7 were re-measured and are essentially unchanged. The table
-above predates the parker fix; `for_class(HostClass::X86_64Avx512)` holds the post-fix row. The flat model above width 6 gives 0.9 us for a
-team at w=8, 8 % optimistic against the measured 0.98; the model is left as it is.
+above predates the parker fix; `for_class(HostClass::X86_64Avx512)` holds the post-fix row. The team row carries all
+four measured widths as anchors, so width 8 keeps the measured 0.98 us; in pool and outside keep the widths of the
+post-fix run only (their width-8 columns are from the pre-fix run and are not used), so the model extrapolates
+there: width 8 is 4.67 us in the pool and 11.6 us from outside.
 
 | kind | w=2 | w=4 | w=6 | w=8 |
 | --- | --- | --- | --- | --- |
@@ -535,7 +551,9 @@ The row is `DispatchCosts::for_class(HostClass::X86_64Avx512)` in `cost.rs`, and
 
 ```rust
 HostClass::X86_64Avx512 => DispatchCosts {
-    team: WidthCosts::new([us_f(0.6), us_f(0.7), us_f(0.9)]),
+    team: WidthCosts::from_anchors(&[
+        (2, us_f(0.6)), (4, us_f(0.7)), (6, us_f(0.9)), (8, us_f(0.98)),
+    ]).unwrap(),
     in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
     outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
 },
@@ -545,10 +563,13 @@ What the Linux data says about the design:
 
 * The team cost is the M5's (1.1 to 2.8 us); a plain token costs about half the M5's. Parked members are dearer:
   a team after a 300 ms gap costs 82 to 84 us (M5 27), the first share starts 63 to 83 us after a park.
-* The width model above the last anchor was 2 times pessimistic (it has since been changed to hold the width 6
-  value flat, section 3.1): width 8 measures 1.11 us on a team, 3.0 in the
-  pool and 6.7 outside against 2.21, 4.69 and 11.7 from `cost(6) * 8 / 6`. With the generic table this refuses a
-  team GEMM of `64^3` at width 8 (estimate 9.7 us against `3 * 4.0`) that pays at width 4 (0.32 of serial).
+* The width model above the last anchor was 2 times pessimistic when it grew in proportion to the width; the flat
+  model that replaced it (section 3.1) had the opposite error and was 8 % optimistic at width 8 on the post-fix team
+  row (0.9 against 0.98 us). Since issue #6 the model grows in proportion above the largest anchor again, with the
+  measured width-8 team anchor covering width 8 exactly. The historical numbers: width 8 measures 1.11 us on a team,
+  3.0 in the pool and 6.7 outside (pre-fix run) against 2.21, 4.69 and 11.7 from `cost(6) * 8 / 6`. With the generic
+  row the extrapolation refuses a team GEMM of `64^3` at width 8 (estimate 9.7 us against `3 * 4.0`) that pays at
+  width 4 (0.32 of serial).
 * Every gate measured follows `estimate >= PAYS * sections * D` exactly; the deviations are in the inputs: the
   generic table on Linux, the M5 serial rates (the 2.0 GHz rates here are 1.4 to 3.7 times larger: GEMM 0.064 ns
   per MAC f64, 0.257 c64, 0.032 f32, 0.128 c32), and strided's class assignment (a contiguous `copy_into` and every

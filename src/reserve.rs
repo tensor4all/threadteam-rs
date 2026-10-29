@@ -36,23 +36,24 @@ impl Drop for LeaderGuard<'_> {
 /// [`exec`](Team::exec). A minted token is an ordinary [`Exec`] that carries
 /// the team's authority:
 ///
-/// * `fork` and `for_ranges` dispatch as team sections: no Rayon entry, no
+/// * `fork` and `for_ranges` dispatch as team sections: no queue entry, no
 ///   wake-up, no allocation. Children of `fork` carry the sub-team of their
 ///   share, so nested forks stay on reserved members.
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
 /// * `external` hands the width as on any token and **lends the token's
-///   members to the pool for the call**: they run the pool's Rayon jobs (the
-///   library's work) instead of idling, and resume team service when the call
-///   returns. A lent job that is still running delays the next section until it
-///   finishes.
+///   members to the pool for the call**: they run the pool's queued tasks
+///   instead of idling, and resume team service when the call returns. A lent
+///   task that is still running delays the next section until it finishes.
 ///
-/// Reserved members spin for the reservation's `idle_spin`, then **park**
-/// while staying reserved: they do not return to Rayon until the `Team` is
-/// dropped. The next dispatch wakes them with one condition-variable broadcast,
-/// which costs a syscall on the first dispatch after a park
-/// (`benches/wake_probe.rs`) and one atomic load for a warm one.
+/// Reserved members wait for work in staged episodes: they spin for the pool's
+/// spin budget ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)),
+/// yield a few times, then **park** while staying reserved; they serve nothing
+/// else until the `Team` is dropped (`docs/design/waiting.md`). The next
+/// dispatch wakes a parked member through its slot's parker, which costs a
+/// syscall on the first dispatch after a park (`benches/wake_probe.rs`) and one
+/// atomic read-modify-write for a warm one.
 ///
 /// # Serialization of callers
 ///
@@ -66,8 +67,8 @@ impl Drop for LeaderGuard<'_> {
 /// A `Team` **owns** its [`Pool`] and has no lifetime: an engine stores a `Team`
 /// (or a plain `Pool` when it wants no team). `Pool` is not `Clone`, no method
 /// hands out a second handle, and [`pool`](Team::pool) only borrows. Dropping
-/// the `Team` releases the members and then drops the pool, which joins the
-/// workers; [`into_pool`](Team::into_pool) releases the members and gives the
+/// the `Team` releases the members and then drops the pool (see [`Pool`] for
+/// what that does to its workers); [`into_pool`](Team::into_pool) releases the members and gives the
 /// pool back instead. Tokens borrow the `Team`, so none outlives it.
 ///
 /// # Examples
@@ -149,9 +150,9 @@ impl Pool {
     /// long as it lives.
     ///
     /// `width` counts the leader and is clamped to the pool width; zero is
-    /// treated as one. Acquisition never waits for a running Rayon job (see
-    /// [`Exec::team`](crate::Exec::team)). Members park after the pool's
-    /// `idle_spin` without work.
+    /// treated as one. Acquisition never takes a worker that runs a task (see
+    /// [`Exec::team`](crate::Exec::team)). Members park after the pool's spin
+    /// budget without work ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)).
     ///
     /// # Errors
     ///
@@ -174,8 +175,10 @@ impl Pool {
         self.into_team_with(width, WaitOverride::new())
     }
 
-    /// [`into_team`](Pool::into_team) with an override of the park delay
-    /// (`idle_spin`) of the reserved members.
+    /// [`into_team`](Pool::into_team) with an override of the wait policy of
+    /// the reservation. The reserved members' waits for work use the pool's spin
+    /// budget, not `idle_spin` (`docs/design/waiting.md`); the override is kept
+    /// for the policy the team reports.
     ///
     /// # Errors
     ///
@@ -185,13 +188,14 @@ impl Pool {
         let policy = self.wait_policy().with(over);
         // On drop the members leave at once.
         let release = WaitPolicy::new(Duration::ZERO, false);
-        let reservation = match self
-            .awake
-            .acquire(&self, width - 1, release, policy.idle_spin())
-        {
-            Ok(r) => r,
-            Err(reason) => return Err(IntoTeamError { pool: self, reason }),
-        };
+        let reservation =
+            match self
+                .awake
+                .acquire(width - 1, release, self.awake.spin_budget(false))
+            {
+                Ok(r) => r,
+                Err(reason) => return Err(IntoTeamError { pool: self, reason }),
+            };
         let team = Team {
             reservation,
             policy,
@@ -306,15 +310,14 @@ impl Team {
         let ids = &self.reservation.ids[..budget - 1];
         // Root-scope entry of the token: `exec` is serialized (one leader at a
         // time), so the calling thread's CPU set decides here whether the scope
-        // is oversubscribed. When it is, the members park after their short
-        // spin instead of spinning for the whole park delay; otherwise they get
-        // the policy's delay. `Exec::team_with` on the minted token repeats
+        // is oversubscribed. When it is, the members' waits get the throttled
+        // spin budget; otherwise the pool's. `Exec::team_with` on the minted token repeats
         // this on the thread that enters each scope, so a token that travels to
         // a thread with a different CPU set is paced by that set.
         let oversubscribed = crate::pin::oversubscribed(budget);
         self.pool
             .awake
-            .set_park_ns(ids, crate::pin::park_delay(self.policy, oversubscribed));
+            .set_spin_budget(ids, self.pool.awake.spin_budget(oversubscribed));
         let auth = TeamAuth {
             awake: &self.pool.awake,
             ids,

@@ -6,6 +6,14 @@ cpueinsum-rs, tlinalg-rs and tenferro-rs; the cross-repository rules are in
 tensor4all/tensor4all-meta#41 (`docs/design/core-boundary-and-execution-ownership.md`,
 "Where placement is decided").
 
+
+> **Workers (2026-10-30).** threadteam no longer runs on a private Rayon pool.
+> Its workers are its own threads, leased from a process-wide reserve; see
+> [`own-threads.md`](own-threads.md). Where this record describes Rayon jobs,
+> installs or claim jobs, read the native queue, the cooperative waits and the
+> compare-and-swap reservation described there. The token contracts here are
+> unchanged.
+
 ## Problem
 
 The CPU stack places work with **four** mechanisms at once:
@@ -326,11 +334,10 @@ closure, the participant count, a padded completion counter, a sense-reversing
 barrier, a cancellation flag and an atomic cell for the first panic payload.
 The leader stores the section address and the participant index into each
 member slot and bumps its `gen` counter with release ordering; members poll
-`gen` and `state` with one PAUSE per poll (`spin_loop`, no `sched_yield`) and
-run their share and decrement the completion counter. After the reservation's
-park delay (the effective `idle_spin`, or zero in an oversubscribed root scope,
-see below) without work, a member parks (see below). The leader runs
-share 0, then waits for the counter, polling the same way. Nothing is allocated and nobody is woken
+`gen` and `state`, run their share and decrement the completion counter. The
+leader runs share 0, then waits for the counter. Every one of these waits
+(a member waiting for work, the leader's join, a barrier) is a staged episode,
+spin, a few yields, then sleep, described in [`waiting.md`](waiting.md). Nothing is allocated, and a dispatch wakes only members that are asleep
 (`tests/team_alloc_free.rs`; acquisition allocates a small `Vec` and, for
 members not already awake, the claim jobs).
 
@@ -406,36 +413,35 @@ release it when they return, so a caller that needs the team across several
 entries keeps the token and lends it with `reborrow`. No thread-local state is
 involved (the owner's thread id is stored in the team).
 
-**Parking.** A reserved member that finds no new section for the park delay
-(the effective `idle_spin` of the reservation: the pool default or the
-`reserve_with` / `team_with` override) parks and stays reserved. All parked
-members of a pool wait on one condition variable (`park_lock`, `park_cv`), with
-a counter `parked` of members inside or entering the wait. The protocol:
+**Parking.** A reserved member that finds no new section within its staged
+wait (spin budget, a few yields; [`waiting.md`](waiting.md)) parks and stays
+reserved. Each member slot has its own `Parker`, and a leader wakes only
+the slots it changed (a publish, a release, a lend); the joins and barriers
+sleep on one pool-wide `Parker`. The protocol of every `Parker`:
 
-* A member raises `parked` (acquire-release increment), takes the lock,
-  re-checks `gen`, `state` and `lent` and waits only while none changed; it
+* A sleeper raises `parked` (acquire-release increment), takes the lock,
+  re-checks the state it waits on and waits only while it is unchanged; it
   lowers `parked` when it leaves.
-* A leader changes the state a member waits on (bumps `gen`, stores `IDLE`,
-  sets `lent`), then reads `parked` with an acquire-release `fetch_add(0)`. If it
-  is nonzero, the leader takes and drops the lock and calls `notify_all`. Either the member sees the changed
-  state after raising `parked`, or the leader sees `parked` (both are read-modify-writes of one atomic, so the
-  argument needs only its modification order and release sequences, not a total
-  order of SeqCst accesses, which `loom` does not model); and because the
-  leader takes the lock before notifying, the notification cannot fall between a
-  member's check and its wait (the usual condition-variable handshake).
-* With nobody parked a dispatch pays one uncontended atomic read-modify-write.
-  A broadcast also wakes parked members of other teams of the same pool, which
-  re-check and sleep again; the leader pays one syscall, not one per member.
-* Spurious wake-ups loop. There is no per-member wake state: every parked member
-  waits on the one condition variable, so no wake-up depends on the order in
-  which a leader publishes to individual members.
+* A waker changes the state (SeqCst), then reads `parked` with an
+  acquire-release `fetch_add(0)`. If it is nonzero, it takes and drops the lock
+  and calls `notify_all`. Either the sleeper sees the changed state after
+  raising `parked`, or the waker sees `parked` (both are read-modify-writes of
+  one atomic, so the argument needs only its modification order and release
+  sequences, not a total order of SeqCst accesses, which `loom` does not
+  model); and because the waker takes the lock before notifying, the
+  notification cannot fall between a sleeper's check and its wait.
+* With nobody asleep a wake costs one uncontended atomic read-modify-write.
+  Spurious wake-ups loop. Which parker each wait uses, and when it sleeps, is
+  in [`waiting.md`](waiting.md).
 
 The handshake is the small `Parker` type in `src/park.rs`, built on a `sync`
 shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
 
 * **Model check.** `tests/loom_park.rs` runs the real `Parker` under `loom` with
-  one leader and two members: a published section, a released reservation, and a
-  member that parks twice. The correctness argument therefore uses only what loom
+  one leader and two members: a published section, a released reservation, a
+  member that parks twice, and per-slot parkers; and the exact join and barrier
+  code (`Completion`, `Barrier`): a leader asleep in a join, consecutive
+  barrier rounds, and a cancellation waking a sleeper. The correctness argument therefore uses only what loom
   models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a
@@ -454,63 +460,12 @@ with a zero idle spin and broadcasts, so the members return to Rayon at once.
 
 ### How a reserved member and a joining leader wait
 
-Two waits exist, both allocation-free and both unchanged in the handshake:
-
-* **Reserved members polling `gen`, and a leader in `Section::join` or
-  `Section::barrier`, in a scope that is not oversubscribed**: one
-  `std::hint::spin_loop()` per poll (PAUSE on x86, YIELD/ISB on aarch64), never
-  a `yield_now`. A thread that only issues PAUSE stays runnable but does not
-  re-enter the scheduler on every poll, so a pair the scheduler stacked on one
-  CPU can be separated instead of preempting each other in a yield loop, and a
-  share does not pay a syscall per poll. This is libgomp's shape. A reserved
-  member still parks after its park delay, which is what ends the spin; nothing
-  else wakes it.
-* **Acquisition, the cold claim, and the `IDLE` / leaving states**: `backoff`
-  as before (a bounded pure spin, then one `yield_now` per poll). Those threads
-  are not reserved yet or are on their way out, so they must cooperate to make
-  progress on a loaded host.
-
-**Oversubscription.** A root team scope is oversubscribed when its participants
-number more than the CPUs in the **entering thread's** affinity mask (on
-non-Linux targets: `std::thread::available_parallelism()`). It is decided at
-root-scope entry on that thread, whether or not participant pinning is on: at
-`Exec::team_with` (acquisition path and the carried path of a root token minted
-by a `Team`), and for a `Team` also when its root token is minted
-(`Team::exec`/`try_exec`), which is the pressure a token used without a team
-scope reports. Because the scope entry repeats it, a token minted on one CPU set
-and used on another is paced and placed by the set of the thread that enters the
-scope, never by the one it was minted on. The result is carried into
-`TeamExec`, team-carrying `Exec` tokens, `reborrow`, `limit`, `split` and `fork`
-children and every `Section`, so a nested section of an oversubscribed root
-knows it too; it is never recomputed from a child's size. The members' park
-delay is written to their slots at the same entry. In such a scope:
-
-* the park delay of the reserved members is **zero**, so a member that finds no
-  section spins one short episode (64 polls) and parks instead of holding a CPU
-  for the whole `idle_spin`. `polls` and `spins` are reset at the start of each
-  idle episode, so the episode is counted afresh;
-* `Section::join` and `Section::barrier` spin about 100 times and then
-  `yield_now` per poll, the shape libomp takes when it detects more threads than
-  CPUs, so the waiting participants do not hold every CPU while their peers are
-  queued behind them.
-
-The flag is per scope and per root; overlapping teams or pools are the caller's
-business (see the placement warning below). This is the behaviour libgomp
-throttles to about 100 spins when oversubscribed; measured on broccoli, parking
-alone did not remove the tensor4all/faer#107 slow mode, so the zero park delay is
-about the CPU a member burns, not about the mode.
-
-**Quality of service.** `PoolBuilder::qos(Qos)` sets the class of each worker
-when it starts (`pthread_set_qos_class_self_np` on Apple targets, nothing
-elsewhere; no platform type is public). The default is `UserInitiated` on
-macOS. `threadteam` never changes the caller's class, but the calling thread
-leads every section, so `raise_current_thread_qos(Qos)` raises the calling
-thread to at least the given class and never lowers it (the current class is
-read first); an engine calls it once for its leading thread. In the wake probe
-the class (builder default, explicit `Default`, `UserInteractive`) made no
-measurable difference to the wake latency on this host. Dropping the
-team stores `IDLE` with a zero idle spin and wakes them, so the members return to
-Rayon at once.
+Replaced by [`waiting.md`](waiting.md): every team wait spins for the pool's
+spin budget in polls, yields a few times, then sleeps; the leader's join and
+the barriers sleep on a pool-wide parker; a descheduled waiter throttles the
+pool's waits. The earlier design (PAUSE-only spin with a wall-time park delay
+for members and no sleep at all in joins and barriers) is in the history of
+this file.
 
 ### Participant placement (opt-in)
 
@@ -591,69 +546,13 @@ How it works:
 
 ### Waiting policy
 
-`PoolBuilder::idle_spin` (default 200 ms, may be zero) and
-`PoolBuilder::idle_runs_rayon` (default `false`) set `WaitPolicy` defaults; an
-oversubscribed root scope overrides the park delay with zero for its own
-reservation only;
-`acquire_timeout` is separate. `WaitOverride` (partial policy) applies to one
-operation: `Exec::team_with` for a root reservation, `TeamExec::with_wait` for a
-scope. Children inherit the effective policy and may override it for their own
-scope. The root reservation's effective policy is stored in its members' slots
-when it ends and governs the idle interval that follows; the interval starts
-when the reservation ends, not when the member last computed. A reserved member
-never leaves on a timeout and never runs an unrelated Rayon job (it parks, still
-reserved, after the park delay), whatever the policy, so an override cannot weaken a reservation, and a child's override
-expires when the child returns and cannot release its parent's members.
-With `idle_runs_rayon`, an idle member calls `rayon::yield_now`, whose job runs
-to completion before the member is claimable again. Without it, an idle member
-leaves its worker out of Rayon service for up to `idle_spin`; a following
-`broadcast` or a Rayon job that needs every worker then waits for them, so a
-caller that alternates with such work sets a short spin or calls
-`Pool::release_idle`.
-
-**Idle clock and the default delay.** The park delay of a reserved member is
-measured on a clock that belongs to that member alone: it starts when the
-member first finds nothing to do after its own last share (or after it started,
-or was taken back from a lend), and it restarts with every share the member
-runs. A share of another member does not move it, and neither does anything the
-leader does between sections. When the clock exceeds the delay the member
-parks. Consequences:
-
-* A team that runs no section costs CPU for the delay after the team is built
-  (or after its last section), then nothing: members that spin beyond that are a
-  bug.
-* Sections less than the delay apart keep every participating member spinning
-  the whole time. That is the intended behaviour, not a leak: it is what makes a
-  dispatch cost one atomic store and no syscall (about 0.3 us, against some tens of
-  us after a park on the reference M5, see `benches/spin_grid.rs`).
-* A CPU measurement over a window of sequential work therefore depends on where
-  the window sits relative to the last section (or the construction of the team):
-  a window inside the first 200 ms reads about `width - 1` extra cores, a window
-  after it reads one. Measure CPU after a settle time longer than the delay, or
-  say what the window contains.
-
-The default is 200 ms, the same as the default blocktime of the LLVM and Intel
-OpenMP runtimes (`KMP_BLOCKTIME`): long enough that a loop of small parallel
-regions with serial work between them never pays a wake-up, short enough that a
-program that stops using the team goes quiet within a fifth of a second. The
-sweep in `benches/spin_grid.rs` (6 participants) shows the trade: with a 200 ms
-delay a dispatch after a 100 ms gap costs 12 us (members still spinning, 4.9
-cores); with a zero delay it costs 37 us after any gap and members use no CPU.
-Callers with sparse sections set a shorter delay with `idle_spin` or
-`team_with`.
-
-The clock is explicit in the code (`last_work` in `member_loop`) and visible
-with the feature `trace`, which stamps every member transition (enter, share
-begin and end, park enter and exit, lend, leave) into a preallocated ring; the
-bench `idle_trace` prints each member's spin, park and run time per phase and
-`tests/idle_clock.rs` checks that a member parks neither before the delay since
-its own last share nor never.
-
-`Pool::release_idle` bumps an epoch: idle members leave at once, reserved
-members leave when their reservation ends. It never revokes a live token and
-does not wait, so it may be called inside a reservation. Dropping the pool
-signals shutdown, which idle members honour. `Pool::resident_members` reports
-the number of awake members (diagnostic).
+`PoolBuilder::idle_spin` (default 200 ms, may be zero) and `idle_runs_rayon`
+govern an *unreserved* idle member, the state a member is in after a scoped
+team (`Exec::team`) ended: it stays claimable without a Rayon wake-up until
+`idle_spin` passes or it has polled for the pool's spin budget, whichever
+comes first, then returns to Rayon. `WaitOverride` overrides them per scope.
+Reserved members do not use `idle_spin` any more; their waits, and the joins
+and barriers, follow [`waiting.md`](waiting.md).
 
 ### Unwind
 

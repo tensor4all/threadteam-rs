@@ -72,6 +72,7 @@ fn a_section_carries_the_oversubscription_flag_it_was_built_with() {
         slot_of,
         std::ptr::null(),
         geometry(false),
+        None,
     );
     assert!(!quiet.over);
     let crowded = Section::new(
@@ -80,6 +81,7 @@ fn a_section_carries_the_oversubscription_flag_it_was_built_with() {
         slot_of,
         std::ptr::null(),
         geometry(true),
+        None,
     );
     assert!(crowded.over);
 }
@@ -177,4 +179,51 @@ fn a_team_scope_takes_the_oversubscription_from_the_thread_that_enters_it() {
         "four participants on a one-CPU scope mask is oversubscribed"
     );
     assert!(scoped.1, "a fork child inherits the root's pressure");
+}
+
+/// The budget a root scope chooses at entry: the throttled one when its
+/// participants outnumber the caller's CPUs, the pool's otherwise; and a
+/// persistent team's token does the same at every root-scope entry.
+#[test]
+fn a_root_scope_chooses_the_throttled_spin_budget_when_oversubscribed() {
+    use crate::park::THROTTLED_POLLS;
+    let budget = 50_000;
+    let pool = |width| {
+        Pool::builder()
+            .threads(width)
+            .spin_polls(budget)
+            .acquire_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap()
+    };
+    on_two_cpus(|| {
+        let crowded = pool(4);
+        let mut exec = Exec::new(&crowded, 4).unwrap();
+        exec.team(|team| {
+            let awake = team.awake.expect("a pool");
+            assert!(!team.ids.is_empty());
+            for &id in team.ids {
+                assert_eq!(awake.slot_spin_budget(id), THROTTLED_POLLS);
+            }
+        })
+        .expect("an idle pool");
+        drop(exec);
+        let team = crowded.into_team(4).expect("an idle pool");
+        let mut exec = team.exec(4);
+        exec.team(|t| {
+            for &id in t.ids {
+                assert_eq!(t.awake.unwrap().slot_spin_budget(id), THROTTLED_POLLS);
+            }
+        })
+        .expect("a team token opens its scope");
+
+        let fits = pool(2);
+        let mut exec = Exec::new(&fits, 2).unwrap();
+        exec.team(|team| {
+            for &id in team.ids {
+                assert_eq!(team.awake.unwrap().slot_spin_budget(id), budget);
+            }
+        })
+        .expect("an idle pool");
+    });
 }

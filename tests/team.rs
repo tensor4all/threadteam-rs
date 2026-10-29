@@ -37,10 +37,15 @@ fn pool(n: usize) -> Pool {
 }
 
 /// A pool whose acquisitions tolerate a loaded test host.
+/// A pool whose idle members stay for `spin` of wall time: the poll bound of
+/// an idle member (`spin_polls`) is lifted so that `idle_spin` alone decides,
+/// which these tests are about. `idle_members_return_after_the_spin_budget`
+/// covers the poll bound.
 fn builder(n: usize, spin: Duration) -> threadteam::PoolBuilder {
     Pool::builder()
         .threads(n)
         .idle_spin(spin)
+        .spin_polls(u32::MAX)
         .acquire_timeout(Duration::from_secs(5))
 }
 
@@ -483,6 +488,80 @@ fn a_panic_cancels_barriers_so_peers_leave_instead_of_deadlocking() {
     }
 }
 
+/// The same with every wait asleep (`spin_polls(0)`): the panicker raises the
+/// cancellation after its peers went to sleep in the barrier, and the
+/// cancellation wakes them (`Section::fail`).
+#[test]
+fn a_panic_wakes_peers_asleep_in_a_barrier() {
+    let _w = watchdog();
+    let pool = Pool::builder()
+        .threads(5)
+        .spin_polls(0)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    for panicker in [0, 3] {
+        let mut exec = Exec::new(&pool, 5).unwrap();
+        let cancelled = AtomicUsize::new(0);
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            exec.team(|team| {
+                team.run_with(|p| {
+                    if p.index() == panicker {
+                        // Let the peers reach the barrier and sleep first.
+                        std::thread::sleep(Duration::from_millis(20));
+                        panic!("boom");
+                    }
+                    if p.barrier() == Err(Cancelled) {
+                        cancelled.fetch_add(1, Ordering::SeqCst);
+                    }
+                });
+            })
+        }));
+        assert!(r.is_err());
+        assert_eq!(cancelled.load(Ordering::SeqCst), 4);
+    }
+}
+
+/// Every wait asleep (`spin_polls(0)`), many short sections with barriers,
+/// splits and forks: every section completes with every share counted. A lost
+/// wake-up hangs (watchdog).
+#[test]
+fn sleeping_waits_complete_every_section() {
+    let _w = watchdog();
+    let pool = Pool::builder()
+        .threads(6)
+        .spin_polls(0)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let team = pool.into_team(6).unwrap();
+    let mut exec = team.exec(6);
+    let sum = AtomicUsize::new(0);
+    let rounds = 300;
+    exec.team(|mut t| {
+        let size = t.size().get();
+        for _ in 0..rounds {
+            t.reborrow().run(|_, _| {
+                sum.fetch_add(1, Ordering::Relaxed);
+            });
+            t.reborrow().run_with(|p| {
+                p.barrier().unwrap();
+                p.barrier().unwrap();
+                sum.fetch_add(1, Ordering::Relaxed);
+            });
+            t.reborrow()
+                .split(&[size / 2, size - size / 2], |_, child| {
+                    child.run(|_, _| {
+                        sum.fetch_add(1, Ordering::Relaxed);
+                    });
+                })
+                .unwrap();
+        }
+        assert_eq!(sum.load(Ordering::Relaxed), rounds * 3 * size);
+    })
+    .unwrap();
+}
+
 #[test]
 fn a_child_panic_propagates_through_split_after_siblings_finish() {
     let _w = watchdog();
@@ -575,6 +654,25 @@ fn the_team_runs_from_a_pool_worker_with_members_from_the_others() {
         });
     });
     let _ = ok.load(Ordering::SeqCst);
+}
+
+#[test]
+fn idle_members_return_after_the_spin_budget() {
+    let _w = watchdog();
+    // An hour of `idle_spin`, but a budget of 1000 polls: a released member
+    // returns to Rayon after its polls, long before the hour.
+    let pool = Pool::builder()
+        .threads(4)
+        .idle_spin(Duration::from_secs(3600))
+        .spin_polls(1000)
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let mut exec = Exec::new(&pool, 4).unwrap();
+    exec.team(|t| t.run(|_, _| {})).unwrap();
+    wait_until("idle members returned after their polls", || {
+        pool.resident_members() == 0
+    });
 }
 
 #[test]

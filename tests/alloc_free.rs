@@ -2,25 +2,65 @@
 #![cfg(all(feature = "parallel", not(feature = "ledger")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
 use std::num::NonZeroUsize;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Mutex;
 use threadteam::{Exec, Pool};
 
 struct Counting;
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+/// While set, every counted allocation also records its size, its thread and
+/// a backtrace, so that a failure says where it came from (a platform the
+/// author cannot run, such as macOS on CI, is diagnosed from the log alone).
+static RECORD: AtomicBool = AtomicBool::new(false);
+static RECORDED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+thread_local! {
+    /// The recording itself allocates: it is neither counted nor recorded.
+    static RECORDING: Cell<bool> = const { Cell::new(false) };
+}
+
+fn count(size: usize) {
+    if RECORDING.with(|r| r.get()) {
+        return;
+    }
+    ALLOCS.fetch_add(1, Ordering::SeqCst);
+    if RECORD.load(Ordering::SeqCst) {
+        RECORDING.with(|r| r.set(true));
+        let entry = format!(
+            "{size} bytes on {:?}:\n{}",
+            std::thread::current().name(),
+            std::backtrace::Backtrace::force_capture()
+        );
+        RECORDED
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(entry);
+        RECORDING.with(|r| r.set(false));
+    }
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::SeqCst);
+        count(l.size());
         System.alloc(l)
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         System.dealloc(p, l)
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, n: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Ordering::SeqCst);
+        count(n);
         System.realloc(p, l, n)
     }
+}
+
+/// The allocations recorded so far, for a failure message.
+fn recorded() -> String {
+    RECORDED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .join("\n----\n")
 }
 
 #[global_allocator]
@@ -37,27 +77,36 @@ fn entries(pool: &Pool) {
     });
     let w = Exec::new(pool, 3).unwrap().external(|w| w.get());
     assert_eq!(w, 3);
+    if !threadteam::Exec::new(pool, 3).unwrap().can_broadcast() {
+        return;
+    }
+    Exec::new(pool, 3)
+        .unwrap()
+        .broadcast(|i| {
+            sink.fetch_add(i, Ordering::Relaxed);
+        })
+        .unwrap();
     assert!(sink.load(Ordering::Relaxed) > 0);
 }
 
-/// Smallest allocation count over `rounds` windows of one call each, after warm-up.
-///
-/// From a plain thread every entry pushes one job into rayon's injector queue,
-/// whose block allocation (one per 31 pushes) is amortized and outside this
-/// crate; a per-call allocation shows up in every window, so the minimum
-/// separates the two.
+/// Largest allocation count over `rounds` windows of one call each, after
+/// warm-up: strict, every window counts (the native scheduler publishes stack
+/// batches, so there is no amortized queue allocation to tolerate).
 fn measure(rounds: usize, f: impl Fn()) -> usize {
     for _ in 0..20 {
         f();
     }
-    (0..rounds)
+    RECORD.store(true, Ordering::SeqCst);
+    let worst = (0..rounds)
         .map(|_| {
             let before = ALLOCS.load(Ordering::SeqCst);
             f();
             ALLOCS.load(Ordering::SeqCst) - before
         })
-        .min()
-        .unwrap_or(0)
+        .max()
+        .unwrap_or(0);
+    RECORD.store(false, Ordering::SeqCst);
+    worst
 }
 
 // One test: the counter is process-global.
@@ -65,7 +114,20 @@ fn measure(rounds: usize, f: impl Fn()) -> usize {
 fn fork_for_ranges_external_do_not_allocate() {
     let pool = Pool::builder().threads(3).build().unwrap();
     let plain = measure(10, || entries(&pool));
-    assert_eq!(plain, 0, "plain-thread entries allocated");
+    assert_eq!(plain, 0, "plain-thread entries allocated:\n{}", recorded());
+    // The same after the workers went to sleep: waking them allocates nothing.
+    let asleep = measure(5, || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before = ALLOCS.load(Ordering::SeqCst);
+        entries(&pool);
+        assert_eq!(
+            ALLOCS.load(Ordering::SeqCst) - before,
+            0,
+            "entries after a park allocated:\n{}",
+            recorded()
+        );
+    });
+    let _ = asleep;
 
     // Inside the pool: a worker of `pool` enters again, which installs nothing,
     // so every window is strict.
@@ -78,7 +140,8 @@ fn fork_for_ranges_external_do_not_allocate() {
     assert_eq!(
         inside.load(Ordering::SeqCst),
         0,
-        "in-pool entries allocated"
+        "in-pool entries allocated:\n{}",
+        recorded()
     );
 
     // Participant pinning on: the extra pin section a root team scope runs must

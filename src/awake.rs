@@ -1,21 +1,17 @@
-//! Reserved awake members: per-member dispatch slots, sections, acquisition.
+//! The workers of a pool: their slots, the native loop, sections, acquisition.
 //!
-//! A *member* is a worker of the pool that runs a long-lived loop as one
-//! Rayon job. While the loop runs, the worker serves no other Rayon job.
-//! Each worker index owns one cache-line padded [`Slot`]:
+//! Every leased worker runs [`serve`] for its slot until the pool detaches it
+//! (`docs/design/own-threads.md`). A slot's state word ([`crate::park::SlotState`])
+//! has the bits `RESERVED`, `LENT`, `BUSY`, `DETACH`:
 //!
-//! ```text
-//! ABSENT --claim job--> RESERVED <--claim (CAS)-- IDLE
-//!    ^                     |  release (store)      ^ |
-//!    +---- idle timeout ---+-----------------------+ +-- YIELD (inside a Rayon job)
-//! ```
-//!
-//! * `ABSENT`: no loop on this worker.
-//! * `RESERVED`: owned by one leader; the member spins on `gen` and runs the
-//!   section the leader published. It neither runs Rayon jobs nor leaves.
-//! * `IDLE`: loop alive but unreserved; spins for the policy's idle time, then
-//!   leaves (`ABSENT`). Claimable by a compare-and-swap, with no waiting.
-//! * `YIELD`: an idle member inside `rayon::yield_now`; not claimable.
+//! * `0`: free. The worker serves the pool's broadcast shares and queued tasks
+//!   (winning `BUSY` before it takes one) and otherwise waits (spin, yield,
+//!   park). A team claims it by a compare-and-swap from `0`.
+//! * `RESERVED`: a team member. It waits for `gen` (spin, yield, park) and runs
+//!   the sections its leader publishes; it serves nothing else.
+//! * `RESERVED|LENT`: a member lent to the pool's queue (`Exec::external`).
+//! * `BUSY`: running a task or a share; not claimable.
+//! * `DETACH`: the pool is being dropped; the worker acknowledges and leaves.
 //!
 //! A leader publishes a [`Section`] (a stack object) by writing its address
 //! and an argument into the member's slot and bumping `gen`; the member runs
@@ -27,11 +23,12 @@
 //! futex round per section that grew with the number of unused members).
 //!
 //! No thread-local state is used: a member's identity is its slot index.
+#![cfg_attr(not(feature = "parallel"), allow(dead_code))]
 
 use crate::error::Refused;
 use crate::park::Parker;
 use crate::policy::WaitPolicy;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::any::Any;
 use std::time::Duration;
 
@@ -44,23 +41,17 @@ macro_rules! trace {
     };
 }
 
-const ABSENT: usize = 0;
-const IDLE: usize = 1;
-#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-const YIELD: usize = 2;
-const RESERVED: usize = 3;
-
-/// Alignment that keeps a hot atomic on its own cache line pair (128 bytes
-/// covers Apple Silicon and adjacent-line prefetch on x86).
-#[repr(align(128))]
-pub(crate) struct Padded<T>(pub(crate) T);
+#[cfg(feature = "parallel")]
+use crate::park::{BUSY, DETACH};
+use crate::park::{LENT, RESERVED};
 
 /// Pure spin for a while, then yield the CPU between polls.
 ///
 /// Used where progress needs cooperation with other threads on the same CPUs:
 /// `acquire`, the cold claim, and the loops that are not reserved dispatch
-/// polls (`IDLE`, and the states a loop is leaving). Reserved members and a
-/// leader waiting on a section poll with [`spin_wait`] instead.
+/// polls (`IDLE`, and the states a loop is leaving). Reserved members, and a
+/// leader or participant waiting on a section, wait in staged episodes instead
+/// ([`crate::park::Waiter`]).
 #[inline]
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn backoff(spins: &mut u32) {
@@ -72,89 +63,97 @@ pub(crate) fn backoff(spins: &mut u32) {
     }
 }
 
-/// One PAUSE per poll (YIELD on aarch64), never a yield.
-///
-/// The wait of a reserved member polling `gen`, and of a leader in
-/// `Section::join` / `Section::barrier`, in a scope that is not oversubscribed:
-/// a thread that only spins with PAUSE stays runnable but does not repeatedly
-/// re-enter the scheduler, so a stacked pair can be separated and a share does
-/// not pay for a `sched_yield` on every poll. A parked member is woken by the
-/// leader through [`Parker`].
-#[inline]
-pub(crate) fn spin_wait() {
-    std::hint::spin_loop();
-}
-
-/// How many polls a joined section spins before it yields, in an oversubscribed
-/// scope (more participants than CPUs in the caller's set).
-const OVERSUBSCRIBED_SPINS: u32 = 100;
-
-/// One poll of a leader waiting on a section.
-///
-/// Not oversubscribed: [`spin_wait`]. Oversubscribed: about
-/// [`OVERSUBSCRIBED_SPINS`] PAUSE spins, then one `yield_now` per poll, so the
-/// waiting participants do not hold every CPU while their peers are queued
-/// behind them (the shape libomp takes when it detects oversubscription).
-#[inline]
-fn wait_poll(over: bool, polls: &mut u32) {
-    if !over {
-        spin_wait();
-        return;
-    }
-    if *polls >= OVERSUBSCRIBED_SPINS {
-        std::thread::yield_now();
-    } else {
-        *polls += 1;
-        std::hint::spin_loop();
-    }
-}
-
-/// One member's dispatch slot.
+/// One worker's slot: its state word, its team-member dispatch state, and
+/// where it sleeps.
 #[repr(align(128))]
-struct Slot {
-    state: AtomicUsize,
+pub(crate) struct Slot {
+    /// `RESERVED`/`LENT`/`BUSY`/`DETACH` (see [`crate::park::SlotState`]).
+    pub(crate) state: crate::park::SlotState,
     /// Bumped by the current leader per published section.
     gen: AtomicUsize,
     ptr: AtomicPtr<Section>,
     arg: AtomicUsize,
-    /// Idle policy written by the releasing leader before `IDLE` is stored.
+    /// Idle policy written by the releasing leader before the slot is freed.
     idle_spin_ns: AtomicU64,
-    idle_yield: AtomicBool,
-    /// How long a reserved member spins without work before it parks.
-    park_ns: AtomicU64,
-    /// Set by the leader while the member's thread is lent to Rayon
-    /// (`Exec::external` on a team token).
-    lent: AtomicBool,
-    /// The mask this member saved before pinning itself; only the member thread
-    /// of this slot touches it (see [`crate::pin::SavedMask`]).
+    /// Spin budget, in polls, of this reserved member's waits for work (see
+    /// `docs/design/waiting.md`); written by the leader at root-scope entry.
+    spin_budget: AtomicU32,
+    /// The mask this member saved before pinning itself; only the worker
+    /// thread of this slot touches it (see [`crate::pin::SavedMask`]).
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    saved: crate::pin::SavedMask,
-    /// Where this member sleeps once its park delay has passed; woken by the
-    /// leader after it changed `gen`, `state` or `lent` of this slot.
-    park: Parker,
+    pub(crate) saved: crate::pin::SavedMask,
+    /// Where this worker sleeps: idle, as a member between sections, or while
+    /// it waits for a batch (`help_while`). An `Arc`, so that a completion can
+    /// keep it alive across its final decrement.
+    pub(crate) park: std::sync::Arc<Parker>,
+    /// The worker thread leased to this slot (set when it attaches).
+    pub(crate) thread: std::sync::OnceLock<std::thread::ThreadId>,
+    /// The worker's broadcast cursor (only the worker touches it).
+    bseq: AtomicU64,
+    /// Set while the worker waits for a batch and serves its pool meanwhile.
+    pub(crate) helping: AtomicBool,
+    /// Broadcast shares on this worker's stack (only the worker touches it).
+    /// While one runs, the worker takes no other share: a later broadcast run
+    /// above an unfinished one could wait at its barrier for a worker that
+    /// waits at the earlier one's.
+    in_bcast: AtomicUsize,
+    /// A released member that has not gone to sleep since (it still spins,
+    /// claimable without a wake): what `Pool::resident_members` counts besides
+    /// reserved members.
+    lingering: AtomicBool,
+    /// The worker attached to its lease / acknowledged its detach.
+    pub(crate) attached: AtomicBool,
+    pub(crate) acked: AtomicBool,
 }
 
 impl Slot {
     fn new() -> Self {
         Slot {
-            state: AtomicUsize::new(ABSENT),
+            state: crate::park::SlotState::new(),
             gen: AtomicUsize::new(0),
             ptr: AtomicPtr::new(core::ptr::null_mut()),
             arg: AtomicUsize::new(0),
-            idle_spin_ns: AtomicU64::new(0),
-            idle_yield: AtomicBool::new(false),
-            park_ns: AtomicU64::new(u64::MAX),
-            lent: AtomicBool::new(false),
+            idle_spin_ns: AtomicU64::new(u64::MAX),
+            spin_budget: AtomicU32::new(crate::park::THROTTLED_POLLS),
             saved: crate::pin::SavedMask::new(),
-            park: Parker::new(),
+            park: std::sync::Arc::new(Parker::new()),
+            thread: std::sync::OnceLock::new(),
+            bseq: AtomicU64::new(0),
+            helping: AtomicBool::new(false),
+            in_bcast: AtomicUsize::new(0),
+            lingering: AtomicBool::new(false),
+            attached: AtomicBool::new(false),
+            acked: AtomicBool::new(false),
         }
     }
 }
 
+/// The waiting state of one pool (`docs/design/waiting.md`).
+pub(crate) struct Waits {
+    /// Where leaders sleep in `join` and participants in `barrier`. One per
+    /// pool: a member may wake it after its last decrement, when the section
+    /// may already be gone, and the pool outlives every member loop. Also
+    /// where a plain outside thread waits for a batch of this pool.
+    pub(crate) sync: std::sync::Arc<Parker>,
+    /// Spin budget of a wait, in polls (`PoolBuilder::spin_polls`).
+    pub(crate) spin_polls: u32,
+    /// Diagnostics (`Pool::wait_counters`): sleeps of leaders in joins, of
+    /// participants in barriers, and parks of members waiting for work.
+    pub(crate) join_sleeps: AtomicU64,
+    pub(crate) barrier_sleeps: AtomicU64,
+    pub(crate) member_parks: AtomicU64,
+}
+
 /// Shared state of the awake members of one pool.
 pub(crate) struct Awake {
-    slots: Box<[Slot]>,
-    pub(crate) shutdown: AtomicBool,
+    pub(crate) slots: Box<[Slot]>,
+    /// The pool's queue of task batches (plain `fork`, `for_ranges`, `external`).
+    pub(crate) queue: crate::park::Queue,
+    /// The pool's broadcasts.
+    pub(crate) bcast: crate::park::BroadcastList,
+    /// What the joins and barriers of this pool's sections sleep on, and the
+    /// pool's spin budget (`docs/design/waiting.md`).
+    pub(crate) waits: Waits,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
@@ -174,10 +173,19 @@ impl Awake {
         acquire_timeout: Duration,
         costs: crate::cost::DispatchCosts,
         pin: bool,
+        spin_polls: u32,
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
-            shutdown: AtomicBool::new(false),
+            queue: crate::park::Queue::new(),
+            bcast: crate::park::BroadcastList::new(),
+            waits: Waits {
+                sync: std::sync::Arc::new(Parker::new()),
+                spin_polls,
+                join_sleeps: AtomicU64::new(0),
+                barrier_sleeps: AtomicU64::new(0),
+                member_parks: AtomicU64::new(0),
+            },
             release_epoch: AtomicUsize::new(0),
             defaults,
             costs,
@@ -188,36 +196,51 @@ impl Awake {
         }
     }
 
-    /// Workers currently running a member loop, reserved or idle.
+    /// Members kept awake for teams: reserved ones, and released ones that
+    /// have not gone to sleep since.
     pub(crate) fn resident(&self) -> usize {
         self.slots
             .iter()
-            .filter(|s| s.state.load(Ordering::Acquire) != ABSENT)
+            .filter(|s| s.state.load() & RESERVED != 0 || s.lingering.load(Ordering::Acquire))
             .count()
     }
 
-    /// Hands members back: they become idle under `policy`.
+    /// Hands members back: they become free under `policy`.
     pub(crate) fn release(&self, ids: &[usize], policy: WaitPolicy) {
         let ns = u64::try_from(policy.idle_spin().as_nanos()).unwrap_or(u64::MAX);
         for &id in ids {
             let s = &self.slots[id];
             s.idle_spin_ns.store(ns, Ordering::Relaxed);
-            s.idle_yield
-                .store(policy.idle_runs_rayon(), Ordering::Relaxed);
-            s.state.store(IDLE, Ordering::SeqCst);
+            s.lingering.store(true, Ordering::Release);
+            s.state.release();
             s.park.wake();
         }
     }
 
-    /// Sets the park delay of the given reserved members, in nanoseconds.
+    /// Spin budget, in polls, of a wait in a root scope: the pool's budget, or
+    /// the throttled one when the scope is oversubscribed.
+    pub(crate) fn spin_budget(&self, over: bool) -> u32 {
+        if over {
+            crate::park::THROTTLED_POLLS.min(self.waits.spin_polls)
+        } else {
+            self.waits.spin_polls
+        }
+    }
+
+    /// The spin budget a member slot currently has (tests).
+    #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+    pub(crate) fn slot_spin_budget(&self, id: usize) -> u32 {
+        self.slots[id].spin_budget.load(Ordering::Relaxed)
+    }
+
+    /// Sets the spin budget of the given reserved members' waits for work.
     ///
-    /// A root team scope writes it once at entry: zero (park after the short
-    /// spin) when the scope is oversubscribed, the effective `idle_spin`
-    /// otherwise. Nothing else changes it, so a member keeps the value of the
+    /// A root team scope writes it once at entry ([`Self::spin_budget`] of
+    /// whether it is oversubscribed). Nothing else changes it, so a member keeps the value of the
     /// scope it was reserved for.
-    pub(crate) fn set_park_ns(&self, ids: &[usize], ns: u64) {
+    pub(crate) fn set_spin_budget(&self, ids: &[usize], polls: u32) {
         for &id in ids {
-            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
+            self.slots[id].spin_budget.store(polls, Ordering::Relaxed);
         }
     }
 
@@ -270,71 +293,89 @@ impl Awake {
         trace!(self, None, Publish);
     }
 
-    /// Lends (or takes back) the members' threads to Rayon: while lent, a
-    /// reserved member runs the pool's jobs instead of idling.
+    /// Lends (or takes back) the members' threads to the pool's queue: while
+    /// lent, a reserved member runs the pool's tasks instead of idling. Taking
+    /// it back lets a task it is running finish; the member serves its team
+    /// again after that.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) fn lend(&self, ids: &[usize], on: bool) {
         for &id in ids {
             let s = &self.slots[id];
-            s.lent.store(on, Ordering::SeqCst);
-            if on {
+            s.state.set_lent(on);
+            s.park.wake();
+        }
+    }
+
+    /// Wakes the workers that can take work of the queue or a broadcast: free
+    /// ones, lent members and workers helping while they wait.
+    pub(crate) fn wake_for_work(&self) {
+        for s in &*self.slots {
+            let st = s.state.load();
+            if st == 0 || st == RESERVED | LENT || s.helping.load(Ordering::SeqCst) {
                 s.park.wake();
             }
         }
     }
 
-    /// Reserves `need` members, or refuses without waiting for a Rayon job.
-    ///
-    /// Idle resident members are claimed with a compare-and-swap. Missing ones
-    /// are requested with claim jobs; the leader waits at most the pool's
-    /// acquisition timeout for *idle workers to wake up*, never for a worker
-    /// that is busy: when the members are not all there by then the claim is
-    /// closed, every tentative member is released and `Unavailable` returned.
+    /// The slot of the calling thread in this pool, if it is one of its
+    /// workers (a scan of the slots: entry points only).
+    pub(crate) fn slot_of_current(&self) -> Option<usize> {
+        let me = std::thread::current().id();
+        self.slots.iter().position(|s| s.thread.get() == Some(&me))
+    }
+
+    /// Reserves `need` free workers by compare-and-swap, waiting at most the
+    /// pool's acquisition timeout for busy ones to become free; on a shortfall
+    /// every tentative member is released and `Unavailable` returned. A worker
+    /// that runs a task is not free, so a reservation never shares a thread
+    /// with a running task.
     pub(crate) fn acquire(
         self: &std::sync::Arc<Self>,
-        pool: &crate::pool::Pool,
         need: usize,
         policy: WaitPolicy,
-        park_spin: Duration,
+        spin_budget: u32,
     ) -> Result<Reservation, Refused> {
         let mut ids = Vec::with_capacity(need);
-        // Idle members are claimed with a compare-and-swap. A member that is
-        // inside `yield_now` is not claimable at that instant, but it is only
-        // polling unless it found a job; retry for at most the timeout while
-        // such members exist, instead of treating them as busy at once.
+        let me = self.slot_of_current();
         let started = std::time::Instant::now();
+        let mut spins = 0u32;
         loop {
-            let mut yielding = false;
-            for (i, s) in self.slots.iter().enumerate() {
+            // Members of an earlier team that are still awake first (warm,
+            // claimable without a wake-up), then any other free worker.
+            let order = self
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.lingering.load(Ordering::Acquire))
+                .chain(
+                    self.slots
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, s)| !s.lingering.load(Ordering::Acquire)),
+                );
+            for (i, s) in order {
                 if ids.len() == need {
                     break;
                 }
-                match s
-                    .state
-                    .compare_exchange(IDLE, RESERVED, Ordering::AcqRel, Ordering::Relaxed)
+                if Some(i) != me
+                    && !ids.contains(&i)
+                    && s.attached.load(Ordering::Acquire)
+                    && s.state.try_reserve()
                 {
-                    Ok(_) => ids.push(i),
-                    Err(YIELD) => yielding = true,
-                    Err(_) => {}
+                    s.lingering.store(false, Ordering::Release);
+                    ids.push(i);
                 }
             }
-            if ids.len() == need || !yielding || started.elapsed() >= self.acquire_timeout {
+            if ids.len() == need || started.elapsed() >= self.acquire_timeout {
                 break;
             }
-            std::hint::spin_loop();
+            backoff(&mut spins);
         }
-        let missing = need - ids.len();
-        if missing > 0 {
-            self.claim_cold(pool, missing, &mut ids);
-            if ids.len() < need {
-                self.release(&ids, policy);
-                return Err(Refused::Unavailable);
-            }
+        if ids.len() < need {
+            self.release(&ids, policy);
+            return Err(Refused::Unavailable);
         }
-        let ns = u64::try_from(park_spin.as_nanos()).unwrap_or(u64::MAX);
-        for &id in &ids {
-            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
-        }
+        self.set_spin_budget(&ids, spin_budget);
         Ok(Reservation {
             awake: std::sync::Arc::clone(self),
             ids,
@@ -342,46 +383,81 @@ impl Awake {
         })
     }
 
+    /// Runs one broadcast share or one queued task on worker `id`, if there is
+    /// one; the caller holds the right to run work (it won `BUSY`, or it is a
+    /// worker waiting for a batch). `true` when something ran.
     #[cfg(feature = "parallel")]
-    fn claim_cold(
-        self: &std::sync::Arc<Self>,
-        pool: &crate::pool::Pool,
-        missing: usize,
-        ids: &mut Vec<usize>,
-    ) {
-        use std::sync::Arc;
-        use std::time::Instant;
-        let acq = Arc::new(Acq::new(missing));
-        for _ in 0..missing {
-            let (aw, a) = (Arc::clone(self), Arc::clone(&acq));
-            pool.inner.spawn(move || claim_job(&aw, &a));
-        }
-        let deadline = Instant::now() + self.acquire_timeout;
-        let mut spins = 0;
-        while acq.joined() < missing && Instant::now() < deadline {
-            backoff(&mut spins);
-        }
-        let n = acq.close();
-        for pos in 0..n {
-            let mut spins = 0;
-            loop {
-                let id = acq.ids[pos].load(Ordering::Acquire);
-                if id != usize::MAX {
-                    ids.push(id);
-                    break;
-                }
-                backoff(&mut spins);
+    pub(crate) fn run_one(&self, id: usize) -> bool {
+        let slot = &self.slots[id];
+        let mut seq = slot.bseq.load(Ordering::Relaxed);
+        if slot.in_bcast.load(Ordering::Relaxed) == 0 && self.bcast.has_after(seq) {
+            let next = self.bcast.next_for(id, &mut seq);
+            slot.bseq.store(seq, Ordering::Relaxed);
+            if let Some(b) = next {
+                slot.in_bcast.fetch_add(1, Ordering::Relaxed);
+                // SAFETY: a linked broadcast that targets `id`; its caller
+                // keeps it alive until this share completed. `run_share`
+                // catches a panic of the share.
+                unsafe { crate::park::Broadcast::run_share(b, id) };
+                slot.in_bcast.fetch_sub(1, Ordering::Relaxed);
+                return true;
             }
         }
+        if let Some((b, i)) = self.queue.claim() {
+            // SAFETY: index `i` of `b` was claimed here.
+            unsafe { crate::park::Batch::run_claimed(b, i) };
+            return true;
+        }
+        false
     }
 
-    #[cfg(not(feature = "parallel"))]
-    fn claim_cold(
-        self: &std::sync::Arc<Self>,
-        _pool: &crate::pool::Pool,
-        _missing: usize,
-        _ids: &mut Vec<usize>,
-    ) {
+    /// Whether worker `id` has work it could run now (a hint).
+    #[cfg(feature = "parallel")]
+    fn work_for(&self, id: usize) -> bool {
+        let slot = &self.slots[id];
+        self.queue.has_work()
+            || (slot.in_bcast.load(Ordering::Relaxed) == 0
+                && self.bcast.has_after(slot.bseq.load(Ordering::Relaxed)))
+    }
+
+    /// A free worker or a lent member takes one piece of work: it wins `BUSY`
+    /// first, so a team cannot reserve it meanwhile, then runs it.
+    #[cfg(feature = "parallel")]
+    fn try_work(&self, id: usize) -> bool {
+        if !self.work_for(id) {
+            return false;
+        }
+        let slot = &self.slots[id];
+        if !slot.state.try_take() {
+            return false;
+        }
+        let ran = self.run_one(id);
+        slot.state.end_busy();
+        ran
+    }
+
+    /// Waits until `done` reports completion. A worker of this pool (`me`)
+    /// serves this pool's queue and broadcasts meanwhile, so nested and
+    /// cross-pool waits always make progress; it sleeps on its own parker,
+    /// which the batch's completion and new work of this pool wake.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn help_while(&self, me: usize, done: impl Fn() -> bool) {
+        let slot = &self.slots[me];
+        // Waits nest (a task run while helping waits in turn): the outer wait
+        // stays wakeable after the inner one returns.
+        let outer = slot.helping.swap(true, Ordering::SeqCst);
+        let mut waiter = crate::park::Waiter::new(self.waits.spin_polls);
+        while !done() {
+            if self.run_one(me) {
+                waiter = crate::park::Waiter::new(self.waits.spin_polls);
+                continue;
+            }
+            if waiter.step() == crate::park::Step::Sleep {
+                slot.park.park_while(|| !done() && !self.work_for(me));
+                waiter = crate::park::Waiter::new(self.waits.spin_polls);
+            }
+        }
+        slot.helping.store(outer, Ordering::SeqCst);
     }
 }
 
@@ -400,238 +476,137 @@ impl Drop for Reservation {
     }
 }
 
-/// One acquisition: how many claim jobs found a worker, and which.
-#[cfg(feature = "parallel")]
-struct Acq {
-    joined: AtomicUsize,
-    ids: Vec<AtomicUsize>,
-}
-
-#[cfg(feature = "parallel")]
-impl Acq {
-    const CLOSED: usize = 1 << (usize::BITS - 1);
-
-    fn new(capacity: usize) -> Self {
-        Acq {
-            joined: AtomicUsize::new(0),
-            ids: (0..capacity)
-                .map(|_| AtomicUsize::new(usize::MAX))
-                .collect(),
-        }
-    }
-
-    fn joined(&self) -> usize {
-        self.joined.load(Ordering::Acquire) & !Self::CLOSED
-    }
-
-    /// A claim job asks for a position; `None` when closed or full.
-    fn join(&self) -> Option<usize> {
-        let mut cur = self.joined.load(Ordering::Acquire);
-        loop {
-            if cur & Self::CLOSED != 0 || cur >= self.ids.len() {
-                return None;
-            }
-            match self.joined.compare_exchange_weak(
-                cur,
-                cur + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return Some(cur),
-                Err(now) => cur = now,
-            }
-        }
-    }
-
-    /// Closes the claim; later jobs do nothing. Returns the joined count.
-    fn close(&self) -> usize {
-        self.joined.fetch_or(Self::CLOSED, Ordering::AcqRel) & !Self::CLOSED
-    }
-}
-
-/// Runs on a pool worker: becomes a member for the acquisition, or does nothing.
-#[cfg(feature = "parallel")]
-fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
-    let Some(w) = rayon::current_thread_index() else {
-        return;
-    };
-    let Some(slot) = aw.slots.get(w) else {
-        return;
-    };
-    if slot
-        .state
-        .compare_exchange(ABSENT, RESERVED, Ordering::AcqRel, Ordering::Relaxed)
-        .is_err()
-    {
-        // Stolen by a resident member that is serving Rayon (idle_runs_rayon):
-        // its thread cannot host a second loop. Hand the job back to the pool
-        // unless the acquisition is already over.
-        if acq.joined.load(Ordering::Acquire) & Acq::CLOSED == 0 {
-            let (aw, acq) = (std::sync::Arc::clone(aw), std::sync::Arc::clone(acq));
-            rayon::spawn(move || claim_job(&aw, &acq));
-        }
-        return;
-    }
-    let seen = slot.gen.load(Ordering::Acquire);
-    let epoch = aw.release_epoch.load(Ordering::Relaxed);
-    match acq.join() {
-        Some(pos) => {
-            acq.ids[pos].store(w, Ordering::Release);
-            member_loop(aw, w, seen, epoch);
-        }
-        None => slot.state.store(ABSENT, Ordering::Release),
-    }
-}
-
-/// The member loop. Returns when the idle policy, `release_idle` or shutdown
-/// returns the thread to Rayon.
+/// The native loop of worker `id` of a pool, from its attachment until the
+/// pool detaches it (`DETACH`, while it is not busy). See
+/// `docs/design/own-threads.md` and `docs/design/waiting.md`.
 ///
-/// Idle clock of a reserved member: `last_work` is the instant at which this
-/// member first found nothing to do after its last share (or after it started,
-/// or was taken back from Rayon). It belongs to the member alone, a share of
-/// another member does not move it, and it is read only while polling. When it
-/// is older than the member's park delay the member parks and stays reserved;
-/// a member whose team runs no section therefore costs CPU for the park delay
-/// at most, then nothing. The delay is zero in an oversubscribed root scope, so
-/// `polls` and `spins` are reset at the start of each idle episode there: the
-/// member then spins one short episode of `polls` and parks.
+/// * Reserved (and not lent): a team member. It waits for its slot's `gen`
+///   in staged episodes (spin for the slot's budget, yield, park) and runs the
+///   sections its leader publishes; it serves nothing else.
+/// * Free, or a lent member: it takes broadcast shares and queued tasks,
+///   winning `BUSY` before it removes anything, and otherwise waits in a staged
+///   episode (the policy's idle spin) and parks until work, a reservation or a
+///   detach arrives.
+///
+/// A member restores its own affinity mask when it stops being reserved, and
+/// before it serves foreign work as a lent member.
 #[cfg(feature = "parallel")]
-fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
-    use std::time::Instant;
+pub(crate) fn serve(aw: &Awake, id: usize) {
+    use crate::park::{Step, Waiter};
     let slot = &aw.slots[id];
-    let mut idle_since: Option<Instant> = None;
-    let mut last_work: Option<Instant> = None;
+    let mut seen = slot.gen.load(Ordering::Acquire);
+    // Claimable only from now on: a leader that reserves this slot publishes
+    // its first section after the baseline above.
+    slot.attached.store(true, Ordering::SeqCst);
+    let mut waiter: Option<Waiter> = None;
     let mut was_lent = false;
-    let mut reserved = true;
-    let mut spins = 0u32;
-    let mut polls = 0u32;
+    let mut reserved = false;
+    let mut epoch = aw.release_epoch.load(Ordering::Relaxed);
+    // Whether the last iteration served as a member; a wait episode does not
+    // carry over between the member's and the free worker's waits.
+    let mut as_member = false;
     trace!(aw, Some(id), Enter);
     loop {
-        let state = slot.state.load(Ordering::Acquire);
-        // Pinning ends with the reservation, and it ends on this thread: a
-        // member restores its own mask before it leaves `RESERVED` and before
-        // it serves Rayon work (a lend restores it below).
-        if state == RESERVED {
+        let st = slot.state.load();
+        // Pinning ends with the reservation, and it ends on this thread.
+        if st & RESERVED != 0 {
             reserved = true;
         } else if reserved {
             reserved = false;
             slot.saved.restore();
         }
-        match state {
-            RESERVED if slot.lent.load(Ordering::Acquire) => {
-                if !was_lent {
-                    was_lent = true;
-                    // The thread serves the pool's jobs now: undo our pin first.
-                    slot.saved.restore();
-                    trace!(aw, Some(id), LentBegin);
-                }
-                idle_since = None;
-                last_work = None;
-                // Serve the pool's jobs; resume team service when taken back.
-                if !matches!(rayon::yield_now(), Some(rayon::Yield::Executed)) {
-                    for _ in 0..32 {
-                        std::hint::spin_loop();
-                    }
-                }
+        if st & DETACH != 0 && st & BUSY == 0 {
+            trace!(aw, Some(id), Leave);
+            return;
+        }
+        if st & RESERVED != 0 && st & LENT == 0 {
+            if !as_member {
+                as_member = true;
+                waiter = None;
             }
-            RESERVED => {
-                if was_lent {
-                    was_lent = false;
-                    trace!(aw, Some(id), LentEnd);
-                }
-                idle_since = None;
-                let g = slot.gen.load(Ordering::Acquire);
-                if g == seen {
-                    let fresh = last_work.is_none();
-                    let since = *last_work.get_or_insert_with(Instant::now);
-                    if fresh {
-                        // A new idle episode: the park check counts from here.
-                        spins = 0;
-                        polls = 0;
-                    }
-                    spin_wait();
-                    polls = polls.wrapping_add(1);
-                    if polls & 0x3F == 0 {
-                        let park_ns = slot.park_ns.load(Ordering::Relaxed);
-                        if since.elapsed().as_nanos() >= u128::from(park_ns) {
-                            trace!(aw, Some(id), ParkEnter);
-                            park_member(slot, seen);
-                            trace!(aw, Some(id), ParkExit);
-                            last_work = None;
-                            spins = 0;
-                            polls = 0;
-                        }
-                    }
-                } else {
-                    seen = g;
-                    spins = 0;
-                    polls = 0;
-                    last_work = None;
-                    let ptr = slot.ptr.load(Ordering::Relaxed);
-                    let arg = slot.arg.load(Ordering::Relaxed);
-                    // SAFETY: the leader keeps the section alive until its
-                    // completion counter reaches zero, which happens only
-                    // after the call below decremented it.
-                    if unsafe { (*ptr).pin } {
-                        // A pin section: this member saves its previous mask
-                        // here, before it pins itself in its share.
-                        slot.saved.save_if_unpinned();
-                    }
-                    trace!(aw, Some(id), SectionBegin);
-                    // SAFETY: as above.
-                    unsafe { Section::execute_member(ptr, arg) };
-                    trace!(aw, Some(id), SectionEnd);
-                }
+            if was_lent {
+                was_lent = false;
+                waiter = None;
+                trace!(aw, Some(id), LentEnd);
             }
-            IDLE => {
-                let since = *idle_since.get_or_insert_with(Instant::now);
-                let spin_ns = slot.idle_spin_ns.load(Ordering::Relaxed);
-                let leave = aw.shutdown.load(Ordering::Relaxed)
-                    || aw.release_epoch.load(Ordering::Relaxed) != epoch
-                    || since.elapsed().as_nanos() >= u128::from(spin_ns);
-                if leave {
-                    if slot
-                        .state
-                        .compare_exchange(IDLE, ABSENT, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                    {
-                        trace!(aw, Some(id), Leave);
-                        return;
-                    }
-                    continue; // claimed meanwhile
+            let g = slot.gen.load(Ordering::Acquire);
+            if g == seen {
+                let w = waiter
+                    .get_or_insert_with(|| Waiter::new(slot.spin_budget.load(Ordering::Relaxed)));
+                if w.step() == Step::Sleep {
+                    aw.waits.member_parks.fetch_add(1, Ordering::Relaxed);
+                    trace!(aw, Some(id), ParkEnter);
+                    park_member(slot, seen);
+                    trace!(aw, Some(id), ParkExit);
+                    waiter = None;
                 }
-                if slot.idle_yield.load(Ordering::Relaxed)
-                    && slot
-                        .state
-                        .compare_exchange(IDLE, YIELD, Ordering::AcqRel, Ordering::Relaxed)
-                        .is_ok()
-                {
-                    let ran = rayon::yield_now();
-                    slot.state.store(IDLE, Ordering::Release);
-                    if !matches!(ran, Some(rayon::Yield::Executed)) {
-                        // Nothing to run: stay claimable for a moment.
-                        for _ in 0..64 {
-                            std::hint::spin_loop();
-                        }
-                    }
-                } else {
-                    backoff(&mut spins);
+            } else {
+                seen = g;
+                waiter = None;
+                let ptr = slot.ptr.load(Ordering::Relaxed);
+                let arg = slot.arg.load(Ordering::Relaxed);
+                // SAFETY: the leader keeps the section alive until its
+                // completion counter reaches zero, which happens only after
+                // the call below decremented it.
+                if unsafe { (*ptr).pin } {
+                    // A pin section: save the previous mask before pinning.
+                    slot.saved.save_if_unpinned();
                 }
+                trace!(aw, Some(id), SectionBegin);
+                // SAFETY: as above; `aw` outlives this loop, so the wake after
+                // the last decrement does not touch the section.
+                unsafe { Section::execute_member(ptr, arg) };
+                trace!(aw, Some(id), SectionEnd);
             }
-            _ => backoff(&mut spins),
+            continue;
+        }
+        // Free (`0`) or lent (`RESERVED|LENT`): serve the pool.
+        if as_member {
+            as_member = false;
+            waiter = None;
+        }
+        if st & LENT != 0 && !was_lent {
+            was_lent = true;
+            // The thread serves foreign work now: undo our pin first.
+            slot.saved.restore();
+            trace!(aw, Some(id), LentBegin);
+        }
+        if aw.try_work(id) {
+            waiter = None;
+            continue;
+        }
+        let now = aw.release_epoch.load(Ordering::Relaxed);
+        if now != epoch {
+            // `Pool::release_idle`: stop spinning now.
+            epoch = now;
+            waiter = Some(Waiter::new(0));
+        }
+        let w = waiter.get_or_insert_with(|| {
+            let idle = slot.idle_spin_ns.load(Ordering::Relaxed);
+            Waiter::new(if idle == 0 { 0 } else { aw.waits.spin_polls })
+        });
+        if w.step() == Step::Sleep {
+            slot.lingering.store(false, Ordering::Release);
+            let qgen = aw.queue.gen();
+            let bgen = aw.bcast.gen();
+            slot.park.park_while(|| {
+                slot.state.load() == st
+                    && aw.queue.gen() == qgen
+                    && aw.bcast.gen() == bgen
+                    && !aw.work_for(id)
+            });
+            waiter = None;
         }
     }
 }
 
-/// Sleeps (still reserved) until a section is published, the reservation ends
-/// or the thread is lent. The handshake lives in [`Parker`].
+/// Sleeps (still reserved) until a section is published, the reservation ends,
+/// the member is lent, or the pool detaches it. The handshake lives in
+/// [`Parker`].
 #[cfg(feature = "parallel")]
 fn park_member(slot: &Slot, seen: usize) {
-    slot.park.park_while(|| {
-        slot.gen.load(Ordering::SeqCst) == seen
-            && slot.state.load(Ordering::SeqCst) == RESERVED
-            && !slot.lent.load(Ordering::SeqCst)
-    });
+    slot.park
+        .park_while(|| slot.gen.load(Ordering::SeqCst) == seen && slot.state.load() == RESERVED);
 }
 
 /// A unit of dispatched work, living on the leader's stack.
@@ -654,19 +629,22 @@ pub(crate) struct Section {
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pin: bool,
     /// Dispatched participants that have not finished.
-    remaining: Padded<AtomicUsize>,
-    arrived: Padded<AtomicUsize>,
-    epoch: Padded<AtomicUsize>,
-    cancelled: AtomicBool,
+    done: crate::park::Completion,
+    barrier: crate::park::Barrier,
+    cancelled: crate::sync::AtomicBool,
+    /// The pool's waiting state; null when the section has no pool (nothing is
+    /// dispatched, and its single participant never waits).
+    waits: *const Waits,
     /// First panic payload, boxed twice so that it fits an `AtomicPtr`.
     /// (A `Mutex` would allocate on first use on some platforms.)
     panic: AtomicPtr<Box<dyn Any + Send>>,
 }
 
-// SAFETY: `data` points to a `Sync` closure that outlives the section; every
-// other field is an atomic, a plain flag written before the section is
-// published (and read only after a member observed the publishing `gen` with
-// acquire ordering), or a function pointer.
+// SAFETY: `data` points to a `Sync` closure that outlives the section; `waits`
+// points to the pool's `Waits` (in `Awake`, which outlives every section and
+// member loop) and is only read; every other field is an atomic, a plain flag
+// written before the section is published (and read only after a member
+// observed the publishing `gen` with acquire ordering), or a function pointer.
 unsafe impl Sync for Section {}
 
 /// The geometry of a section: its shares, its participants, and the flags of
@@ -690,6 +668,7 @@ impl Section {
         slot_of: unsafe fn(*const (), usize) -> usize,
         slot_data: *const (),
         geometry: Geometry,
+        waits: Option<&Waits>,
     ) -> Self {
         let Geometry {
             dispatched,
@@ -706,10 +685,10 @@ impl Section {
             slot_data,
             over,
             pin,
-            remaining: Padded(AtomicUsize::new(dispatched)),
-            arrived: Padded(AtomicUsize::new(0)),
-            epoch: Padded(AtomicUsize::new(0)),
-            cancelled: AtomicBool::new(false),
+            done: crate::park::Completion::new(dispatched),
+            barrier: crate::park::Barrier::new(size),
+            cancelled: crate::sync::AtomicBool::new(false),
+            waits: waits.map_or(core::ptr::null(), |w| w as *const Waits),
             panic: AtomicPtr::new(core::ptr::null_mut()),
         }
     }
@@ -738,17 +717,48 @@ impl Section {
     /// decrement.
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     unsafe fn execute_member(ptr: *const Section, arg: usize) {
-        let sec = &*ptr;
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
-        if let Err(p) = r {
-            sec.fail(p);
+        // The pool's waiting state outlives the section: read it now, use it
+        // after the decrement that may let the leader free the section.
+        let waits = (*ptr).waits;
+        {
+            let sec = &*ptr;
+            let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sec.call_here(arg)));
+            if let Err(p) = r {
+                sec.fail(p);
+            }
         }
-        (*ptr).remaining.0.fetch_sub(1, Ordering::Release);
+        crate::park::Completion::finish(
+            core::ptr::addr_of!((*ptr).done),
+            waits.as_ref().map(|w| &*w.sync),
+        );
+    }
+
+    /// The pool's waiting state, if the section has a pool.
+    fn waits(&self) -> Option<&Waits> {
+        // SAFETY: `waits` is null or points into the pool's `Awake`, which
+        // outlives the section.
+        unsafe { self.waits.as_ref() }
+    }
+
+    /// A wait episode of this section's join or barrier.
+    fn waiter(&self) -> crate::park::Waiter {
+        match self.waits() {
+            Some(w) => crate::park::Waiter::new(if self.over {
+                crate::park::THROTTLED_POLLS.min(w.spin_polls)
+            } else {
+                w.spin_polls
+            }),
+            None => crate::park::Waiter::new(u32::MAX),
+        }
     }
 
     /// Records a participant's panic and cancels barriers.
     pub(crate) fn fail(&self, payload: Box<dyn Any + Send>) {
-        self.cancelled.store(true, Ordering::Release);
+        // SeqCst, then wake: barrier waiters may sleep on the pool's parker.
+        self.cancelled.store(true, Ordering::SeqCst);
+        if let Some(w) = self.waits() {
+            w.sync.wake();
+        }
         let fresh = Box::into_raw(Box::new(payload));
         if self
             .panic
@@ -780,42 +790,36 @@ impl Section {
         self.cancelled.load(Ordering::Acquire)
     }
 
-    /// Waits until every dispatched participant has finished.
-    ///
-    /// Polls with [`spin_wait`] (one PAUSE, no yield) unless the root scope is
-    /// oversubscribed, where it spins about 100 times and then yields per poll.
+    /// Waits until every dispatched participant has finished: a staged wait
+    /// (spin, yield, then sleep on the pool's parker until the last member's
+    /// decrement wakes it), throttled when the root scope is oversubscribed.
     pub(crate) fn join(&self) {
-        let mut polls = 0;
-        while self.remaining.0.load(Ordering::Acquire) != 0 {
-            wait_poll(self.over, &mut polls);
+        if self.done.is_done() {
+            return;
+        }
+        let mut waiter = self.waiter();
+        self.done.wait(self.waits().map(|w| &*w.sync), &mut waiter);
+        if waiter.slept() {
+            if let Some(w) = self.waits() {
+                w.join_sleeps.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
     /// Sense-reversing barrier over the section's participants; `false` when
-    /// a participant failed, so that peers can leave instead of waiting.
+    /// a participant failed, so that peers can leave instead of waiting. Waits
+    /// like [`Self::join`].
     pub(crate) fn barrier(&self) -> bool {
-        if self.is_cancelled() {
-            return false;
-        }
-        if self.size == 1 {
-            return true;
-        }
-        let epoch = self.epoch.0.load(Ordering::Acquire);
-        if self.arrived.0.fetch_add(1, Ordering::AcqRel) + 1 == self.size {
-            self.arrived.0.store(0, Ordering::Relaxed);
-            self.epoch.0.store(epoch.wrapping_add(1), Ordering::Release);
-            return true;
-        }
-        let mut polls = 0;
-        loop {
-            if self.epoch.0.load(Ordering::Acquire) != epoch {
-                return true;
+        let mut waiter = self.waiter();
+        let passed =
+            self.barrier
+                .arrive(&self.cancelled, self.waits().map(|w| &*w.sync), &mut waiter);
+        if waiter.slept() {
+            if let Some(w) = self.waits() {
+                w.barrier_sleeps.fetch_add(1, Ordering::Relaxed);
             }
-            if self.is_cancelled() {
-                return false;
-            }
-            wait_poll(self.over, &mut polls);
         }
+        passed
     }
 }
 

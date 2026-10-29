@@ -614,8 +614,11 @@ campaign.
 
 `for_class(HostClass::X86_64Avx2)` carries a measured team row with ten anchors. Host `broccoli`: AMD EPYC 7702P
 (Zen2, 64 physical cores, SMT off, NUMA 1, 16 MiB L3 per 4-core CCX), `cpufreq/boost = 0`, governor `performance`,
-nothing else running. This crate's `benches/dispatch_cost.rs` (the Linux port, unchanged) built against threadteam
-0.1.0, `TT_POOL=64`, `TT_WIDTHS=2,4,6,8,12,16,24,32,48,64`, process pinned to CPUs 0-63, 2026-10-29. The row is
+nothing else running. The Linux port of this crate's `benches/dispatch_cost.rs` that takes the pool size and the
+widths from the environment (`faer-benchmark` branch `bench/awake-team-linux`,
+`data/probes/20261026-awake-team-linux/bench/tt/src/bin/dispatch_cost.rs`, unchanged; the checked-in bench here
+does not read these variables) built against threadteam 0.1.0, `TT_POOL=64`, `TT_WIDTHS=2,4,6,8,12,16,24,32,48,64`,
+process pinned to CPUs 0-63, 2026-10-29. The row is
 `team/load10us-minus-10us`, the same quantity as the other rows (back to back sections whose shares carry 10 us of
 work, minus the 10 us), rounded to the nearest nanosecond. Raw output: `thresholds-data/raw/broccoli-dispatch-20261029.csv`.
 
@@ -623,9 +626,9 @@ work, minus the 10 us), rounded to the nearest nanosecond. Raw output: `threshol
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | team, us | 1.42 | 1.99 | 2.33 | 2.74 | 3.56 | 4.08 | 4.29 | 4.84 | 6.40 | 9.33 |
 
-The cost is sublinear in the width (about `2.33 * (w / 6)^0.45` between 6 and 64), so the linear extrapolation above
-the largest anchor stays conservative against it; with anchors to 64 a 64-core host reads measured values at every
-width it can use.
+The cost grows more slowly than the width between 6 and 64 (2.33 to 9.33 us for a width ratio of 10.7). Widths
+between the ten anchors interpolate, so a host of up to 64 cores never reaches the extrapolation; above 64 the
+linear extrapolation is the chosen conservative policy, not a measured bound.
 
 What the row does not claim:
 

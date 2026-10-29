@@ -430,10 +430,10 @@ impl DispatchCosts {
     ///   6: team 3.0, 2.3, 1.4; in pool 6.0, 11, 5.5; outside 14, 18, 19.
     /// * [`HostClass::X86_64Avx2`]: the team row measured on `broccoli`, an
     ///   AMD EPYC 7702P (Zen2, 64 cores, SMT off), boost off, governor
-    ///   `performance`, pool 64 pinned to CPUs 0-63, with this crate's
-    ///   `benches/dispatch_cost.rs` (back to back sections whose shares carry
-    ///   10 us of work, threadteam 0.1.0; tensor4all/threadteam-rs#6,
-    ///   `docs/design/thresholds.md`), in microseconds at widths 2, 4, 6, 8,
+    ///   `performance`, pool 64 pinned to CPUs 0-63, with the Linux port of
+    ///   `benches/dispatch_cost.rs` in `faer-benchmark` (back to back sections
+    ///   whose shares carry 10 us of work, threadteam 0.1.0;
+    ///   tensor4all/threadteam-rs#6, `docs/design/thresholds.md` section 3.7), in microseconds at widths 2, 4, 6, 8,
     ///   12, 16, 24, 32, 48, 64: 1.42, 1.99, 2.33, 2.74, 3.56, 4.08, 4.29,
     ///   4.84, 6.40, 9.33. In pool and outside deliberately keep the generic
     ///   row. The class covers every AVX2 host, also small desktops, so the

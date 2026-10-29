@@ -163,7 +163,7 @@ const CHECK_EVERY: u32 = 64;
 /// Default gap between two clock reads of a spinning waiter that counts as a
 /// preemption: 64 polls take well under 10 µs, and a scheduler slice is 0.75 ms
 /// or more. Zero turns the detection off (libgomp's behaviour).
-pub(crate) const PREEMPT_GAP_NS: u64 = 200_000;
+pub(crate) const PREEMPT_GAP_NS: u64 = 0;
 
 /// Default time a pool keeps starting its waits throttled once its waiters
 /// were descheduled often enough (see [`CONTENDED_EVENTS`]).

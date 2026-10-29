@@ -107,6 +107,42 @@ Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
 a test binary that runs serial and pooled work and then checks that
 `rayon::ThreadPoolBuilder::new().build_global()` still succeeds.
 
+## Wait benchmarks
+
+`benches/wait_scenarios.rs` measures how team threads wait, the way callers use them; the design
+is in [`docs/design/waiting.md`](docs/design/waiting.md). A change to the waits is judged by running
+it on the base and on the head of the change, on a quiet host and on a many-core shared host.
+
+| scenario | a call is | reports |
+| --- | --- | --- |
+| `sections` | 200 sections of 5, 20 or 50 µs, team held | per call, and the overhead over `sections * work` |
+| `gaps` | 10 sections of 5 µs, the caller sleeps 0 / 100 µs / 1 ms / 10 ms between calls | the first section (wake latency) and the call |
+| `acquire` | 50 sections of 20 µs: the team held (a token per call), the pool held (members acquired per call), a new pool per call | per call; for a new pool also the total from build to drop |
+| `nested` | 100 splits of the team into pairs, each pair one 20 µs section | per call |
+
+Each scenario runs at width = all CPUs of the affinity set and at three quarters of them, on
+threadteam and on a Rayon `scope`; `benches/omp/wait_omp.c` runs `sections` and `gaps` on libgomp
+(one `omp parallel` region per section, runtime defaults). `--load K:P` adds `K` child processes,
+each busy `P` % of every 10 ms, for the whole run: the stand-in for another user's processes.
+
+```sh
+# one checkout, both passes (quiet, then 8 processes at 10 %), rows appended to
+# docs/design/waiting-data/<host>.csv
+scripts/bench-waits.sh <label>                 # e.g. main-4c73c2b, then the PR head
+scripts/bench-waits.sh <label> 64,48 8:10      # explicit widths and load
+cargo bench --bench wait_scenarios -- --scenario gaps --widths 8   # one scenario; options in the file header
+```
+
+* **evo** (quiet): `scripts/bench-waits.sh <label> "" none` on the base and on the head. The
+  acceptance check is that `sections` and `gaps` do not regress.
+* **broccoli** (64 CPUs, shared): `taskset -c 0-63 scripts/bench-waits.sh <label> 64,48 8:10` on the
+  base and on the head, plus the faer#107 arms of `acquire_probe_107` (tensor4all/faer branch
+  `probe/107-acquire-per-call`). The acceptance check is that width 64 under load is no longer
+  slow and width 48 does not regress.
+
+Results are committed as CSV under [`docs/design/waiting-data/`](docs/design/waiting-data/), one
+file per host, with the label naming the commit; the summary tables live in `waiting.md`.
+
 ## License
 
 Licensed under either of MIT or Apache-2.0 at your option.

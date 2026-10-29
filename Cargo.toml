@@ -83,3 +83,8 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
 [[bench]]
 name = "cost_lookup"
 harness = false
+
+[[bench]]
+name = "wait_scenarios"
+harness = false
+required-features = ["parallel"]

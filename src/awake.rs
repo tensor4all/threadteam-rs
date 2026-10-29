@@ -84,11 +84,6 @@ struct Slot {
     /// Spin budget, in polls, of this reserved member's waits for work (see
     /// `docs/design/waiting.md`); written by the leader at root-scope entry.
     spin_budget: AtomicU32,
-    /// Until when this member's waits start throttled: it saw itself
-    /// descheduled while it spun (`crate::park::Pressure`); its own thread
-    /// writes and reads it.
-    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
-    pressed_until: crate::sync::AtomicU64,
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
@@ -111,7 +106,6 @@ impl Slot {
             idle_spin_ns: AtomicU64::new(0),
             idle_yield: AtomicBool::new(false),
             spin_budget: AtomicU32::new(crate::park::THROTTLED_POLLS),
-            pressed_until: crate::sync::AtomicU64::new(0),
             lent: AtomicBool::new(false),
             saved: crate::pin::SavedMask::new(),
             park: Parker::new(),
@@ -125,8 +119,6 @@ pub(crate) struct Waits {
     /// pool: a member may wake it after its last decrement, when the section
     /// may already be gone, and the pool outlives every member loop.
     pub(crate) sync: Parker,
-    /// Recent scheduling pressure seen by this pool's waiters.
-    pub(crate) pressure: crate::park::Pressure,
     /// Spin budget of a wait, in polls (`PoolBuilder::spin_polls`).
     pub(crate) spin_polls: u32,
     /// Diagnostics (`Pool::wait_counters`): sleeps of leaders in joins, of
@@ -140,7 +132,7 @@ pub(crate) struct Waits {
 pub(crate) struct Awake {
     slots: Box<[Slot]>,
     /// What the joins and barriers of this pool's sections sleep on, and the
-    /// pool's spin budget and scheduling pressure (`docs/design/waiting.md`).
+    /// pool's spin budget (`docs/design/waiting.md`).
     pub(crate) waits: Waits,
     pub(crate) shutdown: AtomicBool,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
@@ -163,13 +155,11 @@ impl Awake {
         costs: crate::cost::DispatchCosts,
         pin: bool,
         spin_polls: u32,
-        pressure: crate::park::Pressure,
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
             waits: Waits {
                 sync: Parker::new(),
-                pressure,
                 spin_polls,
                 join_sleeps: AtomicU64::new(0),
                 barrier_sleeps: AtomicU64::new(0),
@@ -211,7 +201,7 @@ impl Awake {
     /// the throttled one when the scope is oversubscribed.
     pub(crate) fn spin_budget(&self, over: bool) -> u32 {
         if over {
-            self.waits.pressure.throttled().min(self.waits.spin_polls)
+            crate::park::THROTTLED_POLLS.min(self.waits.spin_polls)
         } else {
             self.waits.spin_polls
         }
@@ -225,8 +215,8 @@ impl Awake {
 
     /// Sets the spin budget of the given reserved members' waits for work.
     ///
-    /// A root team scope writes it once at entry ([`Self::spin_budget`] of its
-    /// pressure). Nothing else changes it, so a member keeps the value of the
+    /// A root team scope writes it once at entry ([`Self::spin_budget`] of
+    /// whether it is oversubscribed). Nothing else changes it, so a member keeps the value of the
     /// scope it was reserved for.
     pub(crate) fn set_spin_budget(&self, ids: &[usize], polls: u32) {
         for &id in ids {
@@ -501,8 +491,7 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
 /// after it started, or was taken back from Rayon), spins for the slot's spin
 /// budget in polls, yields a few times, then parks and stays reserved. The
 /// budget is a count, so a member that is descheduled does not spend it while
-/// it waits for its CPU; a long gap between its clock reads ends the spin at
-/// once (see [`crate::park::Pressure`]).
+/// it waits for its CPU.
 ///
 /// An unreserved (`IDLE`) member returns to Rayon after the policy's
 /// `idle_spin` of wall time or after the pool's spin budget of polls, whichever
@@ -515,7 +504,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     let slot = &aw.slots[id];
     let mut idle_since: Option<Instant> = None;
     let mut idle_polls = 0u64;
-    let mut waiter: Option<Waiter<'_>> = None;
+    let mut waiter: Option<Waiter> = None;
     let mut was_lent = false;
     let mut reserved = true;
     let mut spins = 0u32;
@@ -557,11 +546,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
                     let w = waiter.get_or_insert_with(|| {
-                        Waiter::of_thread(
-                            slot.spin_budget.load(Ordering::Relaxed),
-                            Some(&aw.waits.pressure),
-                            Some(&slot.pressed_until),
-                        )
+                        Waiter::new(slot.spin_budget.load(Ordering::Relaxed))
                     });
                     if w.step() == Step::Sleep {
                         aw.waits.member_parks.fetch_add(1, Ordering::Relaxed);
@@ -779,17 +764,14 @@ impl Section {
     }
 
     /// A wait episode of this section's join or barrier.
-    fn waiter(&self) -> crate::park::Waiter<'_> {
+    fn waiter(&self) -> crate::park::Waiter {
         match self.waits() {
-            Some(w) => crate::park::Waiter::new(
-                if self.over {
-                    w.pressure.throttled().min(w.spin_polls)
-                } else {
-                    w.spin_polls
-                },
-                Some(&w.pressure),
-            ),
-            None => crate::park::Waiter::new(u32::MAX, None),
+            Some(w) => crate::park::Waiter::new(if self.over {
+                crate::park::THROTTLED_POLLS.min(w.spin_polls)
+            } else {
+                w.spin_polls
+            }),
+            None => crate::park::Waiter::new(u32::MAX),
         }
     }
 

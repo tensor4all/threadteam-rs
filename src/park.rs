@@ -20,7 +20,7 @@
 //! the latter and the exact code is model-checked. With nobody parked a wake is
 //! one uncontended atomic read-modify-write.
 
-use crate::sync::{AtomicBool, AtomicU64, AtomicUsize, Condvar, Mutex, Ordering};
+use crate::sync::{AtomicBool, AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Places where a test can pause a thread (feature `test-hooks`).
 #[doc(hidden)]
@@ -144,49 +144,19 @@ impl Parker {
 }
 
 // ---------------------------------------------------------------------------
-// Staged waits (`docs/design/waiting.md`): a bounded spin, a few yields, then a
-// sleep on a `Parker`. The join and the barrier of a section use them through
-// [`Completion`] and [`Barrier`], which are the exact code `loom` checks.
+// Staged waits (`docs/design/waiting.md`): libgomp's waits. A bounded spin of
+// polls, a few yields, then a sleep on a `Parker`. The join and the barrier of
+// a section use them through [`Completion`] and [`Barrier`], which are the
+// exact code `loom` checks.
 
-/// Default spin budget, in polls, of a wait that starts throttled: the scope
-/// is oversubscribed, or the pool saw a waiter descheduled recently. libgomp's
-/// throttled spin count has the same value.
+/// Spin budget, in polls, of a wait in a statically oversubscribed scope (more
+/// participants than CPUs in the caller's set). libgomp's throttled spin count
+/// has the same value.
 pub(crate) const THROTTLED_POLLS: u32 = 100;
 
 /// Yields between the spin and the sleep. Each lets a thread queued on the same
 /// CPU run without a futex round trip.
 const YIELD_POLLS: u32 = if cfg!(loom) { 0 } else { 16 };
-
-/// A spinning waiter reads the clock once per this many polls.
-const CHECK_EVERY: u32 = 64;
-
-/// The gap between two clock reads of a spinning waiter that counts as a
-/// preemption while detection is on: 64 polls take well under 10 µs, and a
-/// scheduler slice is 0.75 ms or more.
-pub(crate) const PREEMPT_GAP_NS: u64 = 200_000;
-
-/// How long after a pool is built its waiters detect preemptions (with
-/// [`PREEMPT_GAP_NS`]) and the pool can throttle; after that, by default,
-/// nothing is detected and every wait spins, yields and sleeps as libgomp's
-/// do. A pool's first calls are where freshly spawned threads sit stacked
-/// (the scheduler places new threads before it knows their load): a pool
-/// built for one call (`with_team`) collapsed without detection (broccoli,
-/// threadteam-rs#14 `e76036c`: 87.6 ms), while a held pool, past its first
-/// moments, ran as fast as libgomp only without it.
-pub(crate) const WARM_NS: u64 = 200_000_000;
-
-/// Default time a pool keeps starting its waits throttled once its waiters
-/// were descheduled often enough (see [`CONTENDED_EVENTS`]).
-pub(crate) const CONTENDED_HOLD_NS: u64 = 100_000_000;
-
-/// Default number of observed preemptions, within one hold window, that
-/// throttle the whole pool; zero never throttles the whole pool. A single
-/// preemption (another user's job taking a CPU for a slice) only ends the spin
-/// of the waiter that saw it: throttling the pool on it made every section of
-/// a width-64 team on a mildly shared host pay futex wakes (threadteam-rs#14,
-/// broccoli). Sustained load produces many preemptions per window and still
-/// throttles.
-pub(crate) const CONTENDED_EVENTS: u32 = 4;
 
 /// What a waiting thread does after one [`Waiter::step`].
 #[doc(hidden)]
@@ -198,193 +168,27 @@ pub enum Step {
     Sleep,
 }
 
-/// Recent scheduling pressure on one pool's waiters.
-///
-/// A waiter that finds a long gap between two of its clock reads was
-/// descheduled while it spun: something else ran on its CPU (another thread of
-/// the team, a foreign process, or interrupts and VM steal; the signal does not
-/// tell them apart). It records the time, and for its hold time (default
-/// [`CONTENDED_HOLD_NS`]) every wait of the pool starts with the throttled
-/// budget, so the pool's waiters free CPUs quickly while that pressure lasts.
-#[doc(hidden)]
-pub struct Pressure {
-    base: std::time::Instant,
-    /// Nanoseconds since `base` until which waits start throttled.
-    until: AtomicU64,
-    /// How long the pool's waits stay throttled once enough observations
-    /// came within one window of this length; zero throttles only the waiter
-    /// that saw a preemption.
-    hold_ns: u64,
-    /// Observations within one window that throttle the pool.
-    threshold: u32,
-    /// How long an observation throttles the thread that saw it (a member's
-    /// slot); zero, the default, throttles no thread beyond its own wait. On a
-    /// quiet broccoli a per-thread hold of 100 ms made held teams 1.2-1.8x
-    /// slower than 0.1.3: one member preempted once then slept at every
-    /// section for the hold (threadteam-rs#14, 2773c36). A benchmark knob.
-    own_hold_ns: u64,
-    /// The throttled budget, in polls.
-    throttled: u32,
-    /// After the warm-up: a gap between two clock reads longer than this is a
-    /// preemption; zero (the default) turns the detection, and with it every
-    /// throttle, off.
-    gap_ns: u64,
-    /// Nanoseconds since `base` until which waiters detect preemptions with
-    /// [`PREEMPT_GAP_NS`] whatever `gap_ns` says (the warm-up of a new pool).
-    warm_until: u64,
-    /// Start of the current observation window, and observations in it. A
-    /// heuristic: concurrent updates may lose a count, never an escalation by
-    /// a later window.
-    window: AtomicU64,
-    in_window: AtomicU64,
-    /// Observations so far (a diagnostic).
-    events: AtomicU64,
-}
-
-impl Default for Pressure {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Pressure {
-    /// No pressure recorded yet; the default hold and throttled budget.
-    pub fn new() -> Self {
-        Self::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, CONTENDED_EVENTS, 0)
-    }
-
-    /// This pressure with a preemption gap of `gap_ns` after the warm-up (0: no
-    /// detection).
-    #[must_use]
-    pub fn with_gap(mut self, gap_ns: u64) -> Self {
-        self.gap_ns = gap_ns;
-        self
-    }
-
-    /// This pressure with a warm-up of `warm_ns` after its creation, during
-    /// which waiters detect preemptions whatever the gap after it (0: none).
-    #[must_use]
-    pub fn with_warm_up(mut self, warm_ns: u64) -> Self {
-        self.warm_until = warm_ns;
-        self
-    }
-
-    /// The preemption gap that applies at `now` (0: no detection).
-    fn gap_at(&self, now: u64) -> u64 {
-        if now < self.warm_until {
-            PREEMPT_GAP_NS
-        } else {
-            self.gap_ns
-        }
-    }
-
-    /// No pressure recorded yet, with a throttled budget of `throttled` polls,
-    /// held for `hold_ns` once `threshold` observations came within `hold_ns`
-    /// of each other (0 never throttles the pool; 1 throttles on the first), and
-    /// a per-thread hold of `own_hold_ns` (0: none).
-    pub fn tuned(throttled: u32, hold_ns: u64, threshold: u32, own_hold_ns: u64) -> Self {
-        Pressure {
-            base: std::time::Instant::now(),
-            until: AtomicU64::new(0),
-            hold_ns,
-            threshold,
-            own_hold_ns,
-            throttled,
-            gap_ns: 0,
-            warm_until: WARM_NS,
-            window: AtomicU64::new(0),
-            in_window: AtomicU64::new(0),
-            events: AtomicU64::new(0),
-        }
-    }
-
-    /// The throttled budget, in polls.
-    pub(crate) fn throttled(&self) -> u32 {
-        self.throttled
-    }
-
-    /// Observations so far.
-    pub(crate) fn events(&self) -> u64 {
-        self.events.load(Ordering::Relaxed)
-    }
-
-    pub(crate) fn now(&self) -> u64 {
-        u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX)
-    }
-
-    /// Records a descheduled waiter at `now`. A later deadline is never
-    /// shortened by an older observation.
-    /// How long an observation throttles the thread that saw it.
-    pub(crate) fn own_hold_ns(&self) -> u64 {
-        self.own_hold_ns
-    }
-
-    pub(crate) fn note(&self, now: u64) {
-        self.events.fetch_add(1, Ordering::Relaxed);
-        if self.hold_ns == 0 || self.threshold == 0 {
-            return;
-        }
-        let start = self.window.load(Ordering::Relaxed);
-        let n = if now.saturating_sub(start) > self.hold_ns {
-            // A new window starts with this observation.
-            self.window.store(now, Ordering::Relaxed);
-            self.in_window.store(1, Ordering::Relaxed);
-            1
-        } else {
-            self.in_window.fetch_add(1, Ordering::Relaxed) + 1
-        };
-        if n >= u64::from(self.threshold) {
-            self.until
-                .fetch_max(now.saturating_add(self.hold_ns), Ordering::Relaxed);
-        }
-    }
-
-    pub(crate) fn active(&self, now: u64) -> bool {
-        self.until.load(Ordering::Relaxed) > now
-    }
-}
-
 /// One wait episode: up to `budget` spin polls (one PAUSE, or YIELD on
 /// aarch64, each), then [`YIELD_POLLS`] yields, then sleep.
 ///
-/// The budget is a count: a waiter that is descheduled does not spend it while
-/// it waits for its CPU. Every [`CHECK_EVERY`] polls it reads the clock. At the
-/// first read it adopts the throttled budget if the pool is under
-/// [`Pressure`]; a long gap between reads ends the spin at once and records the
-/// pressure. A wait that ends within 64 polls never reads the clock.
+/// The budget is a count, as libgomp's `GOMP_SPINCOUNT`: a waiter that is
+/// descheduled does not spend it while it waits for its CPU. Nothing in the
+/// poll loop reads a clock.
 #[doc(hidden)]
-pub struct Waiter<'a> {
+pub struct Waiter {
     budget: u32,
     polls: u32,
     yields: u32,
-    pressure: Option<&'a Pressure>,
-    /// The waiting thread's own throttle deadline (a member's slot), if any.
-    own: Option<&'a AtomicU64>,
-    last: Option<u64>,
     slept: bool,
 }
 
-impl<'a> Waiter<'a> {
+impl Waiter {
     /// A wait episode with a spin of `budget` polls.
-    pub fn new(budget: u32, pressure: Option<&'a Pressure>) -> Self {
-        Self::of_thread(budget, pressure, None)
-    }
-
-    /// A wait episode of a thread with its own throttle deadline `own`: a
-    /// preemption it observes throttles its later waits for the pool's hold,
-    /// and a deadline still running throttles this one.
-    pub(crate) fn of_thread(
-        budget: u32,
-        pressure: Option<&'a Pressure>,
-        own: Option<&'a AtomicU64>,
-    ) -> Self {
+    pub fn new(budget: u32) -> Self {
         Waiter {
             budget,
             polls: 0,
             yields: 0,
-            pressure,
-            own,
-            last: None,
             slept: false,
         }
     }
@@ -400,9 +204,6 @@ impl<'a> Waiter<'a> {
     pub fn step(&mut self) -> Step {
         if self.polls < self.budget {
             self.polls += 1;
-            if self.polls.is_multiple_of(CHECK_EVERY) {
-                self.checkpoint();
-            }
             std::hint::spin_loop();
             return Step::Poll;
         }
@@ -413,34 +214,6 @@ impl<'a> Waiter<'a> {
         }
         self.slept = true;
         Step::Sleep
-    }
-
-    #[cold]
-    fn checkpoint(&mut self) {
-        let Some(p) = self.pressure else { return };
-        let now = p.now();
-        let gap = p.gap_at(now);
-        if gap == 0 {
-            // No detection now, and none later in this episode: stop reading
-            // the clock.
-            self.pressure = None;
-            return;
-        }
-        let own_active = || self.own.is_some_and(|o| o.load(Ordering::Relaxed) > now);
-        match self.last {
-            None if p.active(now) || own_active() => {
-                self.budget = self.budget.min(p.throttled().max(self.polls))
-            }
-            Some(last) if now.saturating_sub(last) > gap => {
-                p.note(now);
-                if let (Some(o), hold @ 1..) = (self.own, p.own_hold_ns()) {
-                    o.fetch_max(now.saturating_add(hold), Ordering::Relaxed);
-                }
-                self.budget = self.polls;
-            }
-            _ => {}
-        }
-        self.last = Some(now);
     }
 }
 
@@ -484,7 +257,7 @@ impl Completion {
     }
 
     /// Waits until every share has finished: spin, yield, then sleep on `sync`.
-    pub fn wait(&self, sync: Option<&Parker>, waiter: &mut Waiter<'_>) {
+    pub fn wait(&self, sync: Option<&Parker>, waiter: &mut Waiter) {
         while !self.is_done() {
             if waiter.step() == Step::Sleep {
                 match sync {
@@ -521,7 +294,7 @@ impl Barrier {
         &self,
         cancelled: &AtomicBool,
         sync: Option<&Parker>,
-        waiter: &mut Waiter<'_>,
+        waiter: &mut Waiter,
     ) -> bool {
         if cancelled.load(Ordering::Acquire) {
             return false;

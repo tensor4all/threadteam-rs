@@ -192,9 +192,8 @@ impl Pool {
         self.awake.waits.spin_polls
     }
 
-    /// How often this pool's waits slept, and how often a waiter saw itself
-    /// descheduled, since the pool was built: diagnostics for the wait
-    /// benchmarks (`docs/design/waiting.md`).
+    /// How often this pool's waits slept since the pool was built: diagnostics
+    /// for the wait benchmarks (`docs/design/waiting.md`).
     #[doc(hidden)]
     pub fn wait_counters(&self) -> WaitCounters {
         use core::sync::atomic::Ordering::Relaxed;
@@ -203,7 +202,6 @@ impl Pool {
             join_sleeps: w.join_sleeps.load(Relaxed),
             barrier_sleeps: w.barrier_sleeps.load(Relaxed),
             member_parks: w.member_parks.load(Relaxed),
-            pressure_events: w.pressure.events(),
         }
     }
 
@@ -288,12 +286,6 @@ pub struct PoolBuilder {
     costs: DispatchCosts,
     pin_participants: bool,
     spin_polls: u32,
-    throttled_polls: u32,
-    pressure_hold: Duration,
-    pressure_events: u32,
-    own_hold: Duration,
-    preempt_gap: Duration,
-    warm_up: Duration,
 }
 
 impl PoolBuilder {
@@ -309,12 +301,6 @@ impl PoolBuilder {
             costs: DispatchCosts::host_default(),
             pin_participants: PIN_PARTICIPANTS_DEFAULT,
             spin_polls: SPIN_POLLS_DEFAULT,
-            throttled_polls: crate::park::THROTTLED_POLLS,
-            pressure_hold: Duration::from_nanos(crate::park::CONTENDED_HOLD_NS),
-            pressure_events: crate::park::CONTENDED_EVENTS,
-            own_hold: Duration::ZERO,
-            preempt_gap: Duration::ZERO,
-            warm_up: Duration::from_nanos(crate::park::WARM_NS),
         }
     }
 
@@ -606,52 +592,6 @@ impl PoolBuilder {
         self
     }
 
-    /// Tuning of the throttled waits, for the wait benchmarks only: the spin
-    /// budget of a throttled wait (default 100 polls), how long the pool's
-    /// waits stay throttled (default 100 ms; zero throttles only the waiter
-    /// that saw a preemption), how many observed preemptions within that time
-    /// throttle the pool (default 4; zero never), and how long a preemption
-    /// throttles the member that saw it (default zero: only its own wait). See
-    /// `docs/design/waiting.md`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn wait_tuning(
-        mut self,
-        throttled_polls: u32,
-        pressure_hold: Duration,
-        pressure_events: u32,
-        own_hold: Duration,
-    ) -> Self {
-        self.throttled_polls = throttled_polls;
-        self.pressure_hold = pressure_hold;
-        self.pressure_events = pressure_events;
-        self.own_hold = own_hold;
-        self
-    }
-
-    /// The gap between two clock reads of a spinning waiter that counts as a
-    /// preemption after the pool's warm-up, for the wait benchmarks only.
-    /// Zero (the default) turns the detection off: every wait then spins its
-    /// full budget, yields and sleeps, as libgomp's waits do. See
-    /// `docs/design/waiting.md`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn preempt_gap(mut self, gap: Duration) -> Self {
-        self.preempt_gap = gap;
-        self
-    }
-
-    /// How long after the pool is built its waiters detect preemptions (gap
-    /// 200 µs) and the pool can throttle, whatever [`preempt_gap`](Self::preempt_gap)
-    /// says (default 200 ms; zero: no warm-up), for the wait benchmarks only.
-    /// See `docs/design/waiting.md`.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn warm_up(mut self, warm: Duration) -> Self {
-        self.warm_up = warm;
-        self
-    }
-
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -735,14 +675,6 @@ impl PoolBuilder {
                 self.costs,
                 self.pin_participants,
                 self.spin_polls,
-                crate::park::Pressure::tuned(
-                    self.throttled_polls,
-                    u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
-                    self.pressure_events,
-                    u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
-                )
-                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX))
-                .with_warm_up(u64::try_from(self.warm_up.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }
@@ -758,14 +690,6 @@ impl PoolBuilder {
                 self.costs,
                 self.pin_participants,
                 self.spin_polls,
-                crate::park::Pressure::tuned(
-                    self.throttled_polls,
-                    u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
-                    self.pressure_events,
-                    u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
-                )
-                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX))
-                .with_warm_up(u64::try_from(self.warm_up.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }
@@ -820,6 +744,4 @@ pub struct WaitCounters {
     pub barrier_sleeps: u64,
     /// Reserved members that parked waiting for work.
     pub member_parks: u64,
-    /// Waiters that saw a gap of more than 200 µs between their clock reads.
-    pub pressure_events: u64,
 }

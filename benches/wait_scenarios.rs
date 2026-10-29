@@ -29,16 +29,9 @@
 //!
 //! Options: `--scenario sections|gaps|acquire|nested|all`, `--widths 64,48`, `--impl threadteam,rayon`,
 //! `--load K:P`, `--calls N` (default 200; `gaps` and `acquire` use N/2), `--csv <file>`,
-//! `--label <text>` (the version or commit, written to the CSV); tuning of the waits (this
-//! version only, `docs/design/waiting.md`): `--spin-polls N`, `--throttled-polls N`,
-//! `--pressure-hold-ms N` (0 throttles only the waiter that saw a preemption),
-//! `--pressure-events N` (preemptions within the hold that throttle the pool; 0 never),
-//! `--own-hold-ms N` (how long a preemption throttles the member that saw it; default 0),
-//! `--preempt-gap-us N` (the gap that counts as a preemption after the warm-up; default 0:
-//! no detection, as libgomp), `--warm-ms N` (how long after a pool is built preemptions are
-//! detected with a 200 µs gap; default 200; 0: none). Under each
-//! threadteam row a `waits per call` line counts join and barrier sleeps, member parks and the
-//! preemptions waiters saw.
+//! `--label <text>` (the version or commit, written to the CSV), `--spin-polls N` (the pool's
+//! spin budget, this version only). Under each threadteam row a `waits per call` line counts join
+//! and barrier sleeps and member parks.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -138,33 +131,15 @@ fn stats(mut v: Vec<f64>) -> Stats {
     }
 }
 
-/// Pool settings from the command line (`--spin-polls`, `--throttled-polls`,
-/// `--pressure-hold-ms`); `None` keeps the library default.
-type Tuning = (
-    Option<u32>,
-    Option<(u32, Duration, u32, Duration)>,
-    Option<Duration>,
-    Option<Duration>,
-);
-static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
+/// The pool's spin budget from the command line (`--spin-polls`); `None` keeps the default.
+static SPIN_POLLS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
 
 fn pool(width: usize) -> Pool {
     let mut b = Pool::builder()
         .threads(width)
         .acquire_timeout(Duration::from_secs(30));
-    if let Some((spin, throttle, gap, warm)) = TUNING.get() {
-        if let Some(g) = gap {
-            b = b.preempt_gap(*g);
-        }
-        if let Some(w) = warm {
-            b = b.warm_up(*w);
-        }
-        if let Some(n) = spin {
-            b = b.spin_polls(*n);
-        }
-        if let Some((polls, hold, events, own)) = throttle {
-            b = b.wait_tuning(*polls, *hold, *events, *own);
-        }
+    if let Some(Some(n)) = SPIN_POLLS.get() {
+        b = b.spin_polls(*n);
     }
     b.build().expect("a pool")
 }
@@ -175,7 +150,6 @@ fn waits_between(a: WaitCounters, b: WaitCounters) -> WaitCounters {
         join_sleeps: b.join_sleeps - a.join_sleeps,
         barrier_sleeps: b.barrier_sleeps - a.barrier_sleeps,
         member_parks: b.member_parks - a.member_parks,
-        pressure_events: b.pressure_events - a.pressure_events,
     }
 }
 
@@ -184,7 +158,6 @@ fn waits_sum(a: WaitCounters, b: WaitCounters) -> WaitCounters {
         join_sleeps: a.join_sleeps + b.join_sleeps,
         barrier_sleeps: a.barrier_sleeps + b.barrier_sleeps,
         member_parks: a.member_parks + b.member_parks,
-        pressure_events: a.pressure_events + b.pressure_events,
     }
 }
 
@@ -198,11 +171,10 @@ fn snap(t: &Option<Team>) -> WaitCounters {
 fn waits_line(c: WaitCounters, calls: usize) {
     let per = |n: u64| n as f64 / calls.max(1) as f64;
     println!(
-        "          waits per call: join sleeps {:.1}, barrier sleeps {:.1}, member parks {:.1}, preemptions seen {:.2}",
+        "          waits per call: join sleeps {:.1}, barrier sleeps {:.1}, member parks {:.1}",
         per(c.join_sleeps),
         per(c.barrier_sleeps),
-        per(c.member_parks),
-        per(c.pressure_events)
+        per(c.member_parks)
     );
 }
 
@@ -359,24 +331,7 @@ fn main() {
     let calls: usize = value("--calls").map_or(200, |v| v.parse().expect("--calls"));
     let label = value("--label").unwrap_or_default();
     let spin = value("--spin-polls").map(|v| v.parse().expect("--spin-polls"));
-    let throttle = match (
-        value("--throttled-polls"),
-        value("--pressure-hold-ms"),
-        value("--pressure-events"),
-        value("--own-hold-ms"),
-    ) {
-        (None, None, None, None) => None,
-        (t, h, e, o) => Some((
-            t.map_or(100, |v| v.parse().expect("--throttled-polls")),
-            Duration::from_millis(h.map_or(100, |v| v.parse().expect("--pressure-hold-ms"))),
-            e.map_or(4, |v| v.parse().expect("--pressure-events")),
-            Duration::from_millis(o.map_or(0, |v| v.parse().expect("--own-hold-ms"))),
-        )),
-    };
-    let gap = value("--preempt-gap-us")
-        .map(|v| Duration::from_micros(v.parse().expect("--preempt-gap-us")));
-    let warm = value("--warm-ms").map(|v| Duration::from_millis(v.parse().expect("--warm-ms")));
-    TUNING.get_or_init(|| (spin, throttle, gap, warm));
+    SPIN_POLLS.get_or_init(|| spin);
     let load_text = load_spec.map_or("none".into(), |(k, p)| format!("{k}x{p}%"));
 
     let csv = value("--csv").map(|path| {

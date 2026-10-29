@@ -153,7 +153,7 @@ fn the_last_member_wakes_a_leader_asleep_in_join() {
                 })
             })
             .collect();
-        done.wait(Some(&sync), &mut Waiter::new(0, None));
+        done.wait(Some(&sync), &mut Waiter::new(0));
         assert!(done.is_done());
         for m in ms {
             m.join().unwrap();
@@ -174,12 +174,12 @@ fn consecutive_barrier_rounds_wake_every_sleeper() {
             let (barrier, cancelled, sync) = (barrier.clone(), cancelled.clone(), sync.clone());
             thread::spawn(move || {
                 for _ in 0..2 {
-                    assert!(barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0, None)));
+                    assert!(barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0)));
                 }
             })
         };
         for _ in 0..2 {
-            assert!(barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0, None)));
+            assert!(barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0)));
         }
         peer.join().unwrap();
     });
@@ -195,9 +195,7 @@ fn a_cancellation_wakes_a_participant_asleep_in_a_barrier() {
         let sync = Arc::new(Parker::new());
         let waiter = {
             let (barrier, cancelled, sync) = (barrier.clone(), cancelled.clone(), sync.clone());
-            thread::spawn(move || {
-                barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0, None))
-            })
+            thread::spawn(move || barrier.arrive(&cancelled, Some(&sync), &mut Waiter::new(0)))
         };
         // `Section::fail`: raise the flag (SeqCst), then wake.
         cancelled.store(true, Ordering::SeqCst);

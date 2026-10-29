@@ -13,13 +13,9 @@ categories = ["concurrency", "science"]
 
 [features]
 default = ["parallel"]
-# Run entries on the pool's own worker threads (docs/design/own-threads.md).
-# Without it the same types exist, every pool has width 1 and every entry runs
-# inline on the calling thread.
-parallel = []
-# Opt-in Rayon interop: `Exec::external_rayon` runs a callback inside a private
-# Rayon pool of the token's width. Not needed by anything else.
-rayon = ["parallel", "dep:rayon"]
+# Run entries on a private Rayon pool. Without it the same types exist, every
+# pool has width 1 and every entry runs inline on the calling thread.
+parallel = ["dep:rayon"]
 # Test support: per-root live-task ledger and entry counters. Zero cost when off.
 ledger = []
 # Test support: hooks that pause threads inside the park/wake handshake and
@@ -49,8 +45,6 @@ libc = "0.2"
 
 [dev-dependencies]
 libc = "0.2"
-# The Rayon reference rows of benches/wait_scenarios.rs.
-rayon = "1.10"
 
 [[bench]]
 name = "team_dispatch"

@@ -10,6 +10,9 @@
 #   taskset -c 0-63 scripts/bench-ab.sh a3a9320 feat/wait-openmp 20 \
 #     --scenario acquire --widths 64 --calls 40 --impl threadteam
 #
+# HEAD2=<rev> adds a third side, labelled `head2`, built and run in every round; the order of the
+# sides rotates by round.
+#
 # HEAD_VARIANTS adds head runs with extra arguments in every round, `;`-separated, each named by
 # its arguments, e.g. HEAD_VARIANTS='--spin-polls 300000;--own-hold-ms 100;--pressure-events 0'.
 # OMP=1 also runs the libgomp driver (benches/omp/wait_omp.c) in every round, with the same
@@ -21,7 +24,7 @@ csv=${CSV:-docs/design/waiting-data/$host-ab.csv}
 log=${LOG:-docs/design/waiting-data/$host-ab.log}
 mkdir -p "$(dirname "$csv")"
 work=$(mktemp -d)
-trap 'git worktree remove --force "$work/base" 2>/dev/null; git worktree remove --force "$work/head" 2>/dev/null; rm -rf "$work"' EXIT
+trap 'for d in base head head2; do git worktree remove --force "$work/$d" 2>/dev/null; done; rm -rf "$work"' EXIT
 build() { # $1 = rev, $2 = dir name; prints the bench binary
   git worktree add -q --detach "$work/$2" "$1"
   (cd "$work/$2" && cargo build -j "${JOBS:-4}" --release --bench wait_scenarios >/dev/null 2>&1)
@@ -29,6 +32,8 @@ build() { # $1 = rev, $2 = dir name; prints the bench binary
 }
 bin_base=$(build "$base" base)
 bin_head=$(build "$head" head)
+bin_head2=""
+[[ -n ${HEAD2:-} ]] && bin_head2=$(build "$HEAD2" head2)
 omp=""
 if [[ ${OMP:-0} == 1 ]]; then
   gcc -O2 -fopenmp "$work/head/benches/omp/wait_omp.c" -o "$work/wait_omp"
@@ -42,12 +47,20 @@ arg() { # value of bench option $1 in "$@" after it, or $2
 omp_scenario=$(arg --scenario all "$@"); omp_widths=$(arg --widths "$(nproc)" "$@")
 omp_calls=$(arg --calls 200 "$@"); omp_load=$(arg --load "" "$@")
 IFS=';' read -r -a variants <<<"${HEAD_VARIANTS:-}"
-echo "base $(git rev-parse --short "$base")  head $(git rev-parse --short "$head")  rounds $rounds  args $*" | tee -a "$log"
+echo "base $(git rev-parse --short "$base")  head $(git rev-parse --short "$head")${HEAD2:+  head2 $(git rev-parse --short "$HEAD2")}  rounds $rounds  args $*" | tee -a "$log"
 for r in $(seq 1 "$rounds"); do
-  order=(base head); (( r % 2 == 0 )) && order=(head base)
+  if [[ -n $bin_head2 ]]; then
+    case $(( r % 3 )) in
+      1) order=(base head head2) ;; 2) order=(head head2 base) ;; *) order=(head2 base head) ;;
+    esac
+  else
+    order=(base head); (( r % 2 == 0 )) && order=(head base)
+  fi
   for side in "${order[@]}"; do
     if [[ $side == base ]]; then
       "$bin_base" --label "base#$r" --csv "$csv" "$@" >>"$log"
+    elif [[ $side == head2 ]]; then
+      "$bin_head2" --label "head2#$r" --csv "$csv" "$@" >>"$log"
     else
       "$bin_head" --label "head#$r" --csv "$csv" "$@" >>"$log"
       if [[ -n $omp ]]; then

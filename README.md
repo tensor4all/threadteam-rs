@@ -6,15 +6,12 @@ type appears in any public signature.
 
 Used by strided-rs, tcontract-rs, cpueinsum-rs, tlinalg-rs and tenferro-rs.
 Design records: [`docs/design/placement.md`](docs/design/placement.md) (the token),
-[`docs/design/own-threads.md`](docs/design/own-threads.md) (the worker threads),
-[`docs/design/waiting.md`](docs/design/waiting.md) (how they wait).
+[`docs/design/waiting.md`](docs/design/waiting.md) (how the workers wait).
 
-The workers are threadteam's own `std::thread`s. A pool leases them from a
-process-wide reserve and gives them back when dropped, so a pool built after another
-one was dropped reuses running threads (faer's `with_team` builds one per call);
-a pool with a thread name, a start hook, a stack size or a QoS of its own gets
-dedicated workers that its drop joins. Rayon is not used unless the opt-in `rayon`
-feature asks for `Exec::external_rayon`.
+The workers belong to a private Rayon pool per `Pool`. A pool with the default
+thread settings keeps its Rayon pool in a process-wide cache when it is
+dropped, and the next pool of the same width takes it, so a pool built per call
+(faer's `with_team`) reuses running threads instead of starting new ones.
 
 ## Usage
 
@@ -67,9 +64,9 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | `Exec::team(f)` / `team_with(over, f)` | reserve `budget - 1` awake pool members for a scope and run barrier-bearing sections through `TeamExec` (`run`, `run_with`, `split`, `fork`, `reborrow`), or `Err(Refused::Unavailable)`; see the design record |
 | `Pool::into_team(width)` -> `Team` (owns the pool; `IntoTeamError` gives it back), `Team::exec(budget)` / `try_exec`, `Team::pool`, `Team::into_pool` | persistent reservation for an engine that owns its pool (`Pool` is not `Clone`); minted tokens are ordinary `Exec`s whose `fork`, `for_ranges`, `broadcast`, `team` dispatch on the reserved members; one leader at a time (`exec` blocks, `try_exec` -> `Refused::Busy`); idle members park while reserved |
 | `PoolBuilder::qos(Qos)`, `raise_current_thread_qos(Qos)` | worker QoS on macOS (default `UserInitiated`); raise the leading thread without ever lowering it |
-| `PoolBuilder::idle_spin`, `idle_runs_rayon`, `acquire_timeout`; `Pool::release_idle` | waiting policy of idle team members (an idle member spins for the spin budget unless `idle_spin` is zero, then sleeps; `idle_runs_rayon` has no effect and is kept for compatibility) |
+| `PoolBuilder::idle_spin`, `idle_runs_rayon`, `acquire_timeout`; `Pool::release_idle` | waiting policy of idle team members (an idle member returns to Rayon after `idle_spin` or the spin budget, whichever comes first) |
 | `PoolBuilder::spin_polls`, `Pool::spin_polls` | spin budget of every team wait, in polls (the shape of libgomp's `GOMP_SPINCOUNT`): a reserved member waiting for work, the leader in a join and a participant in a barrier spin that many polls, yield a few times, then sleep until woken; throttled to 100 polls in an oversubscribed scope or after a waiter was descheduled ([`docs/design/waiting.md`](docs/design/waiting.md)) |
-| `PoolBuilder::pin_participants(bool)`, `Pool::pin_participants()` | opt-in placement of the **members** of a root team scope (Linux; off by default, which is consistent with the rule it protects): member `k` (participant `k >= 1`) pins itself onto the `k`-th CPU of the calling thread's affinity set, `S[0]` is left to the leader, and a member restores its own mask before it serves the pool's queue, leaves the pool, or serves foreign work. **The leader is never pinned**, because a vendor library creates its thread team from the calling thread and a one-CPU caller would confine the whole provider team; a member that calls such a library directly inside a share does confine it, so use `Exec::external` (which restores the member's mask first) or leave pinning off. For tensor4all/faer#107; give each team its own CPU set (`taskset -c`), there is no CPU allocator |
+| `PoolBuilder::pin_participants(bool)`, `Pool::pin_participants()` | opt-in placement of the **members** of a root team scope (Linux; off by default, which is consistent with the rule it protects): member `k` (participant `k >= 1`) pins itself onto the `k`-th CPU of the calling thread's affinity set, `S[0]` is left to the leader, and a member restores its own mask before it returns to Rayon or serves foreign work. **The leader is never pinned**, because a vendor library creates its thread team from the calling thread and a one-CPU caller would confine the whole provider team; a member that calls such a library directly inside a share does confine it, so use `Exec::external` (which restores the member's mask first) or leave pinning off. For tensor4all/faer#107; give each team its own CPU set (`taskset -c`), there is no CPU allocator |
 | `DispatchCosts`, `WidthCosts`, `PoolBuilder::dispatch_costs`, `Exec::dispatch_cost(width)`, `TeamExec::dispatch_cost(width)` | cost of one parallel section per kind of token (team, in pool, outside), steady state; one row per `HostClass` (`HostClass::detect()`, keyed by kernel dispatch: `x86_64-avx512`, `x86_64-avx2`, `x86_64-scalar`, `aarch64-apple`, `aarch64`, `generic`), `DispatchCosts::for_class(class)`; measured rows for `x86_64-avx512` (team anchors at widths 2, 4, 6 and 8) and `aarch64-apple`, a measured Zen2 team row for `x86_64-avx2` (anchors at ten widths from 2 to 64; its plain kinds stay generic), every other class takes the conservative `generic` row (3 / 15 / 40 us at the anchors 2, 4, 6); a row holds measured anchors (`WidthCosts::new`, `WidthCosts::flat`, or `WidthCosts::from_anchors` for measured anchors up to 64 and beyond), interpolates between them and grows linearly above the largest one, so a width above the anchors is never charged the cost of the largest anchor; `DispatchCosts::host_default()` is the detected class's row; `Duration::MAX` when serial; override per pool |
 | `pays_at(est, sections, cost)`, `Exec::pays(est, sections, width)`, `Exec::width_for(est, sections)`, `width_for_by`, `PAYS` | the one rule: parallel iff `est >= PAYS * sections * D(width)`; `width_for` minimises `sections * D(k) + est / k` |
 | `Exec::external(f)` | enter the pool once and hand the budget as a plain width to an outside library (faer, a vendor BLAS); how it divides the width is that library's concern |
@@ -82,13 +79,11 @@ the token to kernels by value. Kernels never store a token and never mint one.
   once is at most its budget at every nesting depth. A parent waiting for its
   children keeps no slot.
 * **Lazy and inline.** A serial token, budget one, or one task runs inline on the
-  calling thread and makes no scheduler call; no worker starts before a pool is
-  built, and Rayon's process-global pool is never started.
-* **Placement by caller.** A worker of the target pool runs its own batch's
-  tasks itself and serves the pool while it waits; a worker of another pool
-  publishes on the target pool and serves its own pool while it waits (so
-  chains between pools always make progress); a plain thread publishes and
-  sleeps until its tasks finished. No thread-local state exists in the crate.
+  calling thread and makes no scheduler call, so the process-global Rayon pool is
+  never started implicitly.
+* **Placement by caller.** A worker of the target pool spawns into the current
+  scope without installing; a plain thread or a worker of another pool enters the
+  target pool once and waits. No thread-local state exists in the crate.
 * **`broadcast`** refuses with `Refused::ForkChild` for a token derived from
   `fork` (through `reborrow` or `limit` too), and with `Refused::CallerInPool`
   when the caller is a worker of the same pool. Roots, and their `reborrow`s and
@@ -98,14 +93,19 @@ the token to kernels by value. Kernels never store a token and never mint one.
   blocking work of another token on those workers delays the broadcast.
   `can_broadcast` applies the same rule through one private helper, so the two
   cannot disagree.
-* **Shutdown.** Dropping a `Pool` detaches every worker and waits until each
-  one acknowledged; after that no worker touches the pool. Dedicated workers (a
-  pool with a thread name, an `on_start` hook, a stack size or a QoS of its own)
-  are then joined: their thread-local destructors, including state created in
-  an `on_start` hook, have run when `drop` returns. Shared workers go back to the
-  process-wide reserve, asleep, for the next pool. A pool dropped from one of its
-  own workers does not wait for or join that worker, which acknowledges and
-  leaves after its task returns. Without `parallel` there is nothing to join.
+* **Shutdown.** Dropping a `Pool` ends its team members and waits until they
+  left. A pool with a `thread_name`, an `on_start` hook, a `stack_size` or a
+  `qos` of its own has dedicated workers, and its drop joins them: when `drop`
+  returns, all of them have exited and their thread-local destructors
+  (including state created in an `on_start` hook) have run. A pool with the
+  default thread settings keeps its idle workers in a process-wide cache keyed
+  by width. The next default pool of that width takes them and gives each
+  worker the building thread's CPU set. A cached set belongs to one pool at a
+  time, and the cache holds at most as many threads as the larger of the
+  available parallelism and the widest pool built so far; it joins the oldest
+  entries beyond that. A pool dropped from one of its own workers cannot wait
+  for itself, so that drop only signals shutdown and returns without joining or
+  caching. Without `parallel` there is nothing to join.
 * **No scheduler type is public.** There is no constructor from, and no accessor
   returning, a scheduler pool. `scripts/check-no-public-rayon.sh` runs
   `cargo public-api -p threadteam` (when installed) and fails if `rayon::`
@@ -115,39 +115,33 @@ the token to kernels by value. Kernels never store a token and never mint one.
 
 | Feature | Effect |
 | --- | --- |
-| `parallel` (default) | run on the pool's own worker threads. Without it the same types exist, `PoolBuilder::build` returns a width-1 pool and every entry runs inline |
-| `rayon` | opt-in Rayon interop: `Exec::external_rayon(f)` runs `f(width)` inside a private Rayon pool of the pool's width (separate threads, built on first use) |
+| `parallel` (default) | run on a private pool. Without it the same types exist, `PoolBuilder::build` returns a width-1 pool and every entry runs inline |
 | `ledger` | test support: `ledger::max_live(root)`, `live`, `installs`, and `Exec::ledger_root`. Records live tasks per root token and pool installs; compiled out when off |
 
 Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
-a test binary that runs serial and pooled work and then checks
-`ledger::global_pool_unstarted()` (with the `rayon` feature it checks that Rayon's
-process-global pool was never started).
+a test binary that runs serial and pooled work and then checks that
+`rayon::ThreadPoolBuilder::new().build_global()` still succeeds.
 
 ## Upgrading from 0.1
 
-0.2 runs entries on threadteam's own worker threads instead of a private Rayon
-pool (`docs/design/own-threads.md`). The signatures are those of 0.1 plus
-`PoolBuilder::spin_polls` / `Pool::spin_polls`; the behaviour changes are:
+0.2 still runs entries on a private Rayon pool. The signatures are those of
+0.1 plus `PoolBuilder::spin_polls` / `Pool::spin_polls`; the behaviour changes
+are:
 
-* **Pool drop.** A pool with default thread settings leases *shared* workers
-  from a process-wide reserve; dropping it waits until every worker detached
-  and returns them to the reserve, asleep, instead of joining them. A pool with
-  a `thread_name`, an `on_start` hook, a stack size or a QoS of its own still
-  gets dedicated workers that its drop joins (their thread-local destructors
-  have run when `drop` returns).
-* **`external` on a team token** lends the members to the pool's own queue. It
-  no longer runs the callback inside a Rayon pool: Rayon calls in the callback
-  go to Rayon's global pool. Code that relied on the old behaviour enables the
-  `rayon` feature and calls `Exec::external_rayon`.
-* **`parallel` pulls no Rayon.** Rayon is a dependency only with the `rayon`
-  feature.
-* **`idle_runs_rayon`** has no effect: an idle worker always serves the pool's
-  queue. It is kept so that callers compile.
+* **Pool drop and reuse.** A pool with the default thread settings no longer
+  joins its workers on drop: after its members left, its Rayon pool goes to a
+  process-wide cache, and the next default pool of the same width reuses those
+  threads (each worker takes the building thread's CPU set). A pool with a
+  `thread_name`, an `on_start` hook, a `stack_size` or a `qos` of its own still
+  gets dedicated workers that its drop joins.
 * **Waits** follow libgomp (`docs/design/waiting.md`): a bounded spin of
   `spin_polls` polls (by default 300000 on x86-64, 2^21 on aarch64), 16
-  yields, then sleep. `idle_spin`, `release_idle` and `resident_members` keep
-  their meaning on the native loop.
+  yields, then sleep. A reserved member that sleeps stays reserved; an idle
+  member returns to Rayon after `idle_spin` or the spin budget, whichever
+  comes first.
+* **Unchanged:** `idle_runs_rayon` keeps its meaning (an idle member serves
+  Rayon jobs while it spins), `external` on a team token still lends the
+  members to the pool's Rayon jobs, and `parallel` still pulls Rayon.
 
 ## Wait benchmarks
 

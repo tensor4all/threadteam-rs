@@ -90,11 +90,22 @@ The last member of a section therefore pays one extra uncontended read-modify-wr
   - 12288 polls (about 300 µs) made the first section after a 1 ms or 10 ms gap 2.3x and 10.8x slower than 0.1.3 on a quiet host (evo): the members had gone to sleep. 131072 closed the 1 ms gap; 300000 also closes the 10 ms gap (evo, `d430347` runs), and is accepted as the OpenMP default (criterion d).
   - libomp keeps 200 ms (`KMP_BLOCKTIME`); 0.1.3 kept 200 ms of wall time for members and never slept in joins.
 - **No calibration.** Converting a time to polls at pool build was considered and dropped (pre-review): a calibration taken while the CPU is contended yields too few polls, and a bare PAUSE loop is not the real poll anyway. The count is approximate in time, as libgomp's is.
-- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed.
+- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed, or while a new pool is under sustained pressure (below).
 
-### Scheduling pressure: none (libgomp's waits)
+### Scheduling pressure: only while a pool is new
 
-Nothing detects preemption: every wait spins its budget, yields and sleeps, as libgomp's waits do. #14 tried several detectors on the Rayon base, and each traded one acceptance criterion for another (broccoli, threadteam-rs#14):
+**Default: libgomp's waits.** Once a pool is past its warm-up, its waits detect nothing: every wait spins 300000 polls, yields 16 times and sleeps, as libgomp's do (`GOMP_SPINCOUNT`, futex).
+- On broccoli (`e76036c`, 16:58Z) this was the only configuration that met criteria (b) and (c) together: on quiet hosts held teams within 10 % of 0.1.3, and under load `held_team` at 0.91x libgomp, `held_pool` +7.8 %, gaps on par with libgomp.
+- Every detecting variant made held teams under load 3.5-4x slower than libgomp, because detection throttled waits that libgomp keeps spinning.
+- The main path of real use is a held pool: tenferro's `CpuEngine` holds its pool, and libomp and libgomp hold hot teams.
+
+**Warm-up: detection while a pool is new (default 200 ms after it is built).** Without any detection, a pool built for one call (`fresh_pool`, faer's `with_team`) collapsed (87.6 ms): its freshly spawned threads start stacked, because the scheduler places new threads before it knows their load, and spinning members never leave a CPU idle to pull one over. So during the warm-up a new pool's waiters detect preemptions and the pool can throttle, as in `c0c024b`, which kept the faer#107 arms at zero:
+- **Detection.** A spinning waiter reads the clock every 64 polls. A gap of more than 200 µs between two reads means it was descheduled while it spun: 64 polls take well under 10 µs, and a scheduler slice is 0.75 ms or more.
+- **Response.** That waiter ends its spin (yields, then sleeps). The pool counts the observations, and once 4 come within 100 ms of each other, every wait of the pool adopts the throttled budget (100 polls) at its first clock read, for 100 ms (`fetch_max`).
+- **Limits of the signal.** It is a pressure heuristic: foreign load, the team's own threads, interrupts and VM steal look alike, and it only shortens active waiting.
+- **Cost after the warm-up.** None in the poll loop: a wait's first clock read finds detection off, and that wait stops reading the clock.
+
+**What was tried and measured on the way** (broccoli and evo, threadteam-rs#14):
 
 | detection | quiet held teams | held teams under load | fresh pool |
 | --- | --- | --- | --- |
@@ -102,9 +113,14 @@ Nothing detects preemption: every wait spins its budget, yields and sleeps, as l
 | a pool-wide throttle on 4 preemptions within 100 ms (`c0c024b`) | within 10 % | 3.5-4x libgomp | fixed |
 | a per-thread 100 ms throttle (`2773c36`) | 1.2-1.8x slower | — | fixed |
 | none (`e76036c` variant) | within 10 % | about libgomp | collapsed (87.6 ms) |
-| detection during a 200 ms warm-up (`1f2145b`) | `held_pool` 2.2x | 3.3x libgomp | collapsed (11 ms) |
 
-The one configuration that met (b) and (c), no detection, failed only on the pool built per call. That pool's collapse comes from spawning fresh threads per call, not from waiting. With threadteam's own threads (`own-threads.md`) a pool reuses the reserve's running workers, so the waits stay libgomp's and the detection, the warm-up and their knobs are gone.
+**Knobs and counters for the benchmarks** (`PoolBuilder::preempt_gap`, `warm_up`, `wait_tuning`, all hidden; bench flags `--preempt-gap-us`, `--warm-ms`, `--pressure-events`, `--pressure-hold-ms`, `--throttled-polls`, `--own-hold-ms`):
+- detection after the warm-up (a nonzero gap);
+- the warm-up length;
+- the pool threshold, the hold and the throttled budget;
+- a per-thread hold.
+
+`Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
 
 ### Start of a section: no arrival barrier
 

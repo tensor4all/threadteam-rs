@@ -36,21 +36,22 @@ impl Drop for LeaderGuard<'_> {
 /// [`exec`](Team::exec). A minted token is an ordinary [`Exec`] that carries
 /// the team's authority:
 ///
-/// * `fork` and `for_ranges` dispatch as team sections: no queue entry, no
+/// * `fork` and `for_ranges` dispatch as team sections: no Rayon entry, no
 ///   wake-up, no allocation. Children of `fork` carry the sub-team of their
 ///   share, so nested forks stay on reserved members.
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
 /// * `external` hands the width as on any token and **lends the token's
-///   members to the pool for the call**: they run the pool's queued tasks
-///   instead of idling, and resume team service when the call returns. A lent
-///   task that is still running delays the next section until it finishes.
+///   members to the pool for the call**: they run the pool's Rayon jobs (the
+///   library's work) instead of idling, and resume team service when the call
+///   returns. A lent job that is still running delays the next section until it
+///   finishes.
 ///
 /// Reserved members wait for work in staged episodes: they spin for the pool's
 /// spin budget ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)),
-/// yield a few times, then **park** while staying reserved; they serve nothing
-/// else until the `Team` is dropped (`docs/design/waiting.md`). The next
+/// yield a few times, then **park** while staying reserved; they do not return
+/// to Rayon until the `Team` is dropped (`docs/design/waiting.md`). The next
 /// dispatch wakes a parked member through its slot's parker, which costs a
 /// syscall on the first dispatch after a park (`benches/wake_probe.rs`) and one
 /// atomic read-modify-write for a warm one.
@@ -67,8 +68,8 @@ impl Drop for LeaderGuard<'_> {
 /// A `Team` **owns** its [`Pool`] and has no lifetime: an engine stores a `Team`
 /// (or a plain `Pool` when it wants no team). `Pool` is not `Clone`, no method
 /// hands out a second handle, and [`pool`](Team::pool) only borrows. Dropping
-/// the `Team` releases the members and then drops the pool (see [`Pool`] for
-/// what that does to its workers); [`into_pool`](Team::into_pool) releases the members and gives the
+/// the `Team` releases the members and then drops the pool, which joins the
+/// workers; [`into_pool`](Team::into_pool) releases the members and gives the
 /// pool back instead. Tokens borrow the `Team`, so none outlives it.
 ///
 /// # Examples
@@ -150,7 +151,7 @@ impl Pool {
     /// long as it lives.
     ///
     /// `width` counts the leader and is clamped to the pool width; zero is
-    /// treated as one. Acquisition never takes a worker that runs a task (see
+    /// treated as one. Acquisition never waits for a running Rayon job (see
     /// [`Exec::team`](crate::Exec::team)). Members park after the pool's spin
     /// budget without work ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)).
     ///
@@ -191,7 +192,7 @@ impl Pool {
         let reservation =
             match self
                 .awake
-                .acquire(width - 1, release, self.awake.spin_budget(false))
+                .acquire(&self, width - 1, release, self.awake.spin_budget(false))
             {
                 Ok(r) => r,
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),

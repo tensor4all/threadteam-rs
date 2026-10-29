@@ -6,14 +6,6 @@ cpueinsum-rs, tlinalg-rs and tenferro-rs; the cross-repository rules are in
 tensor4all/tensor4all-meta#41 (`docs/design/core-boundary-and-execution-ownership.md`,
 "Where placement is decided").
 
-
-> **Workers (2026-10-30).** threadteam no longer runs on a private Rayon pool.
-> Its workers are its own threads, leased from a process-wide reserve; see
-> [`own-threads.md`](own-threads.md). Where this record describes Rayon jobs,
-> installs or claim jobs, read the native queue, the cooperative waits and the
-> compare-and-swap reservation described there. The token contracts here are
-> unchanged.
-
 ## Problem
 
 The CPU stack places work with **four** mechanisms at once:
@@ -153,12 +145,29 @@ deadlock it. `can_broadcast` reports, without consuming the token, whether
 refusal rule, so they cannot disagree. A kernel asks it before building a setup
 that only a broadcast needs.
 
-Dropping a `Pool` is deterministic. The pool starts its workers through Rayon's
-`spawn_handler` with `std::thread::Builder` (same name and stack size) and keeps
-the join handles. `Drop` first drops the Rayon pool, which signals shutdown, and
-then joins every handle, so when it returns all workers have exited and their
-thread-local destructors have run. A pool dropped from one of its own workers
-cannot join itself: that drop skips joining. Steady-state entries are unaffected.
+The pool starts its workers through Rayon's `spawn_handler` with
+`std::thread::Builder` (same name and stack size) and keeps the join handles.
+Dropping a pool with dedicated workers (a `thread_name`, an `on_start` hook, a
+`stack_size` or a `qos` of its own) is deterministic: `Drop` first drops the
+Rayon pool, which signals shutdown, and then joins every handle, so when it
+returns all workers have exited and their thread-local destructors have run.
+A pool with the default thread settings waits until its team members left
+their loops and then keeps the Rayon pool and its handles in a process-wide
+cache keyed by width; the next default pool of that width takes it and each
+worker applies the building thread's CPU set to itself (a Rayon `broadcast`).
+Only idle entries are handed out, so two live pools never share workers. The
+cache holds at most the larger of the available parallelism and the widest
+pool built so far, in threads, and drops and joins its oldest entries beyond
+that. A pool dropped from one of its own workers can neither join nor wait for
+itself: that drop skips joining and caching. Steady-state entries are
+unaffected.
+
+The cache is the Rayon-based answer to tensor4all/faer#107's per-call pools
+(threadteam-rs#18, #19): the slow mode came from the fresh threads of every
+pool, not from the waits. Own `std::thread` workers (#16) solved the same
+problem with a much larger change; maintainer decision, 2026-10-30: 「しばらくは
+Rayon版を出版し続けて，Rayonで何ができないか熟考してから判断する」. That
+version is kept on the `develop` branch and would ship as 0.3.0.
 
 A parent waiting for its children keeps no slot; Rayon may let the waiting
 thread run one of its children, which is one of the tasks already counted.

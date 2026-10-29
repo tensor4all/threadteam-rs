@@ -9,16 +9,12 @@
 //! * [`Exec::new`] mints a token from a pool; [`Exec::serial`] needs none.
 //! * A token is not `Clone`/`Copy`; entries consume it; splits conserve slots.
 //! * Serial, budget-one and one-task entries run inline and never reach any
-//!   scheduler; no worker thread starts before a pool is built, and Rayon is
-//!   not used at all unless the opt-in `rayon` feature is on.
+//!   scheduler, so the process-global Rayon pool is never started implicitly.
 //!
 //! # Features
 //!
-//! * `parallel` (default): run on the pool's own worker threads, leased from a
-//!   process-wide reserve (`docs/design/own-threads.md`). Without it the same
-//!   types exist, every pool has width 1 and every entry runs inline.
-//! * `rayon` (opt-in): `Exec::external_rayon`, a private Rayon pool per pool
-//!   for callbacks that parallelize with Rayon.
+//! * `parallel` (default): run on a private pool. Without it the same types
+//!   exist, every pool has width 1 and every entry runs inline.
 //! * `ledger`: test support, see the `ledger` module (compiled only with this feature).
 //!
 //! # Examples
@@ -64,11 +60,6 @@ pub mod test_hooks;
 #[cfg(feature = "trace")]
 pub mod trace;
 mod track;
-#[cfg(feature = "parallel")]
-mod worker;
-#[cfg(feature = "parallel")]
-#[doc(hidden)]
-pub use worker::spawned_workers;
 
 pub use cost::{pays_at, width_for_by, DispatchCosts, DispatchKind, HostClass, WidthCosts, PAYS};
 pub use error::{Error, Refused};
@@ -78,11 +69,11 @@ pub use exec::Exec;
 pub use park::Parker;
 #[cfg(loom)]
 #[doc(hidden)]
-pub use park::{Barrier, Batch, Broadcast, BroadcastList, Completion, Queue, SlotState, Waiter};
+pub use park::{Barrier, Completion, Waiter};
 pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
 #[doc(hidden)]
 pub use pool::WaitCounters;
-pub use pool::{Pool, PoolBuilder};
+pub use pool::{spawned_workers, Pool, PoolBuilder};
 pub use reserve::{IntoTeamError, Team};
 pub use team::{Cancelled, Participant, TeamExec};
 

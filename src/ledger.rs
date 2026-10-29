@@ -145,16 +145,14 @@ pub fn installs(root: u64) -> usize {
 /// assert!(ledger::global_pool_unstarted());
 /// ```
 pub fn global_pool_unstarted() -> bool {
-    // threadteam starts no Rayon pool at all unless the opt-in `rayon` feature
-    // is on; then the process-global one must still be unstarted.
-    #[cfg(feature = "rayon")]
+    #[cfg(feature = "parallel")]
     {
         rayon::ThreadPoolBuilder::new()
             .num_threads(1)
             .build_global()
             .is_ok()
     }
-    #[cfg(not(feature = "rayon"))]
+    #[cfg(not(feature = "parallel"))]
     {
         true
     }

@@ -84,6 +84,11 @@ struct Slot {
     /// Spin budget, in polls, of this reserved member's waits for work (see
     /// `docs/design/waiting.md`); written by the leader at root-scope entry.
     spin_budget: AtomicU32,
+    /// Until when this member's waits start throttled: it saw itself
+    /// descheduled while it spun (`crate::park::Pressure`); its own thread
+    /// writes and reads it.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pressed_until: crate::sync::AtomicU64,
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
@@ -106,6 +111,7 @@ impl Slot {
             idle_spin_ns: AtomicU64::new(0),
             idle_yield: AtomicBool::new(false),
             spin_budget: AtomicU32::new(crate::park::THROTTLED_POLLS),
+            pressed_until: crate::sync::AtomicU64::new(0),
             lent: AtomicBool::new(false),
             saved: crate::pin::SavedMask::new(),
             park: Parker::new(),
@@ -551,9 +557,10 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
                     let w = waiter.get_or_insert_with(|| {
-                        Waiter::new(
+                        Waiter::of_thread(
                             slot.spin_budget.load(Ordering::Relaxed),
                             Some(&aw.waits.pressure),
+                            Some(&slot.pressed_until),
                         )
                     });
                     if w.step() == Step::Sleep {

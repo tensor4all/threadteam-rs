@@ -14,7 +14,8 @@
 //! * `acquire`: a call is 50 sections of 20 µs, with the team held and a token minted per call
 //!   (`held_team`, as tenferro's `CpuEngine`), with the pool held and the members acquired per
 //!   call (`held_pool`, `Exec::new(..).team(..)`), and with a new pool per call (`fresh_pool`, as
-//!   faer's `with_team`; `total` times the build, the acquisition, the call and the drop);
+//!   faer's `with_team`; `total` times the build, the acquisition, the call and the drop, and
+//!   `build`, `acquire`, `release` and `drop` time those phases one by one);
 //! * `nested`: a call is 100 splits of the team into pairs, each pair running one 20 µs
 //!   section: many child leaders join at once (they share one sleeping place in the pool).
 //!
@@ -561,19 +562,44 @@ fn main() {
                 row("held_pool", "call", v);
                 waits_line(waits_between(c0, p.wait_counters()), calls / 2);
             }
-            let (mut call, mut total) = (Vec::new(), Vec::new());
+            // The phases of a pool built for one call: build, acquisition of its
+            // members, the call, the release of the team and the drop of the pool.
+            let (mut build, mut acquire, mut call, mut release, mut drop_pool, mut total) = (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let us = |a: Instant, b: Instant| (b - a).as_secs_f64() * 1e6;
             let mut c = WaitCounters::default();
             for _ in 0..calls / 2 {
                 let t0 = Instant::now();
-                let t = team(w);
+                let p = pool(w);
+                let t1 = Instant::now();
+                let t = p.into_team(w).expect("an idle pool");
+                let t2 = Instant::now();
                 let c0 = t.pool().wait_counters();
                 call.push(call_team(&t, w, sections, work).1);
                 c = waits_sum(c, waits_between(c0, t.pool().wait_counters()));
-                drop(t);
-                total.push(t0.elapsed().as_secs_f64() * 1e6);
+                let t3 = Instant::now();
+                let p = t.into_pool();
+                let t4 = Instant::now();
+                drop(p);
+                let t5 = Instant::now();
+                build.push(us(t0, t1));
+                acquire.push(us(t1, t2));
+                release.push(us(t3, t4));
+                drop_pool.push(us(t4, t5));
+                total.push(us(t0, t5));
             }
             row("fresh_pool", "call", call);
             row("fresh_pool", "total", total);
+            row("fresh_pool", "build", build);
+            row("fresh_pool", "acquire", acquire);
+            row("fresh_pool", "release", release);
+            row("fresh_pool", "drop", drop_pool);
             waits_line(c, calls / 2);
         }
     }

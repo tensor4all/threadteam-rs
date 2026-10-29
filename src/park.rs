@@ -170,12 +170,13 @@ const PREEMPT_GAP_NS: u64 = 200_000;
 pub(crate) const CONTENDED_HOLD_NS: u64 = 100_000_000;
 
 /// Default number of observed preemptions, within one hold window, that
-/// throttle the whole pool. A single preemption (another user's job taking a
-/// CPU for a slice) only ends the spin of the waiter that saw it: throttling
-/// the pool on it made every section of a width-64 team on a mildly shared
-/// host pay futex wakes (threadteam-rs#14, broccoli). Sustained load produces
-/// many preemptions per window and still throttles.
-pub(crate) const CONTENDED_EVENTS: u32 = 4;
+/// throttle the whole pool; zero never throttles the whole pool. A preemption
+/// throttles the thread that saw it (its member slot) for the hold. Throttling
+/// the whole pool, on one observation and then on four, made every section of
+/// a width-64 team under foreign load sleep and pay futex wakes, 3.6-4.1x
+/// slower than 0.1.3 (threadteam-rs#14, broccoli), so it is off by default and
+/// kept as a benchmark knob.
+pub(crate) const CONTENDED_EVENTS: u32 = 0;
 
 /// What a waiting thread does after one [`Waiter::step`].
 #[doc(hidden)]
@@ -261,9 +262,14 @@ impl Pressure {
 
     /// Records a descheduled waiter at `now`. A later deadline is never
     /// shortened by an older observation.
+    /// How long an observation throttles the thread that saw it.
+    pub(crate) fn hold_ns(&self) -> u64 {
+        self.hold_ns
+    }
+
     pub(crate) fn note(&self, now: u64) {
         self.events.fetch_add(1, Ordering::Relaxed);
-        if self.hold_ns == 0 {
+        if self.hold_ns == 0 || self.threshold == 0 {
             return;
         }
         let start = self.window.load(Ordering::Relaxed);
@@ -300,6 +306,8 @@ pub struct Waiter<'a> {
     polls: u32,
     yields: u32,
     pressure: Option<&'a Pressure>,
+    /// The waiting thread's own throttle deadline (a member's slot), if any.
+    own: Option<&'a AtomicU64>,
     last: Option<u64>,
     slept: bool,
 }
@@ -307,11 +315,23 @@ pub struct Waiter<'a> {
 impl<'a> Waiter<'a> {
     /// A wait episode with a spin of `budget` polls.
     pub fn new(budget: u32, pressure: Option<&'a Pressure>) -> Self {
+        Self::of_thread(budget, pressure, None)
+    }
+
+    /// A wait episode of a thread with its own throttle deadline `own`: a
+    /// preemption it observes throttles its later waits for the pool's hold,
+    /// and a deadline still running throttles this one.
+    pub(crate) fn of_thread(
+        budget: u32,
+        pressure: Option<&'a Pressure>,
+        own: Option<&'a AtomicU64>,
+    ) -> Self {
         Waiter {
             budget,
             polls: 0,
             yields: 0,
             pressure,
+            own,
             last: None,
             slept: false,
         }
@@ -347,10 +367,16 @@ impl<'a> Waiter<'a> {
     fn checkpoint(&mut self) {
         let Some(p) = self.pressure else { return };
         let now = p.now();
+        let own_active = || self.own.is_some_and(|o| o.load(Ordering::Relaxed) > now);
         match self.last {
-            None if p.active(now) => self.budget = self.budget.min(p.throttled().max(self.polls)),
+            None if p.active(now) || own_active() => {
+                self.budget = self.budget.min(p.throttled().max(self.polls))
+            }
             Some(last) if now.saturating_sub(last) > PREEMPT_GAP_NS => {
                 p.note(now);
+                if let Some(o) = self.own {
+                    o.fetch_max(now.saturating_add(p.hold_ns()), Ordering::Relaxed);
+                }
                 self.budget = self.polls;
             }
             _ => {}

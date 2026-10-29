@@ -60,8 +60,10 @@ fn a_descheduled_spinner_ends_its_spin_and_records_the_pressure() {
 }
 
 #[test]
-fn one_preemption_throttles_only_its_waiter_and_a_burst_throttles_the_pool() {
-    let p = Pressure::new(); // four observations within 100 ms throttle the pool
+fn with_a_pool_threshold_a_burst_throttles_the_pool_and_isolated_ones_do_not() {
+    // The pool-wide throttle is off by default; four observations within the
+    // hold window throttle the pool when it is on (a benchmark knob).
+    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4);
     let t = 1_000_000_000;
     for k in 0..3 {
         p.note(t + k * 1_000_000);
@@ -74,10 +76,38 @@ fn one_preemption_throttles_only_its_waiter_and_a_burst_throttles_the_pool() {
         "the hold ends"
     );
     // Observations spread wider than the window never add up.
-    let q = Pressure::new();
+    let q = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4);
     for k in 0..10 {
         let at = t + k * (CONTENDED_HOLD_NS + 1);
         q.note(at);
         assert!(!q.active(at), "isolated observation {k}");
     }
+}
+
+#[test]
+fn by_default_a_preemption_throttles_only_the_thread_that_saw_it() {
+    use core::sync::atomic::AtomicU64;
+    let p = Pressure::new();
+    let own = AtomicU64::new(0);
+    // A member's wait sees itself descheduled (a gap before its second clock
+    // read): its spin ends, and its slot's deadline is set.
+    let mut w = Waiter::of_thread(1_000_000, Some(&p), Some(&own));
+    for _ in 0..64 {
+        assert_eq!(w.step(), Step::Poll);
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    for _ in 64..128 {
+        assert_eq!(w.step(), Step::Poll);
+    }
+    assert_eq!(polls_until_sleep(&mut w), 16);
+    assert!(own.load(core::sync::atomic::Ordering::Relaxed) > 0);
+    // The pool is not throttled: another thread's wait spins its full budget.
+    let other_own = AtomicU64::new(0);
+    let mut other = Waiter::of_thread(100_000, Some(&p), Some(&other_own));
+    assert_eq!(polls_until_sleep(&mut other), 100_000 + 16);
+    // The same thread's next wait is throttled while its deadline runs (set
+    // here to one that cannot pass during the test).
+    own.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
+    let mut again = Waiter::of_thread(100_000, Some(&p), Some(&own));
+    assert_eq!(polls_until_sleep(&mut again), THROTTLED_POLLS + 16);
 }

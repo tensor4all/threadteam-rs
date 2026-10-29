@@ -82,14 +82,30 @@ const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
 /// # Ok::<(), threadteam::Error>(())
 /// ```
 pub struct Pool {
-    // Field order matters: `inner` is dropped (shutdown signalled) before
-    // `joiner` waits for the threads.
+    /// The leased workers (`docs/design/own-threads.md`).
     #[cfg(feature = "parallel")]
-    pub(crate) inner: rayon::ThreadPool,
+    workers: Vec<Arc<crate::worker::WorkerCtl>>,
+    /// Join handles of dedicated workers (empty for shared ones).
     #[cfg(feature = "parallel")]
-    _joiner: Joiner,
+    joins: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>,
     pub(crate) width: NonZeroUsize,
     pub(crate) awake: Arc<Awake>,
+    /// The private Rayon pool of `Exec::external_rayon` (feature `rayon`).
+    #[cfg(feature = "rayon")]
+    rayon: std::sync::OnceLock<rayon::ThreadPool>,
+}
+
+#[cfg(feature = "rayon")]
+impl Pool {
+    /// This pool's private Rayon pool, built on first use.
+    pub(crate) fn rayon(&self) -> &rayon::ThreadPool {
+        self.rayon.get_or_init(|| {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(self.width.get())
+                .build()
+                .expect("a private Rayon pool for external_rayon")
+        })
+    }
 }
 
 impl Pool {
@@ -139,10 +155,10 @@ impl Pool {
         self.awake.defaults
     }
 
-    /// Asks idle team members to return their threads to Rayon now.
+    /// Asks idle team members to stop spinning and sleep now.
     ///
-    /// Members that are idle leave at once; members that are reserved leave
-    /// when their reservation ends, so this never revokes a live
+    /// Members that are idle sleep at once; members that are reserved stop
+    /// spinning after their reservation ends, so this never revokes a live
     /// [`TeamExec`](crate::TeamExec). The call does not wait for anything,
     /// so it is safe to make from inside a reservation. A team acquired later
     /// starts its members afresh.
@@ -206,7 +222,7 @@ impl Pool {
     }
 
     /// Number of workers currently kept awake as team members, reserved or
-    /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
+    /// idle and still awake. Zero once released members went to sleep. A diagnostic: the value
     /// can change at any moment.
     ///
     /// # Examples
@@ -223,32 +239,38 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        // Idle members leave their loops so that the workers can be joined.
         self.awake.shutdown.store(true, Ordering::Release);
-    }
-}
-
-/// The worker threads of a pool, joined when it is dropped.
-#[cfg(feature = "parallel")]
-struct Joiner {
-    handles: std::sync::Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<()>>>>,
-}
-
-#[cfg(feature = "parallel")]
-impl Drop for Joiner {
-    fn drop(&mut self) {
-        let handles = match self.handles.lock() {
-            Ok(mut guard) => std::mem::take(&mut *guard),
-            Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
-        };
-        let me = std::thread::current().id();
-        // A worker of this pool cannot join itself: skip joining entirely.
-        if handles.iter().any(|h| h.thread().id() == me) {
-            return;
-        }
-        for handle in handles {
-            // A worker that panicked has still exited; nothing to report.
-            let _ = handle.join();
+        #[cfg(feature = "parallel")]
+        {
+            // Detach every worker, then wait for their acknowledgements: after
+            // its acknowledgement a worker touches nothing of this pool. A
+            // worker of this pool that drops it (its own task owned the pool)
+            // acknowledges once that task returns; nobody waits for it.
+            for s in &*self.awake.slots {
+                s.state.detach();
+                s.park.wake();
+            }
+            let me = self.awake.slot_of_current();
+            for (i, s) in self.awake.slots.iter().enumerate() {
+                // A worker that has not attached yet (a dedicated one still in
+                // its start hook) attaches, sees `DETACH` and acknowledges too.
+                if Some(i) == me {
+                    continue;
+                }
+                self.awake
+                    .waits
+                    .sync
+                    .park_while(|| !s.acked.load(Ordering::SeqCst));
+            }
+            let joins = std::mem::take(&mut *self.joins.lock().unwrap_or_else(|e| e.into_inner()));
+            let my_thread = std::thread::current().id();
+            for j in joins {
+                if j.thread().id() != my_thread {
+                    // A worker that panicked has still exited.
+                    let _ = j.join();
+                }
+            }
+            drop(core::mem::take(&mut self.workers));
         }
     }
 }
@@ -373,10 +395,9 @@ impl PoolBuilder {
         self
     }
 
-    /// Default spin time of an unreserved idle team member before it returns
-    /// its thread to Rayon. Defaults to 200 ms; zero returns it immediately.
-    /// The member also returns once it has polled for the pool's spin budget
-    /// ([`spin_polls`](Self::spin_polls)), whichever comes first.
+    /// Default idle spin of an unreserved team member before it sleeps.
+    /// Defaults to 200 ms; zero puts it to sleep immediately. Any nonzero value
+    /// lets it spin for the pool's spin budget ([`spin_polls`](Self::spin_polls)).
     ///
     /// Operations may override it with [`WaitOverride`](crate::WaitOverride).
     /// A reserved member never leaves on a timeout.
@@ -396,11 +417,9 @@ impl PoolBuilder {
         self
     }
 
-    /// Default for whether unreserved idle members run Rayon jobs while they
-    /// spin. Defaults to `false`: native team execution keeps them for the
-    /// next reservation. `true` is the compatibility mode in which an idle
-    /// member serves Rayon work (an acquisition then refuses a member that is
-    /// inside such a job instead of waiting for it).
+    /// **No effect** since threadteam runs its own worker threads
+    /// (`docs/design/own-threads.md`): an idle worker always serves the pool's
+    /// queued tasks. Kept so that existing code compiles.
     ///
     /// # Examples
     ///
@@ -509,7 +528,8 @@ impl PoolBuilder {
     /// coordinating thread, so that thread must keep its CPU set.
     ///
     /// A member saves its previous mask in its own slot and restores it
-    /// *itself* before it stops being reserved: before it returns to Rayon, and
+    /// *itself* before it stops being reserved: before it serves the pool's
+    /// queue again, before it leaves the pool, and
     /// before its thread serves work that is not its team's — while it is lent
     /// by [`Exec::external`](crate::Exec::external), and when it runs such work
     /// itself (a member that leads a `fork` child and calls `external`). No
@@ -574,10 +594,8 @@ impl PoolBuilder {
     /// and then sleeps until woken (`docs/design/waiting.md`; the shape of
     /// libgomp's `GOMP_SPINCOUNT`). A count, so a waiter that is descheduled
     /// does not spend it while it waits for its CPU. Zero sleeps after the
-    /// yields. An oversubscribed scope, or a pool whose waiters were recently
-    /// descheduled, uses at most 100 polls. It also bounds how long an idle
-    /// member released by a team keeps polling before it returns to Rayon,
-    /// together with [`idle_spin`](Self::idle_spin).
+    /// yields. An oversubscribed scope uses at most 100 polls. It also bounds
+    /// how long an idle worker keeps polling before it sleeps.
     ///
     /// # Examples
     ///
@@ -621,61 +639,50 @@ impl PoolBuilder {
         let n = self
             .threads
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
-        let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let sink = std::sync::Arc::clone(&handles);
-        let qos = self.qos.or(Qos::PLATFORM_DEFAULT);
-        let mut builder = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .stack_size(self.stack_size)
-            .spawn_handler(move |thread| {
-                let mut b = std::thread::Builder::new();
-                if let Some(name) = thread.name() {
-                    b = b.name(name.to_owned());
-                }
-                if let Some(size) = thread.stack_size() {
-                    b = b.stack_size(size);
-                }
-                let handle = b.spawn(move || {
-                    if let Some(q) = qos {
-                        q.apply_to_current_thread();
-                    }
-                    thread.run()
-                })?;
-                match sink.lock() {
-                    Ok(mut guard) => guard.push(handle),
-                    Err(poisoned) => poisoned.into_inner().push(handle),
-                }
-                Ok(())
-            });
-        if let Some(name) = self.thread_name {
-            builder = builder.thread_name(name);
-        }
-        if let Some(hook) = self.on_start {
-            builder = builder.start_handler(hook);
-        }
-        // On failure `builder` drops its handler, but threads already started
-        // are signalled by rayon and detached; join them here for determinism.
-        let built = builder.build();
-        let inner = match built {
-            Ok(inner) => inner,
-            Err(e) => {
-                drop(Joiner { handles });
-                return Err(Error::PoolBuild(e.to_string()));
-            }
+        // Workers of the reserve have the default stack, the platform's QoS
+        // and no hooks; any other setting gets dedicated workers.
+        let shared = self.thread_name.is_none()
+            && self.on_start.is_none()
+            && self.stack_size == DEFAULT_STACK_BYTES
+            && self.qos.is_none();
+        let on_start: Option<Arc<dyn Fn(usize) + Send + Sync>> = self.on_start.map(Arc::from);
+        let how = crate::worker::Spawn {
+            stack: self.stack_size,
+            name: self.thread_name.as_deref(),
+            on_start,
+            qos: self.qos,
+            shared,
         };
-        let width = NonZeroUsize::new(inner.current_num_threads()).unwrap_or(NonZeroUsize::MIN);
+        let (workers, joins) =
+            crate::worker::obtain(n, &how).map_err(|e| Error::PoolBuild(e.to_string()))?;
+        let width = NonZeroUsize::new(n).unwrap_or(NonZeroUsize::MIN);
+        let awake = Arc::new(Awake::new(
+            width.get(),
+            self.wait,
+            self.acquire_timeout,
+            self.costs,
+            self.pin_participants,
+            self.spin_polls,
+        ));
+        // A worker takes the caller's CPU set, as a thread it spawned would.
+        let mask = crate::pin::read_here();
+        for (id, w) in workers.iter().enumerate() {
+            w.assign(crate::worker::Lease {
+                aw: Arc::clone(&awake),
+                id,
+                mask,
+            });
+        }
+        // Workers attach on their own (after a start hook, for dedicated
+        // ones); until then a slot is not claimable by a team, and queued work
+        // waits for them.
         Ok(Pool {
-            inner,
-            _joiner: Joiner { handles },
+            workers,
+            joins: std::sync::Mutex::new(joins),
             width,
-            awake: Arc::new(Awake::new(
-                width.get(),
-                self.wait,
-                self.acquire_timeout,
-                self.costs,
-                self.pin_participants,
-                self.spin_polls,
-            )),
+            awake,
+            #[cfg(feature = "rayon")]
+            rayon: std::sync::OnceLock::new(),
         })
     }
 
@@ -714,23 +721,83 @@ mod tests {
     use std::time::Duration;
 
     /// The last reference is dropped on a worker of the pool itself: the drop
-    /// must not wait for its own thread.
+    /// must not wait for its own thread (it detaches the others, waits for
+    /// their acknowledgements and skips itself; the worker acknowledges and
+    /// leaves after its task). Public entries always borrow the pool while
+    /// their tasks run, so the task here is published on the pool's queue
+    /// directly, as the Rayon version used `spawn`.
     #[test]
     fn drop_from_a_worker_of_the_pool_does_not_hang() {
-        let pool = Arc::new(Pool::builder().threads(2).build().unwrap());
-        let last = Arc::clone(&pool);
-        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        for shared in [true, false] {
+            let mut b = Pool::builder().threads(2);
+            if !shared {
+                b = b.thread_name(|i| format!("self-drop-{i}"));
+            }
+            let pool = Arc::new(b.build().unwrap());
+            let aw = Arc::clone(&pool.awake);
+            let last = std::sync::Mutex::new(Some(Arc::clone(&pool)));
+            let task = |_: usize| {
+                // The last reference: runs `Pool::drop` on this worker.
+                drop(last.lock().unwrap().take());
+            };
+            unsafe fn call<F: Fn(usize)>(data: *const (), i: usize) {
+                (*data.cast::<F>())(i)
+            }
+            fn call_of<F: Fn(usize)>(_: &F) -> unsafe fn(*const (), usize) {
+                call::<F>
+            }
+            // SAFETY: `task` and the waker (held by `aw`) outlive the batch,
+            // which this test waits for before they go out of scope.
+            let batch = unsafe {
+                crate::park::Batch::new(
+                    call_of(&task),
+                    (&task as *const _ as *const ()).cast(),
+                    1,
+                    &aw.waits.sync,
+                )
+            };
+            aw.queue.publish(&batch);
+            aw.wake_for_work();
+            drop(pool);
+            let (tx, rx) = mpsc::channel::<()>();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let mut w = crate::park::Waiter::new(0);
+                    batch.done.wait(Some(&aw.waits.sync), &mut w);
+                    tx.send(()).unwrap();
+                });
+                rx.recv_timeout(Duration::from_secs(10))
+                    .expect("drop on a worker hung");
+            });
+            assert!(
+                last.lock().unwrap().is_none(),
+                "the pool was dropped by its worker"
+            );
+        }
+    }
+
+    /// A pool built, used and dropped inside a task of another pool: the drop
+    /// waits for the inner pool's workers only, never for the outer worker it
+    /// runs on (a pool cannot be dropped from one of its own workers: every
+    /// task's caller borrows the pool).
+    #[test]
+    fn a_pool_dropped_inside_a_task_of_another_pool_does_not_hang() {
+        let outer = Pool::builder().threads(2).build().unwrap();
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        pool.inner.spawn(move || {
-            gate_rx.recv().unwrap();
-            drop(last); // the last reference: runs `Pool::drop` on this worker
-            done_tx.send(()).unwrap();
+        let done_tx = std::sync::Mutex::new(Some(done_tx));
+        crate::Exec::new(&outer, 2).unwrap().fork(2, |i, _| {
+            if i == 0 {
+                let inner = Arc::new(Pool::builder().threads(2).build().unwrap());
+                crate::Exec::new(&inner, 2).unwrap().fork(2, |_, _| {});
+                drop(inner);
+                if let Some(tx) = done_tx.lock().unwrap().take() {
+                    tx.send(()).unwrap();
+                }
+            }
         });
-        drop(pool);
-        gate_tx.send(()).unwrap();
         done_rx
             .recv_timeout(Duration::from_secs(10))
-            .expect("drop on a worker hung");
+            .expect("a drop inside another pool's task hung");
     }
 }
 

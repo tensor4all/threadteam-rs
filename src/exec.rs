@@ -637,9 +637,10 @@ impl<'p> Exec<'p> {
     /// This is the only place a bare width exists. The token is consumed, the
     /// pool is entered once (inline when the token is serial, has a budget of
     /// one, or the caller already is a worker of the pool) and `f` receives the
-    /// budget, for example to build `faer::Par::rayon(width)` or to set a vendor
-    /// BLAS thread count. Whatever the library schedules with that width runs on
-    /// this pool, never on an ambient one. How the library divides the width is
+    /// budget, for example to set a vendor BLAS thread count. The callback runs
+    /// on a worker of this pool (inline when the caller is one); a library that
+    /// schedules with Rayon needs `external_rayon`
+    /// (feature `rayon`) instead. How the library divides the width is
     /// its own responsibility. Without the `parallel` feature, `f` runs inline
     /// and receives a width of one.
     ///
@@ -667,7 +668,7 @@ impl<'p> Exec<'p> {
                 let width = self.budget;
                 let _released = self.track.release();
                 // A team token lends its reserved members to the pool for the
-                // call: the library's Rayon work runs on them as well.
+                // call: tasks the callback queues on this pool run on them too.
                 let _lent = self.team.map(|t| LendGuard::new(t.awake, t.ids));
                 // The calling thread may itself be a pinned participant of this
                 // pool (the member that leads a `fork` child, or a token used
@@ -680,20 +681,48 @@ impl<'p> Exec<'p> {
         f(NonZeroUsize::MIN)
     }
 
+    /// Runs `f(width)` inside a private Rayon pool of this pool's width, so that
+    /// a callback whose library parallelizes with Rayon (`rayon::join`,
+    /// parallel iterators) gets `width` threads without starting Rayon's
+    /// process-global pool. The opt-in Rayon interop layer (feature `rayon`;
+    /// `docs/design/own-threads.md`): the Rayon pool's threads are separate
+    /// from this pool's workers, built once per pool when first needed.
+    /// A serial or budget-one token calls `f(1)` inline.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # #[cfg(feature = "rayon")] {
+    /// let pool = threadteam::Pool::builder().threads(2).build().unwrap();
+    /// let w = threadteam::Exec::new(&pool, 2).unwrap().external_rayon(|w| w.get());
+    /// assert_eq!(w, 2);
+    /// # }
+    /// ```
+    #[cfg(feature = "rayon")]
+    pub fn external_rayon<R: Send>(self, f: impl FnOnce(NonZeroUsize) -> R + Send) -> R {
+        match self.pool {
+            Some(pool) if self.budget.get() > 1 => {
+                let width = self.budget;
+                let _released = self.track.release();
+                pool.rayon().install(move || f(width))
+            }
+            _ => f(NonZeroUsize::MIN),
+        }
+    }
+
     /// Reserves `budget - 1` pool members for the scope of `f` and hands `f`
     /// the exclusive [`TeamExec`] authority over them and the calling thread.
     ///
     /// The calling thread is participant 0 (the leader); the members are
-    /// pool workers that stay reserved, spinning and serving no Rayon job,
+    /// pool workers that stay reserved, spinning and serving no other task,
     /// until `f` returns (or unwinds). A serial or budget-one token yields a
     /// team of one without touching the pool.
     ///
-    /// Acquisition never waits for a Rayon job that is already running. Idle
-    /// members of an earlier team (see [`WaitPolicy`]) are claimed with a
-    /// compare-and-swap; missing ones are requested from the pool, and the
-    /// call waits at most the pool's acquisition timeout
+    /// Acquisition never takes a worker that runs a task: free workers are
+    /// claimed with a compare-and-swap, and the call waits at most the pool's
+    /// acquisition timeout
     /// ([`PoolBuilder::acquire_timeout`](crate::PoolBuilder::acquire_timeout))
-    /// for idle workers to wake. If not all members are there by then, every
+    /// for busy ones to become free. If not all members are there by then, every
     /// tentative claim is released and nothing runs. Before `f` is called,
     /// every participant has acknowledged on its own thread.
     ///

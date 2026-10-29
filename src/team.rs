@@ -83,12 +83,11 @@ impl Participant<'_> {
 ///   reserved member waiting for work, the leader in a section's join, and a
 ///   participant in a barrier spin with one PAUSE per poll for the pool's spin
 ///   budget ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)), yield
-///   a few times, then sleep until woken. Members run no unrelated Rayon job and
+///   a few times, then sleep until woken. Members run no unrelated task and
 ///   do not leave on a timeout, also between sections and during a long serial
 ///   phase of the leader; they are returned when the scope ends. In a root scope
-///   with more participants than CPUs in the caller's affinity mask, or in a
-///   pool whose waiters were recently descheduled, the spin is throttled to 100
-///   polls, so waiters free their CPUs quickly.
+///   with more participants than CPUs in the caller's affinity mask, the spin
+///   is throttled to 100 polls, so waiters free their CPUs quickly.
 /// * If the pool pins members
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
@@ -297,7 +296,7 @@ impl<'team> TeamExec<'team> {
     /// The same authority with `over` applied to the scoped policy.
     ///
     /// Children inherit the effective policy. An override never weakens a
-    /// reservation: members stay reserved and run no unrelated Rayon job
+    /// reservation: members stay reserved and run no unrelated task
     /// whatever the policy says. The policy of the *root* reservation governs
     /// the idle interval after it ends; a child's override expires when the
     /// child returns and cannot release the parent's members.

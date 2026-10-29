@@ -10,7 +10,7 @@ use crate::track::Track;
 /// Whether the calling thread is a worker of `pool`.
 #[cfg(feature = "parallel")]
 pub(crate) fn in_pool(pool: &Pool) -> bool {
-    pool.inner.current_thread_index().is_some()
+    pool.awake.slot_of_current().is_some()
 }
 
 #[cfg(not(feature = "parallel"))]
@@ -31,42 +31,108 @@ pub(crate) fn in_pool(_pool: &Pool) -> bool {
 /// re-pins at the next pin section.
 #[cfg(feature = "parallel")]
 pub(crate) fn unpin_worker(pool: &Pool) {
-    if let Some(worker) = pool.inner.current_thread_index() {
+    if let Some(worker) = pool.awake.slot_of_current() {
         pool.awake.unpin_member(worker);
     }
 }
 
-/// Runs `task(0..tasks)` concurrently on `pool` and waits for all of them.
-///
-/// The tasks form a recursive binary `rayon::join` tree, whose jobs live on the
-/// stack, so a steady-state call allocates nothing.
-///
-/// * Caller is a worker of `pool`: the tree runs directly on the caller.
-///   Nothing is installed.
-/// * Caller is a plain thread or a worker of another pool: one
-///   `ThreadPool::install` (a stack job) around the tree; every task runs on a
-///   worker of `pool` and the caller waits.
-///
-/// `rayon::join` is only reached on a worker of `pool` (inside `install`, or
-/// when the caller already is one), so it never touches the global registry.
+/// Who waits for a batch of `pool`, and how (`docs/design/own-threads.md`).
 #[cfg(feature = "parallel")]
-pub(crate) fn run_tasks<F: Fn(usize) + Sync>(pool: &Pool, tasks: usize, track: &Track, task: F) {
-    if in_pool(pool) {
-        join_tree(0, tasks, &task);
+enum Waiter {
+    /// A worker of `pool` itself (slot index): it runs its own batch's tasks
+    /// first, then serves the pool while it waits.
+    Own(usize),
+    /// A worker of another pool: it serves its own pool while it waits, so a
+    /// cross-pool chain (A -> B -> A) always makes progress.
+    Foreign(std::sync::Arc<crate::awake::Awake>, usize),
+    /// A plain thread: it sleeps on the pool's parker.
+    Outside,
+}
+
+#[cfg(feature = "parallel")]
+fn waiter_of(pool: &Pool) -> Waiter {
+    if let Some(i) = pool.awake.slot_of_current() {
+        Waiter::Own(i)
+    } else if let Some((aw, i)) = crate::worker::current_worker() {
+        Waiter::Foreign(aw, i)
     } else {
-        track.note_install();
-        pool.inner.install(|| join_tree(0, tasks, &task));
+        Waiter::Outside
     }
 }
 
-/// Runs `task(lo..hi)` as a balanced join tree. Must run on a pool worker.
 #[cfg(feature = "parallel")]
-fn join_tree<F: Fn(usize) + Sync>(lo: usize, hi: usize, task: &F) {
-    if hi - lo == 1 {
-        task(lo);
-    } else {
-        let mid = lo + (hi - lo) / 2;
-        rayon::join(|| join_tree(lo, mid, task), || join_tree(mid, hi, task));
+impl Waiter {
+    /// The parker the last completion wakes.
+    fn parker<'a>(&'a self, pool: &'a Pool) -> &'a std::sync::Arc<crate::park::Parker> {
+        match self {
+            Waiter::Own(i) => &pool.awake.slots[*i].park,
+            Waiter::Foreign(aw, i) => &aw.slots[*i].park,
+            Waiter::Outside => &pool.awake.waits.sync,
+        }
+    }
+
+    /// Waits until `done` holds.
+    fn wait(&self, pool: &Pool, done: &crate::park::Completion) {
+        match self {
+            Waiter::Own(i) => pool.awake.help_while(*i, || done.is_done_now()),
+            Waiter::Foreign(aw, i) => aw.help_while(*i, || done.is_done_now()),
+            Waiter::Outside => {
+                let mut w = crate::park::Waiter::new(pool.awake.waits.spin_polls);
+                done.wait(Some(&pool.awake.waits.sync), &mut w);
+            }
+        }
+    }
+}
+
+/// Runs `task(0..tasks)` on `pool` and waits for all of them.
+///
+/// The tasks form one batch on the caller's stack, published on the pool's
+/// queue, so a steady-state call allocates nothing.
+///
+/// * Caller is a worker of `pool`: it runs the batch's unclaimed tasks itself,
+///   then serves the pool until the others finish.
+/// * Caller is a worker of another pool: the pool's workers run the tasks; the
+///   caller serves its own pool meanwhile.
+/// * Caller is a plain thread: every task runs on a worker of `pool` and the
+///   caller sleeps until the last one finishes.
+///
+/// A panicking task does not stop the others; the first panic is resumed once
+/// all of them finished.
+#[cfg(feature = "parallel")]
+pub(crate) fn run_tasks<F: Fn(usize) + Sync>(pool: &Pool, tasks: usize, track: &Track, task: F) {
+    if tasks == 0 {
+        return;
+    }
+    unsafe fn call<F: Fn(usize)>(data: *const (), i: usize) {
+        // SAFETY: `data` is the `&F` of `run_tasks`, alive until the batch is done.
+        (*data.cast::<F>())(i)
+    }
+    let waiter = waiter_of(pool);
+    if !matches!(waiter, Waiter::Own(_)) {
+        track.note_install();
+    }
+    // SAFETY: `call::<F>` and `task` belong together; both outlive the batch,
+    // which this function waits for; the waker is kept alive by `waiter` (or
+    // the pool) until the wait below returns.
+    let batch = unsafe {
+        crate::park::Batch::new(
+            call::<F>,
+            (&task as *const F).cast(),
+            tasks,
+            waiter.parker(pool),
+        )
+    };
+    pool.awake.queue.publish(&batch);
+    pool.awake.wake_for_work();
+    if let Waiter::Own(_) = waiter {
+        while let Some(k) = pool.awake.queue.claim_own(&batch) {
+            // SAFETY: index `k` of our own batch was claimed here.
+            unsafe { crate::park::Batch::run_claimed(&batch, k) };
+        }
+    }
+    waiter.wait(pool, &batch.done);
+    if let Some(payload) = batch.take_panic() {
+        std::panic::resume_unwind(payload);
     }
 }
 
@@ -77,32 +143,57 @@ pub(crate) fn run_tasks<F: Fn(usize) + Sync>(_pool: &Pool, tasks: usize, _track:
     }
 }
 
-/// Runs `f` on a worker of `pool`, installing only when the caller is not one.
+/// Runs `f` on a worker of `pool`: inline when the caller is one, otherwise as
+/// a one-task batch while the caller waits.
 #[cfg(feature = "parallel")]
 pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R + Send) -> R {
     if in_pool(pool) {
-        f()
-    } else {
-        track.note_install();
-        pool.inner.install(f)
+        return f();
     }
-}
-
-/// Runs `f(i)` for every worker index `i < budget` at once, or reports that the
-/// caller already is a worker of `pool`.
-#[cfg(feature = "parallel")]
-pub(crate) fn broadcast(pool: &Pool, track: &Track, budget: usize, f: impl Fn(usize) + Sync) {
-    // No gate is needed: rayon pushes the per-worker jobs of one broadcast
-    // under a single lock, so every worker sees concurrent broadcasts in the
-    // same order and two of them cannot each hold part of the workers. A gate
-    // would deadlock a foreign-pool caller that steals a second broadcast onto
-    // its own stack while waiting.
-    track.note_install();
-    pool.inner.broadcast(|ctx| {
-        let i = ctx.index();
-        if i < budget {
-            let _live = track.task();
-            f(i);
+    let job = std::sync::Mutex::new(Some(f));
+    let out = std::sync::Mutex::new(None);
+    run_tasks(pool, 1, track, |_| {
+        let f = job.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(f) = f {
+            let r = f();
+            *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
         }
     });
+    let r = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    r.expect("the task ran")
+}
+
+/// Runs `f(i)` for every worker index `i < budget` at once, each on worker
+/// `i` of `pool`. The caller is never a worker of `pool` (`Exec::broadcast`
+/// refuses that); it waits, serving its own pool if it is a worker of one.
+#[cfg(feature = "parallel")]
+pub(crate) fn broadcast(pool: &Pool, track: &Track, budget: usize, f: impl Fn(usize) + Sync) {
+    track.note_install();
+    let task = |i: usize| {
+        let _live = track.task();
+        f(i);
+    };
+    unsafe fn call<F: Fn(usize)>(data: *const (), i: usize) {
+        // SAFETY: `data` is the `&F` of `broadcast`, alive until it is done.
+        (*data.cast::<F>())(i)
+    }
+    fn data_of<F>(f: &F) -> *const () {
+        (f as *const F).cast()
+    }
+    fn call_of<F: Fn(usize)>(_: &F) -> unsafe fn(*const (), usize) {
+        call::<F>
+    }
+    let waiter = waiter_of(pool);
+    // SAFETY: as in `run_tasks`; the broadcast is unlinked below, after all of
+    // its shares completed and before it goes out of scope.
+    let b = unsafe {
+        crate::park::Broadcast::new(call_of(&task), data_of(&task), budget, waiter.parker(pool))
+    };
+    pool.awake.bcast.publish(&b);
+    pool.awake.wake_for_work();
+    waiter.wait(pool, &b.done);
+    pool.awake.bcast.unlink(&b);
+    if let Some(payload) = b.take_panic() {
+        std::panic::resume_unwind(payload);
+    }
 }

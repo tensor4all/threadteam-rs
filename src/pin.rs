@@ -126,6 +126,11 @@ impl SavedMask {
         }
     }
 
+    /// Whether a pin is still in effect (a restore failed or is pending).
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pinned.load(Ordering::Relaxed)
+    }
+
     /// Restores the saved mask on the calling thread, if this member is pinned.
     ///
     /// Best effort: when the kernel refuses the saved mask (a cpuset changed

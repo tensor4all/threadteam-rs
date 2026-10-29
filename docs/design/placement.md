@@ -6,6 +6,14 @@ cpueinsum-rs, tlinalg-rs and tenferro-rs; the cross-repository rules are in
 tensor4all/tensor4all-meta#41 (`docs/design/core-boundary-and-execution-ownership.md`,
 "Where placement is decided").
 
+
+> **Workers (2026-10-30).** threadteam no longer runs on a private Rayon pool.
+> Its workers are its own threads, leased from a process-wide reserve; see
+> [`own-threads.md`](own-threads.md). Where this record describes Rayon jobs,
+> installs or claim jobs, read the native queue, the cooperative waits and the
+> compare-and-swap reservation described there. The token contracts here are
+> unchanged.
+
 ## Problem
 
 The CPU stack places work with **four** mechanisms at once:

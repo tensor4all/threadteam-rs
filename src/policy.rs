@@ -4,24 +4,19 @@ use core::time::Duration;
 
 /// How an idle member behaves after its reservation ended.
 ///
-/// A member that is *reserved* neither runs unrelated Rayon jobs nor leaves
+/// A member that is *reserved* neither runs unrelated tasks nor leaves
 /// on a timeout, whatever the policy says: a policy only governs the idle
 /// interval after the root reservation of a team ends. The interval is
 /// measured from that moment, not from the last time the member computed.
 ///
-/// * `idle_spin`: how long an idle member keeps spinning, ready to be claimed
-///   again without a Rayon wake-up, before it returns its thread to Rayon.
-///   Zero returns it immediately. The pool's spin budget of polls
-///   ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)) bounds it
-///   too, whichever ends first.
-/// * `idle_runs_rayon`: whether the spinning member runs queued Rayon jobs in
-///   the meantime. When it does, a job it picked up runs to completion
-///   (including nested work) before the member is claimable again, and an
-///   acquisition that finds the member in such a job refuses instead of
-///   waiting for it.
-///
-/// While a member spins with `idle_runs_rayon == false`, its thread serves no
-/// Rayon job of the pool for up to `idle_spin`.
+/// * `idle_spin`: whether an idle member keeps spinning, ready to be claimed
+///   again without a wake-up, before it sleeps. Zero puts it to sleep at once;
+///   any other value lets it spin for the pool's spin budget of polls
+///   ([`PoolBuilder::spin_polls`](crate::PoolBuilder::spin_polls)).
+/// * `idle_runs_rayon`: **no effect** since threadteam runs its own worker
+///   threads (`docs/design/own-threads.md`): an idle worker always serves the
+///   pool's queued tasks, and a worker that runs one is not claimable until it
+///   finishes. Kept so that existing code compiles.
 ///
 /// # Examples
 ///
@@ -44,7 +39,7 @@ pub struct WaitPolicy {
 }
 
 impl WaitPolicy {
-    /// The pool default: spin for 200 ms, run no Rayon jobs while idle.
+    /// The pool default: an idle spin of 200 ms (bounded by the spin budget).
     pub const DEFAULT: WaitPolicy = WaitPolicy {
         idle_spin: Duration::from_millis(200),
         idle_runs_rayon: false,
@@ -58,12 +53,12 @@ impl WaitPolicy {
         }
     }
 
-    /// Spin time of an unreserved idle member before it returns to Rayon.
+    /// Spin time of an unreserved idle member before it sleeps.
     pub const fn idle_spin(&self) -> Duration {
         self.idle_spin
     }
 
-    /// Whether an unreserved idle member runs Rayon jobs while it spins.
+    /// The `idle_runs_rayon` setting (no effect; see [`WaitPolicy`]).
     pub const fn idle_runs_rayon(&self) -> bool {
         self.idle_runs_rayon
     }
@@ -122,7 +117,7 @@ impl WaitOverride {
         self
     }
 
-    /// Overrides whether idle members run Rayon jobs.
+    /// Overrides `idle_runs_rayon` (no effect; see [`WaitPolicy`]).
     #[must_use]
     pub const fn idle_runs_rayon(mut self, on: bool) -> Self {
         self.idle_runs_rayon = Some(on);

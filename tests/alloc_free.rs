@@ -37,15 +37,21 @@ fn entries(pool: &Pool) {
     });
     let w = Exec::new(pool, 3).unwrap().external(|w| w.get());
     assert_eq!(w, 3);
+    if !threadteam::Exec::new(pool, 3).unwrap().can_broadcast() {
+        return;
+    }
+    Exec::new(pool, 3)
+        .unwrap()
+        .broadcast(|i| {
+            sink.fetch_add(i, Ordering::Relaxed);
+        })
+        .unwrap();
     assert!(sink.load(Ordering::Relaxed) > 0);
 }
 
-/// Smallest allocation count over `rounds` windows of one call each, after warm-up.
-///
-/// From a plain thread every entry pushes one job into rayon's injector queue,
-/// whose block allocation (one per 31 pushes) is amortized and outside this
-/// crate; a per-call allocation shows up in every window, so the minimum
-/// separates the two.
+/// Largest allocation count over `rounds` windows of one call each, after
+/// warm-up: strict, every window counts (the native scheduler publishes stack
+/// batches, so there is no amortized queue allocation to tolerate).
 fn measure(rounds: usize, f: impl Fn()) -> usize {
     for _ in 0..20 {
         f();
@@ -56,7 +62,7 @@ fn measure(rounds: usize, f: impl Fn()) -> usize {
             f();
             ALLOCS.load(Ordering::SeqCst) - before
         })
-        .min()
+        .max()
         .unwrap_or(0)
 }
 
@@ -66,6 +72,18 @@ fn fork_for_ranges_external_do_not_allocate() {
     let pool = Pool::builder().threads(3).build().unwrap();
     let plain = measure(10, || entries(&pool));
     assert_eq!(plain, 0, "plain-thread entries allocated");
+    // The same after the workers went to sleep: waking them allocates nothing.
+    let asleep = measure(5, || {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let before = ALLOCS.load(Ordering::SeqCst);
+        entries(&pool);
+        assert_eq!(
+            ALLOCS.load(Ordering::SeqCst) - before,
+            0,
+            "entries after a park allocated"
+        );
+    });
+    let _ = asleep;
 
     // Inside the pool: a worker of `pool` enters again, which installs nothing,
     // so every window is strict.

@@ -124,6 +124,31 @@ a test binary that runs serial and pooled work and then checks
 `ledger::global_pool_unstarted()` (with the `rayon` feature it checks that Rayon's
 process-global pool was never started).
 
+## Upgrading from 0.1
+
+0.2 runs entries on threadteam's own worker threads instead of a private Rayon
+pool (`docs/design/own-threads.md`). The signatures are those of 0.1 plus
+`PoolBuilder::spin_polls` / `Pool::spin_polls`; the behaviour changes are:
+
+* **Pool drop.** A pool with default thread settings leases *shared* workers
+  from a process-wide reserve; dropping it waits until every worker detached
+  and returns them to the reserve, asleep, instead of joining them. A pool with
+  a `thread_name`, an `on_start` hook, a stack size or a QoS of its own still
+  gets dedicated workers that its drop joins (their thread-local destructors
+  have run when `drop` returns).
+* **`external` on a team token** lends the members to the pool's own queue. It
+  no longer runs the callback inside a Rayon pool: Rayon calls in the callback
+  go to Rayon's global pool. Code that relied on the old behaviour enables the
+  `rayon` feature and calls `Exec::external_rayon`.
+* **`parallel` pulls no Rayon.** Rayon is a dependency only with the `rayon`
+  feature.
+* **`idle_runs_rayon`** has no effect: an idle worker always serves the pool's
+  queue. It is kept so that callers compile.
+* **Waits** follow libgomp (`docs/design/waiting.md`): a bounded spin of
+  `spin_polls` polls (by default 300000 on x86-64, 2^21 on aarch64), 16
+  yields, then sleep. `idle_spin`, `release_idle` and `resident_members` keep
+  their meaning on the native loop.
+
 ## Wait benchmarks
 
 `benches/wait_scenarios.rs` measures how team threads wait, the way callers use them; the design

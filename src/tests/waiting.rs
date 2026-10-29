@@ -134,3 +134,17 @@ fn by_default_a_preemption_sets_no_per_thread_deadline() {
         "no lasting per-thread deadline"
     );
 }
+
+#[test]
+fn with_detection_off_a_descheduled_spinner_keeps_spinning() {
+    // A preemption gap of zero: no clock-based detection at all (libgomp's
+    // waits); the spin runs its whole budget whatever the scheduler did.
+    let p = Pressure::new().with_gap(0);
+    let mut w = Waiter::new(1_000, Some(&p));
+    for _ in 0..64 {
+        assert_eq!(w.step(), Step::Poll);
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    assert_eq!(polls_until_sleep(&mut w), 1_000 - 64 + 16);
+    assert_eq!(p.events(), 0);
+}

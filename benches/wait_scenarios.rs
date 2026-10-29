@@ -33,7 +33,9 @@
 //! version only, `docs/design/waiting.md`): `--spin-polls N`, `--throttled-polls N`,
 //! `--pressure-hold-ms N` (0 throttles only the waiter that saw a preemption),
 //! `--pressure-events N` (preemptions within the hold that throttle the pool; 0 never),
-//! `--own-hold-ms N` (how long a preemption throttles the member that saw it; default 0). Under each
+//! `--own-hold-ms N` (how long a preemption throttles the member that saw it; default 0),
+//! `--preempt-gap-us N` (the gap that counts as a preemption; default 200; 0 turns detection
+//! and every throttle off, as libgomp). Under each
 //! threadteam row a `waits per call` line counts join and barrier sleeps, member parks and the
 //! preemptions waiters saw.
 
@@ -137,14 +139,21 @@ fn stats(mut v: Vec<f64>) -> Stats {
 
 /// Pool settings from the command line (`--spin-polls`, `--throttled-polls`,
 /// `--pressure-hold-ms`); `None` keeps the library default.
-type Tuning = (Option<u32>, Option<(u32, Duration, u32, Duration)>);
+type Tuning = (
+    Option<u32>,
+    Option<(u32, Duration, u32, Duration)>,
+    Option<Duration>,
+);
 static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
 
 fn pool(width: usize) -> Pool {
     let mut b = Pool::builder()
         .threads(width)
         .acquire_timeout(Duration::from_secs(30));
-    if let Some((spin, throttle)) = TUNING.get() {
+    if let Some((spin, throttle, gap)) = TUNING.get() {
+        if let Some(g) = gap {
+            b = b.preempt_gap(*g);
+        }
         if let Some(n) = spin {
             b = b.spin_polls(*n);
         }
@@ -359,7 +368,9 @@ fn main() {
             Duration::from_millis(o.map_or(0, |v| v.parse().expect("--own-hold-ms"))),
         )),
     };
-    TUNING.get_or_init(|| (spin, throttle));
+    let gap = value("--preempt-gap-us")
+        .map(|v| Duration::from_micros(v.parse().expect("--preempt-gap-us")));
+    TUNING.get_or_init(|| (spin, throttle, gap));
     let load_text = load_spec.map_or("none".into(), |(k, p)| format!("{k}x{p}%"));
 
     let csv = value("--csv").map(|path| {

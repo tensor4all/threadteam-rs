@@ -32,19 +32,17 @@ const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 const PIN_PARTICIPANTS_DEFAULT: bool = false;
 
 /// Default spin budget of a wait, in polls (one PAUSE, or YIELD on aarch64,
-/// per poll); see `docs/design/waiting.md`. On x86-64 a poll measured about
-/// 24 ns on Zen 3 (EPYC 7713P), so 131072 polls are about 3 ms there, the order
-/// of libgomp's default (300000 polls, "about 3 ms"), and longer on CPUs whose
-/// PAUSE is slower (Skylake and later Intel cores: about 2x). A first default of
-/// 12288 polls (about 300 µs) made a team woken after a 1 ms or 10 ms gap 2.3x
-/// and 10.8x slower to start on a quiet host (evo), because its members had gone
-/// to sleep. On aarch64 a YIELD is much cheaper than a PAUSE; the larger default
-/// aims at the same order of time and is not measured yet. Under scheduling
-/// pressure the waits are throttled anyway (`crate::park::Pressure`).
+/// per poll); see `docs/design/waiting.md`. 300000 on x86-64, libgomp's default
+/// `GOMP_SPINCOUNT` ("about 3 ms"; about 7 ms at the 24 ns per poll measured on
+/// Zen 3, EPYC 7713P; longer on Intel cores whose PAUSE is slower). With it a
+/// team called again 10 ms later on a quiet host starts as fast as 0.1.3
+/// (evo); 12288 polls (about 300 µs) made that first section 10.8x slower,
+/// because the members had gone to sleep. On aarch64 a YIELD is much cheaper
+/// than a PAUSE; 2^21 aims at the same order of time and is not measured yet.
 const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
     1 << 21
 } else {
-    1 << 17
+    300_000
 };
 
 /// A fixed set of worker threads that [`Exec`](crate::Exec) tokens place work on.
@@ -294,6 +292,7 @@ pub struct PoolBuilder {
     pressure_hold: Duration,
     pressure_events: u32,
     own_hold: Duration,
+    preempt_gap: Duration,
 }
 
 impl PoolBuilder {
@@ -313,6 +312,7 @@ impl PoolBuilder {
             pressure_hold: Duration::from_nanos(crate::park::CONTENDED_HOLD_NS),
             pressure_events: crate::park::CONTENDED_EVENTS,
             own_hold: Duration::ZERO,
+            preempt_gap: Duration::from_nanos(crate::park::PREEMPT_GAP_NS),
         }
     }
 
@@ -627,6 +627,17 @@ impl PoolBuilder {
         self
     }
 
+    /// The gap between two clock reads of a spinning waiter that counts as a
+    /// preemption (default 200 µs), for the wait benchmarks only. Zero turns
+    /// the detection off: every wait then spins its full budget, yields and
+    /// sleeps, as libgomp's waits do. See `docs/design/waiting.md`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn preempt_gap(mut self, gap: Duration) -> Self {
+        self.preempt_gap = gap;
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -715,7 +726,8 @@ impl PoolBuilder {
                     u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
                     self.pressure_events,
                     u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
-                ),
+                )
+                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }
@@ -736,7 +748,8 @@ impl PoolBuilder {
                     u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
                     self.pressure_events,
                     u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
-                ),
+                )
+                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }

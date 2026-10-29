@@ -98,6 +98,15 @@ const fn to_ns(d: Duration) -> u64 {
 /// model it replaces was.
 #[inline]
 fn interpolate(c0: u64, c1: u64, w0: u16, w1: u16, w: usize) -> u64 {
+    // 64-bit fast path (a 128-bit division is a library call); the same
+    // truncating division, so the value is identical to the 128-bit one.
+    let dw = (w - usize::from(w0)) as i64;
+    if let (Ok(a), Ok(b)) = (i64::try_from(c0), i64::try_from(c1)) {
+        if let Some(t) = (b - a).checked_mul(dw) {
+            let v = a + t / i64::from(w1 - w0);
+            return if v < 0 { 0 } else { v as u64 };
+        }
+    }
     let (c0, c1) = (i128::from(c0), i128::from(c1));
     let v = c0 + (c1 - c0) * (w - usize::from(w0)) as i128 / i128::from(w1 - w0);
     if v < 0 {
@@ -204,8 +213,13 @@ impl WidthCosts {
             }
             i += 1;
         }
-        // Above the last anchor: at least linear in the width, saturating.
-        let v = u128::from(self.ns[len - 1]) * w as u128 / u128::from(self.widths[len - 1]);
+        // Above the last anchor: at least linear in the width, saturating
+        // (64-bit when the product fits, as above).
+        let (last, w_m) = (self.ns[len - 1], u64::from(self.widths[len - 1]));
+        if let Some(p) = last.checked_mul(w as u64) {
+            return p / w_m;
+        }
+        let v = u128::from(last) * w as u128 / u128::from(w_m);
         if v > u64::MAX as u128 {
             u64::MAX
         } else {
@@ -917,5 +931,23 @@ mod tests {
             1
         );
         assert_eq!(width_for_by(us(1_000_000), 1, nz(1), d).get(), 1);
+    }
+
+    #[test]
+    fn wide_values_take_the_128_bit_path_with_the_same_result() {
+        // Values whose products overflow 64 bits use the 128-bit fallback; it
+        // must give what the 128-bit formula gives.
+        let big = Duration::from_nanos(u64::MAX / 3);
+        let huge = Duration::from_nanos(u64::MAX / 2);
+        let c = WidthCosts::from_anchors(&[(2, big), (64, huge)]).unwrap();
+        let (c0, c1) = (i128::from(u64::MAX / 3), i128::from(u64::MAX / 2));
+        for w in [3usize, 17, 33, 63] {
+            let want = c0 + (c1 - c0) * (w as i128 - 2) / 62;
+            assert_eq!(u128::from(c.ns_at(nz(w))), want as u128, "width {w}");
+        }
+        // Above the last anchor the product saturates instead of wrapping.
+        assert_eq!(c.ns_at(nz(200)), u64::MAX);
+        let want = u128::from(u64::MAX / 2) * 100 / 64;
+        assert_eq!(u128::from(c.ns_at(nz(100))), want.min(u128::from(u64::MAX)));
     }
 }

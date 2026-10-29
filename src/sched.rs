@@ -18,6 +18,24 @@ pub(crate) fn in_pool(_pool: &Pool) -> bool {
     false
 }
 
+/// Restores the calling thread's own affinity mask when it is a reserved,
+/// pinned member of `pool`.
+///
+/// A participant can be the thread that runs work which is not its team's: the
+/// member that leads a `fork` child and calls
+/// [`Exec::external`](crate::Exec::external), or a token used from inside a
+/// share. Such a thread must not keep the team's single-CPU placement while it
+/// serves that work, and only it may change its own affinity, so it restores
+/// the mask it saved before pinning (see `pin::SavedMask`). A no-op when the
+/// calling thread is not a worker of `pool` or is not pinned; the member
+/// re-pins at the next pin section.
+#[cfg(feature = "parallel")]
+pub(crate) fn unpin_worker(pool: &Pool) {
+    if let Some(worker) = pool.inner.current_thread_index() {
+        pool.awake.unpin_member(worker);
+    }
+}
+
 /// Runs `task(0..tasks)` concurrently on `pool` and waits for all of them.
 ///
 /// The tasks form a recursive binary `rayon::join` tree, whose jobs live on the

@@ -80,4 +80,28 @@ fn fork_for_ranges_external_do_not_allocate() {
         0,
         "in-pool entries allocated"
     );
+
+    // Participant pinning on: the extra pin section a root team scope runs must
+    // not allocate either. The window contains the acquisition's id `Vec`, the
+    // one allocation of an acquisition documented in the design record, so it
+    // is compared against the same window with pinning off rather than
+    // against zero.
+    let team_scope_window = |pin: bool| {
+        let pool = Pool::builder()
+            .threads(3)
+            .pin_participants(pin)
+            .idle_spin(std::time::Duration::from_millis(1))
+            .acquire_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let scope = |pool: &Pool| {
+            let mut exec = Exec::new(pool, 3).unwrap();
+            let _live = exec.team(|mut team| team.reborrow().run(|_, _| {}));
+        };
+        measure(10, || scope(&pool))
+    };
+    let off = team_scope_window(false);
+    let on = team_scope_window(true);
+    assert!(off <= 1, "a team scope allocates at most the id Vec: {off}");
+    assert_eq!(on, off, "participant pinning added an allocation");
 }

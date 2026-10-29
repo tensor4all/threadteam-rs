@@ -1,6 +1,6 @@
 //! Reserved awake members: the scoped authority [`TeamExec`].
 
-use crate::awake::{Awake, JoinGuard, Section};
+use crate::awake::{Awake, Geometry, JoinGuard, Section};
 use crate::cost::{pays_at, width_for_by, DispatchCosts, DispatchKind};
 use crate::error::Error;
 use crate::policy::{WaitOverride, WaitPolicy};
@@ -79,10 +79,18 @@ impl Participant<'_> {
 ///   `budget - 1` pool workers. Before any section runs, every participant
 ///   acknowledged on its own thread (a rendezvous), so barriers inside
 ///   sections cannot deadlock for lack of threads.
-/// * Reserved members spin, then park once the park delay (`idle_spin`) has
-///   passed since their own last share; they run no unrelated Rayon job and do
-///   not leave on a timeout, also between sections and during a long serial
-///   phase of the leader. They are returned when the scope ends.
+/// * Reserved members spin with one PAUSE per poll, then park once the park
+///   delay (`idle_spin`) has passed since their own last share; they run no
+///   unrelated Rayon job and do not leave on a timeout, also between sections
+///   and during a long serial phase of the leader. They are returned when the
+///   scope ends. In a root scope with more participants than CPUs in the
+///   caller's affinity mask the delay is zero, so they park after a short spin
+///   instead of holding a CPU.
+/// * If the pool pins members
+///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
+///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
+///   the calling thread's set, and restores its own mask afterwards. The leader
+///   is never pinned.
 /// * A panic in any participant propagates to the leader after every
 ///   dispatched share has finished; the reservation is released.
 ///
@@ -180,6 +188,12 @@ pub struct TeamExec<'team> {
     pub(crate) ids: &'team [usize],
     pub(crate) policy: WaitPolicy,
     pub(crate) track: Track,
+    /// The root scope of this authority is oversubscribed: it has more
+    /// participants than the caller's CPU set has CPUs. Fixed at root-scope
+    /// entry, inherited by reborrows, splits and `fork` children, and put on
+    /// every [`Section`] so that nested sections of an oversubscribed root
+    /// know it too.
+    pub(crate) over: bool,
 }
 
 /// How the members of a split are divided.
@@ -318,6 +332,7 @@ impl<'team> TeamExec<'team> {
             ids: self.ids,
             policy: self.policy,
             track: self.track.alias(),
+            over: self.over,
         }
     }
 
@@ -364,6 +379,17 @@ impl<'team> TeamExec<'team> {
     where
         F: Fn(&Participant<'_>) + Sync,
     {
+        self.run_with_pin(f, false);
+    }
+
+    /// [`run_with`](Self::run_with), or the pin section of a root scope when
+    /// `pin` is set: the members save their own mask before their share runs
+    /// (see `member_loop`) and every member pins itself in the share. The
+    /// leader's share never pins.
+    pub(crate) fn run_with_pin<F>(self, f: F, pin: bool)
+    where
+        F: Fn(&Participant<'_>) + Sync,
+    {
         let track = &self.track;
         let _released = track.release();
         let body = |p: &Participant<'_>| {
@@ -371,7 +397,37 @@ impl<'team> TeamExec<'team> {
             f(p);
         };
         let ids = self.ids;
-        section(self.awake, &|pos| ids[pos], ids.len(), ids.len() + 1, &body);
+        let geometry = Geometry {
+            dispatched: ids.len(),
+            size: ids.len() + 1,
+            over: self.over,
+            pin,
+        };
+        section(self.awake, &|pos| ids[pos], &body, geometry);
+    }
+
+    /// Places every member on its own CPU of `set`: member `k` (participant
+    /// `k >= 1`) pins itself onto the `k`-th set CPU, wrapping modulo `|set|`.
+    /// The leader, participant 0, is **never pinned**: it keeps its own mask,
+    /// `set`, so a vendor team it creates inherits the caller's CPU set instead
+    /// of one CPU (see [`PoolBuilder::pin_participants`]). `set[0]` is therefore
+    /// left to the leader, without enforcing it.
+    ///
+    /// One section of the existing machinery, so all participants are on their
+    /// own threads; it also serves as the rendezvous that precedes any user
+    /// section. Each member changes its own affinity, and saves its previous
+    /// mask first (once per reservation). Best effort: an empty or refused set
+    /// leaves a member where it was.
+    pub(crate) fn pin_section(&mut self, set: &crate::pin::CpuMask) {
+        self.reborrow().run_with_pin(
+            |p| {
+                let _ = p.barrier();
+                if p.index() > 0 {
+                    crate::pin::pin_to(set, p.index());
+                }
+            },
+            true,
+        );
     }
 
     /// Divides the team into child reservations of the given sizes.
@@ -461,14 +517,15 @@ impl<'team> TeamExec<'team> {
     {
         let track = &self.track;
         let _released = track.release();
-        let (awake, ids, policy) = (self.awake, self.ids, self.policy);
-        split_raw(awake, ids, plan, |c, child_ids| {
+        let (awake, ids, policy, over) = (self.awake, self.ids, self.policy, self.over);
+        split_raw(awake, ids, plan, over, |c, child_ids| {
             let _live = track.task();
             let child = TeamExec {
                 awake,
                 ids: child_ids,
                 policy,
                 track: track.child(),
+                over,
             };
             f(c, child);
         });
@@ -491,13 +548,8 @@ impl<'team> TeamExec<'team> {
 ///
 /// The one implementation of a section: `TeamExec` and team-carrying `Exec`
 /// tokens both dispatch through it.
-pub(crate) fn section<B, S>(
-    awake: Option<&Awake>,
-    slot_of: &S,
-    dispatched: usize,
-    size: usize,
-    body: &B,
-) where
+pub(crate) fn section<B, S>(awake: Option<&Awake>, slot_of: &S, body: &B, geometry: Geometry)
+where
     B: Fn(&Participant<'_>) + Sync,
     S: Fn(usize) -> usize + Sync,
 {
@@ -516,11 +568,11 @@ pub(crate) fn section<B, S>(
     let sec = Section::new(
         call::<B>,
         (body as *const B).cast(),
-        size,
-        dispatched,
         slot_call::<S>,
         (slot_of as *const S).cast(),
+        geometry,
     );
+    let dispatched = geometry.dispatched;
     let guard = JoinGuard(&sec);
     if dispatched > 0 {
         if let Some(awake) = awake {
@@ -540,7 +592,7 @@ pub(crate) fn section<B, S>(
 
 /// Runs `f(c, child_ids)` for every child of `plan` at once: child 0 on the
 /// calling thread, child `c` on the first member of its index range.
-pub(crate) fn split_raw<F>(awake: Option<&Awake>, ids: &[usize], plan: &Plan<'_>, f: F)
+pub(crate) fn split_raw<F>(awake: Option<&Awake>, ids: &[usize], plan: &Plan<'_>, over: bool, f: F)
 where
     F: Fn(usize, &[usize]) + Sync,
 {
@@ -550,28 +602,38 @@ where
         f(c, &ids[start..start + size - 1]);
     };
     let n = plan.children();
+    let geometry = Geometry {
+        dispatched: n - 1,
+        size: ids.len() + 1,
+        over,
+        pin: false,
+    };
     section(
         awake,
         &|pos| ids[plan.child(pos + 1).0 - 1],
-        n - 1,
-        ids.len() + 1,
         &body,
+        geometry,
     );
 }
 
 /// Runs `f(k)` for `k in 0..participants` at once (leader is `k = 0`).
-pub(crate) fn spread_raw<F>(awake: Option<&Awake>, ids: &[usize], participants: usize, f: F)
-where
+pub(crate) fn spread_raw<F>(
+    awake: Option<&Awake>,
+    ids: &[usize],
+    participants: usize,
+    over: bool,
+    f: F,
+) where
     F: Fn(usize) + Sync,
 {
     let body = |p: &Participant<'_>| f(p.index());
-    section(
-        awake,
-        &|pos| ids[pos],
-        participants - 1,
-        participants,
-        &body,
-    );
+    let geometry = Geometry {
+        dispatched: participants - 1,
+        size: participants,
+        over,
+        pin: false,
+    };
+    section(awake, &|pos| ids[pos], &body, geometry);
 }
 
 impl fmt::Debug for TeamExec<'_> {

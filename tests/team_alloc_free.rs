@@ -137,4 +137,41 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
             "after park, round {round}"
         );
     }
+
+    // Participant pinning on: minting a root token of a persistent team, running
+    // a root team scope through it (which is where the pin section places the
+    // participants) and dropping the token must not allocate. The leader saves
+    // and restores its mask on its stack, a member saves its mask in its own
+    // slot, and both use `cpu_set_t` values, never a `Vec`.
+    let pool = Pool::builder()
+        .threads(4)
+        .pin_participants(true)
+        .idle_spin(Duration::from_millis(1))
+        .acquire_timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let team = pool.into_team(4).unwrap();
+    let token_phases = |team: &threadteam::Team| {
+        let mut exec = team.exec(4); // mint
+        exec.team(|mut team| {
+            team.reborrow().run(|_, _| {});
+            team.reborrow().run_with(|p| {
+                let _ = p.barrier();
+            });
+        })
+        .expect("the team token opens its scope");
+        // pinned members dispatch as usual
+        exec.reborrow().fork(2, |_, mut child| {
+            child
+                .team(|team| team.run(|_, _| {}))
+                .expect("carried sub-team");
+        });
+        drop(exec); // drop
+    };
+    for _ in 0..50 {
+        token_phases(&team); // warm-up
+    }
+    for round in 0..20 {
+        assert_eq!(allocs_in(|| token_phases(&team)), 0, "pinned round {round}");
+    }
 }

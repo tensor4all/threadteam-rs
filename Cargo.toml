@@ -35,7 +35,12 @@ bench = false
 [target.'cfg(loom)'.dependencies]
 loom = "0.7"
 
+# Worker QoS (`pthread_set_qos_class_self_np`).
 [target.'cfg(target_vendor = "apple")'.dependencies]
+libc = "0.2"
+
+# Participant placement (`sched_getaffinity` / `sched_setaffinity`).
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

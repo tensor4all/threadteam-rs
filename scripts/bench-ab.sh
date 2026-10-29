@@ -11,7 +11,9 @@
 #     --scenario acquire --widths 64 --calls 40 --impl threadteam
 #
 # HEAD_VARIANTS adds head runs with extra arguments in every round, `;`-separated, each named by
-# its arguments, e.g. HEAD_VARIANTS='--spin-polls 12288;--pressure-hold-ms 0;--throttled-polls 1024'.
+# its arguments, e.g. HEAD_VARIANTS='--spin-polls 300000;--own-hold-ms 100;--pressure-events 0'.
+# OMP=1 also runs the libgomp driver (benches/omp/wait_omp.c) in every round, with the same
+# --scenario (sections, gaps or acquire = libgomp's held team), --widths, --calls and --load.
 set -euo pipefail
 base=${1:?base rev}; head=${2:?head rev}; rounds=${3:?rounds}; shift 3
 host=$(hostname -s)
@@ -27,6 +29,18 @@ build() { # $1 = rev, $2 = dir name; prints the bench binary
 }
 bin_base=$(build "$base" base)
 bin_head=$(build "$head" head)
+omp=""
+if [[ ${OMP:-0} == 1 ]]; then
+  gcc -O2 -fopenmp "$work/head/benches/omp/wait_omp.c" -o "$work/wait_omp"
+  omp="$work/wait_omp"
+fi
+arg() { # value of bench option $1 in "$@" after it, or $2
+  local name=$1 def=$2; shift 2
+  while [[ $# -gt 0 ]]; do [[ $1 == "$name" ]] && { echo "$2"; return; }; shift; done
+  echo "$def"
+}
+omp_scenario=$(arg --scenario all "$@"); omp_widths=$(arg --widths "$(nproc)" "$@")
+omp_calls=$(arg --calls 200 "$@"); omp_load=$(arg --load "" "$@")
 IFS=';' read -r -a variants <<<"${HEAD_VARIANTS:-}"
 echo "base $(git rev-parse --short "$base")  head $(git rev-parse --short "$head")  rounds $rounds  args $*" | tee -a "$log"
 for r in $(seq 1 "$rounds"); do
@@ -36,6 +50,12 @@ for r in $(seq 1 "$rounds"); do
       "$bin_base" --label "base#$r" --csv "$csv" "$@" >>"$log"
     else
       "$bin_head" --label "head#$r" --csv "$csv" "$@" >>"$log"
+      if [[ -n $omp ]]; then
+        for w in ${omp_widths//,/ }; do
+          WAIT_OMP_SCENARIO=$omp_scenario WAIT_OMP_LOAD=$omp_load \
+            "$omp" "$w" "$omp_calls" "$csv" "libgomp#$r" >>"$log"
+        done
+      fi
       for v in "${variants[@]}"; do
         [[ -z $v ]] && continue
         # shellcheck disable=SC2086

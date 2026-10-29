@@ -31,7 +31,7 @@ fn a_wait_spins_its_budget_then_yields_sixteen_times_then_sleeps() {
 fn a_pool_under_pressure_starts_its_waits_throttled() {
     // Throttle on the first observation, with a deadline that cannot pass
     // during the test.
-    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 1);
+    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 1, 0);
     p.note(u64::MAX - CONTENDED_HOLD_NS);
     let mut throttled = Waiter::new(100_000, Some(&p));
     assert_eq!(polls_until_sleep(&mut throttled), THROTTLED_POLLS + 16);
@@ -60,10 +60,10 @@ fn a_descheduled_spinner_ends_its_spin_and_records_the_pressure() {
 }
 
 #[test]
-fn with_a_pool_threshold_a_burst_throttles_the_pool_and_isolated_ones_do_not() {
-    // The pool-wide throttle is off by default; four observations within the
-    // hold window throttle the pool when it is on (a benchmark knob).
-    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4);
+fn a_burst_throttles_the_pool_and_isolated_preemptions_do_not() {
+    // Four observations within the hold window throttle the pool (the
+    // default threshold).
+    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4, 0);
     let t = 1_000_000_000;
     for k in 0..3 {
         p.note(t + k * 1_000_000);
@@ -76,7 +76,7 @@ fn with_a_pool_threshold_a_burst_throttles_the_pool_and_isolated_ones_do_not() {
         "the hold ends"
     );
     // Observations spread wider than the window never add up.
-    let q = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4);
+    let q = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 4, 0);
     for k in 0..10 {
         let at = t + k * (CONTENDED_HOLD_NS + 1);
         q.note(at);
@@ -85,9 +85,11 @@ fn with_a_pool_threshold_a_burst_throttles_the_pool_and_isolated_ones_do_not() {
 }
 
 #[test]
-fn by_default_a_preemption_throttles_only_the_thread_that_saw_it() {
+fn with_a_per_thread_hold_a_preemption_throttles_the_thread_that_saw_it() {
     use core::sync::atomic::AtomicU64;
-    let p = Pressure::new();
+    // The per-thread hold is a benchmark knob (off by default); the pool
+    // threshold is off here so that only the thread's own deadline acts.
+    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 0, CONTENDED_HOLD_NS);
     let own = AtomicU64::new(0);
     // A member's wait sees itself descheduled (a gap before its second clock
     // read): its spin ends, and its slot's deadline is set.
@@ -110,4 +112,25 @@ fn by_default_a_preemption_throttles_only_the_thread_that_saw_it() {
     own.store(u64::MAX, core::sync::atomic::Ordering::Relaxed);
     let mut again = Waiter::of_thread(100_000, Some(&p), Some(&own));
     assert_eq!(polls_until_sleep(&mut again), THROTTLED_POLLS + 16);
+}
+
+#[test]
+fn by_default_a_preemption_sets_no_per_thread_deadline() {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    let p = Pressure::new();
+    let own = AtomicU64::new(0);
+    let mut w = Waiter::of_thread(1_000_000, Some(&p), Some(&own));
+    for _ in 0..64 {
+        w.step();
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    for _ in 64..128 {
+        w.step();
+    }
+    assert_eq!(polls_until_sleep(&mut w), 16, "its own spin ends");
+    assert_eq!(
+        own.load(Ordering::Relaxed),
+        0,
+        "no lasting per-thread deadline"
+    );
 }

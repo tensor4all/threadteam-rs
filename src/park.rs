@@ -170,13 +170,13 @@ const PREEMPT_GAP_NS: u64 = 200_000;
 pub(crate) const CONTENDED_HOLD_NS: u64 = 100_000_000;
 
 /// Default number of observed preemptions, within one hold window, that
-/// throttle the whole pool; zero never throttles the whole pool. A preemption
-/// throttles the thread that saw it (its member slot) for the hold. Throttling
-/// the whole pool, on one observation and then on four, made every section of
-/// a width-64 team under foreign load sleep and pay futex wakes, 3.6-4.1x
-/// slower than 0.1.3 (threadteam-rs#14, broccoli), so it is off by default and
-/// kept as a benchmark knob.
-pub(crate) const CONTENDED_EVENTS: u32 = 0;
+/// throttle the whole pool; zero never throttles the whole pool. A single
+/// preemption (another user's job taking a CPU for a slice) only ends the spin
+/// of the waiter that saw it: throttling the pool on it made every section of
+/// a width-64 team on a mildly shared host pay futex wakes (threadteam-rs#14,
+/// broccoli). Sustained load produces many preemptions per window and still
+/// throttles.
+pub(crate) const CONTENDED_EVENTS: u32 = 4;
 
 /// What a waiting thread does after one [`Waiter::step`].
 #[doc(hidden)]
@@ -207,6 +207,12 @@ pub struct Pressure {
     hold_ns: u64,
     /// Observations within one window that throttle the pool.
     threshold: u32,
+    /// How long an observation throttles the thread that saw it (a member's
+    /// slot); zero, the default, throttles no thread beyond its own wait. On a
+    /// quiet broccoli a per-thread hold of 100 ms made held teams 1.2-1.8x
+    /// slower than 0.1.3: one member preempted once then slept at every
+    /// section for the hold (threadteam-rs#14, 2773c36). A benchmark knob.
+    own_hold_ns: u64,
     /// The throttled budget, in polls.
     throttled: u32,
     /// Start of the current observation window, and observations in it. A
@@ -227,18 +233,20 @@ impl Default for Pressure {
 impl Pressure {
     /// No pressure recorded yet; the default hold and throttled budget.
     pub fn new() -> Self {
-        Self::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, CONTENDED_EVENTS)
+        Self::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, CONTENDED_EVENTS, 0)
     }
 
     /// No pressure recorded yet, with a throttled budget of `throttled` polls,
     /// held for `hold_ns` once `threshold` observations came within `hold_ns`
-    /// of each other (a threshold of 0 or 1 throttles on the first).
-    pub fn tuned(throttled: u32, hold_ns: u64, threshold: u32) -> Self {
+    /// of each other (0 never throttles the pool; 1 throttles on the first), and
+    /// a per-thread hold of `own_hold_ns` (0: none).
+    pub fn tuned(throttled: u32, hold_ns: u64, threshold: u32, own_hold_ns: u64) -> Self {
         Pressure {
             base: std::time::Instant::now(),
             until: AtomicU64::new(0),
             hold_ns,
             threshold,
+            own_hold_ns,
             throttled,
             window: AtomicU64::new(0),
             in_window: AtomicU64::new(0),
@@ -263,8 +271,8 @@ impl Pressure {
     /// Records a descheduled waiter at `now`. A later deadline is never
     /// shortened by an older observation.
     /// How long an observation throttles the thread that saw it.
-    pub(crate) fn hold_ns(&self) -> u64 {
-        self.hold_ns
+    pub(crate) fn own_hold_ns(&self) -> u64 {
+        self.own_hold_ns
     }
 
     pub(crate) fn note(&self, now: u64) {
@@ -374,8 +382,8 @@ impl<'a> Waiter<'a> {
             }
             Some(last) if now.saturating_sub(last) > PREEMPT_GAP_NS => {
                 p.note(now);
-                if let Some(o) = self.own {
-                    o.fetch_max(now.saturating_add(p.hold_ns()), Ordering::Relaxed);
+                if let (Some(o), hold @ 1..) = (self.own, p.own_hold_ns()) {
+                    o.fetch_max(now.saturating_add(hold), Ordering::Relaxed);
                 }
                 self.budget = self.polls;
             }

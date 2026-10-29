@@ -143,8 +143,9 @@ cargo bench --bench wait_scenarios -- --scenario gaps --widths 8   # one scenari
 
 To compare two commits on a shared host, `scripts/bench-ab.sh <base-rev> <head-rev> <rounds>
 [bench args]` builds both and alternates them, so a drift of other users' load falls on both sides;
-`HEAD_VARIANTS='--spin-polls 12288;--pressure-events 1'` adds head runs with tuning flags (this
-version only). The base of the waits change is its bench commit `a3a9320` (the bench on the 0.1.3
+`HEAD_VARIANTS='--spin-polls 300000;--own-hold-ms 100'` adds head runs with tuning flags (this
+version only), and `OMP=1` runs the libgomp driver in every round with the same scenario, widths,
+calls and load (`acquire` is libgomp's held team). The base of the waits change is its bench commit `a3a9320` (the bench on the 0.1.3
 waits). Under every threadteam row, a `waits per call` line counts join and barrier sleeps, member
 parks and the preemptions waiters saw.
 

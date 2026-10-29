@@ -293,6 +293,7 @@ pub struct PoolBuilder {
     throttled_polls: u32,
     pressure_hold: Duration,
     pressure_events: u32,
+    own_hold: Duration,
 }
 
 impl PoolBuilder {
@@ -311,6 +312,7 @@ impl PoolBuilder {
             throttled_polls: crate::park::THROTTLED_POLLS,
             pressure_hold: Duration::from_nanos(crate::park::CONTENDED_HOLD_NS),
             pressure_events: crate::park::CONTENDED_EVENTS,
+            own_hold: Duration::ZERO,
         }
     }
 
@@ -605,8 +607,10 @@ impl PoolBuilder {
     /// Tuning of the throttled waits, for the wait benchmarks only: the spin
     /// budget of a throttled wait (default 100 polls), how long the pool's
     /// waits stay throttled (default 100 ms; zero throttles only the waiter
-    /// that saw a preemption), and how many observed preemptions within that
-    /// time throttle the pool (default 4). See `docs/design/waiting.md`.
+    /// that saw a preemption), how many observed preemptions within that time
+    /// throttle the pool (default 4; zero never), and how long a preemption
+    /// throttles the member that saw it (default zero: only its own wait). See
+    /// `docs/design/waiting.md`.
     #[doc(hidden)]
     #[must_use]
     pub fn wait_tuning(
@@ -614,10 +618,12 @@ impl PoolBuilder {
         throttled_polls: u32,
         pressure_hold: Duration,
         pressure_events: u32,
+        own_hold: Duration,
     ) -> Self {
         self.throttled_polls = throttled_polls;
         self.pressure_hold = pressure_hold;
         self.pressure_events = pressure_events;
+        self.own_hold = own_hold;
         self
     }
 
@@ -708,6 +714,7 @@ impl PoolBuilder {
                     self.throttled_polls,
                     u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
                     self.pressure_events,
+                    u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
                 ),
             )),
         })
@@ -728,6 +735,7 @@ impl PoolBuilder {
                     self.throttled_polls,
                     u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
                     self.pressure_events,
+                    u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
                 ),
             )),
         })

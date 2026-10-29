@@ -4,11 +4,18 @@
  * busy-waits `work` microseconds on the clock; a call is a run of sections. Prints rows in the
  * Rust bench's format and appends them to a CSV file when one is given.
  *
- * Build and run with scripts/bench-omp.sh, or:
+ * Build and run with scripts/bench-waits.sh or scripts/bench-ab.sh (OMP=1), or:
  *   gcc -O2 -fopenmp benches/omp/wait_omp.c -o target/wait_omp
  *   target/wait_omp <width> <calls> [csv] [label]
  * The OpenMP runtime runs with its defaults (no OMP_WAIT_POLICY, no GOMP_SPINCOUNT, no binding)
  * unless the caller sets them.
+ *
+ * Environment:
+ *   WAIT_OMP_SCENARIO  all (default) | sections | gaps | acquire
+ *   WAIT_OMP_LOAD      K:P, foreign load: K child processes each busy P % of every 10 ms
+ *
+ * `acquire` / `held_team` is libgomp's counterpart of the Rust bench's held team: calls of 50
+ * sections of 20 us on the same (hot) team, back to back.
  */
 #define _GNU_SOURCE
 #include <omp.h>
@@ -17,6 +24,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static double now_us(void) {
@@ -68,6 +77,39 @@ static void call(int width, int sections, double work, double *first, double *wh
   *whole = now_us() - t0;
 }
 
+static pid_t load_children[256];
+static int load_n;
+
+/* Foreign load: K children each busy P % of every 10 ms, until killed. */
+static void load_start(const char *spec) {
+  int k = 0, p = 0;
+  if (!spec || sscanf(spec, "%d:%d", &k, &p) != 2) return;
+  for (int i = 0; i < k && i < 256; i++) {
+    pid_t c = fork();
+    if (c == 0) {
+      for (;;) {
+        double t = now_us();
+        while (now_us() - t < 100.0 * p) relax();
+        usleep((useconds_t)(10000 - 100 * p > 0 ? 10000 - 100 * p : 0));
+      }
+    }
+    if (c > 0) load_children[load_n++] = c;
+  }
+  usleep(200000);
+}
+
+static void load_stop(void) {
+  for (int i = 0; i < load_n; i++) {
+    kill(load_children[i], SIGKILL);
+    waitpid(load_children[i], NULL, 0);
+  }
+}
+
+static int want(const char *s) {
+  const char *w = getenv("WAIT_OMP_SCENARIO");
+  return !w || !strcmp(w, "all") || !strcmp(w, s);
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     fprintf(stderr, "usage: wait_omp <width> <calls> [csv] [label]\n");
@@ -79,7 +121,15 @@ int main(int argc, char **argv) {
   char host[256] = "";
   gethostname(host, sizeof host - 1);
   const char *label = argc > 4 ? argv[4] : "";
-  const char *load = getenv("WAIT_BENCH_LOAD") ? getenv("WAIT_BENCH_LOAD") : "none";
+  const char *load_spec = getenv("WAIT_OMP_LOAD");
+  char load_text[64];
+  int lk = 0, lp = 0;
+  if (load_spec && sscanf(load_spec, "%d:%d", &lk, &lp) == 2)
+    snprintf(load_text, sizeof load_text, "%dx%d%%", lk, lp);
+  else
+    snprintf(load_text, sizeof load_text, "%s",
+             getenv("WAIT_BENCH_LOAD") ? getenv("WAIT_BENCH_LOAD") : "none");
+  const char *load = load_text;
   snprintf(prefix, sizeof prefix, "%s,%s,%d,%s", host, label, cpus, load);
   if (argc > 3) {
     int fresh = access(argv[3], F_OK) != 0;
@@ -89,17 +139,18 @@ int main(int argc, char **argv) {
   }
   double *a = malloc(sizeof(double) * calls), *b = malloc(sizeof(double) * calls);
   char param[64];
+  load_start(load_spec);
   /* warm the hot team */
   for (int i = 0; i < 10; i++) call(width, 10, 5, a, b);
 
   int works[3] = {5, 20, 50};
-  for (int k = 0; k < 3; k++) {
+  for (int k = 0; k < 3 && want("sections"); k++) {
     for (int i = 0; i < calls; i++) call(width, 200, works[k], &a[i], &b[i]);
     snprintf(param, sizeof param, "work=%dus,sections=200", works[k]);
     row("sections", width, param, "call", b, calls, 200.0 * works[k]);
   }
   int gaps[4] = {0, 100, 1000, 10000};
-  for (int k = 0; k < 4; k++) {
+  for (int k = 0; k < 4 && want("gaps"); k++) {
     for (int i = 0; i < calls / 2; i++) {
       if (gaps[k]) usleep(gaps[k]);
       call(width, 10, 5, &a[i], &b[i]);
@@ -108,6 +159,11 @@ int main(int argc, char **argv) {
     row("gaps", width, param, "first", a, calls / 2, 5);
     row("gaps", width, param, "call", b, calls / 2, 50);
   }
+  if (want("acquire")) {
+    for (int i = 0; i < calls / 2; i++) call(width, 50, 20, &a[i], &b[i]);
+    row("acquire", width, "held_team", "call", b, calls / 2, 1000);
+  }
+  load_stop();
   if (csv) fclose(csv);
   return 0;
 }

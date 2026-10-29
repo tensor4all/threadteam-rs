@@ -32,7 +32,8 @@
 //! `--label <text>` (the version or commit, written to the CSV); tuning of the waits (this
 //! version only, `docs/design/waiting.md`): `--spin-polls N`, `--throttled-polls N`,
 //! `--pressure-hold-ms N` (0 throttles only the waiter that saw a preemption),
-//! `--pressure-events N` (preemptions within the hold that throttle the pool). Under each
+//! `--pressure-events N` (preemptions within the hold that throttle the pool; 0 never),
+//! `--own-hold-ms N` (how long a preemption throttles the member that saw it; default 0). Under each
 //! threadteam row a `waits per call` line counts join and barrier sleeps, member parks and the
 //! preemptions waiters saw.
 
@@ -136,7 +137,7 @@ fn stats(mut v: Vec<f64>) -> Stats {
 
 /// Pool settings from the command line (`--spin-polls`, `--throttled-polls`,
 /// `--pressure-hold-ms`); `None` keeps the library default.
-type Tuning = (Option<u32>, Option<(u32, Duration, u32)>);
+type Tuning = (Option<u32>, Option<(u32, Duration, u32, Duration)>);
 static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
 
 fn pool(width: usize) -> Pool {
@@ -147,8 +148,8 @@ fn pool(width: usize) -> Pool {
         if let Some(n) = spin {
             b = b.spin_polls(*n);
         }
-        if let Some((polls, hold, events)) = throttle {
-            b = b.wait_tuning(*polls, *hold, *events);
+        if let Some((polls, hold, events, own)) = throttle {
+            b = b.wait_tuning(*polls, *hold, *events, *own);
         }
     }
     b.build().expect("a pool")
@@ -348,12 +349,14 @@ fn main() {
         value("--throttled-polls"),
         value("--pressure-hold-ms"),
         value("--pressure-events"),
+        value("--own-hold-ms"),
     ) {
-        (None, None, None) => None,
-        (t, h, e) => Some((
+        (None, None, None, None) => None,
+        (t, h, e, o) => Some((
             t.map_or(100, |v| v.parse().expect("--throttled-polls")),
             Duration::from_millis(h.map_or(100, |v| v.parse().expect("--pressure-hold-ms"))),
             e.map_or(4, |v| v.parse().expect("--pressure-events")),
+            Duration::from_millis(o.map_or(0, |v| v.parse().expect("--own-hold-ms"))),
         )),
     };
     TUNING.get_or_init(|| (spin, throttle));

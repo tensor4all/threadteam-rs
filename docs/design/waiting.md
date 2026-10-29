@@ -96,11 +96,11 @@ The last member of a section therefore pays one extra uncontended read-modify-wr
 
 - **Detection.** A spinning waiter reads the clock (`Instant::now`, vDSO) every 64 polls. If the gap since its previous read exceeds 200 µs, it was descheduled while it spun. Sixty-four polls take well under 10 µs, and a scheduler slice is 0.75 ms or more.
 - **What it means.** This is a pressure heuristic, not proof of foreign load. A foreign process, another thread of the team, interrupts, page faults or VM steal all look the same, and a short preemption can escape the threshold. It is acceptable because the response only shortens active waiting; it never changes affinity or correctness.
-- **Response.** The waiter ends its spin at once (yields, then sleeps). A member also moves its own slot's deadline to now + 100 ms (`fetch_max`), so its next waits start with the throttled budget while that runs: the thread that sees itself preempted gives its CPU back quickly, and the members that are not preempted keep spinning.
-  - Why per thread, not per pool: a pool-wide throttle made every wait of the pool sleep at every section once one waiter (or four, within 100 ms) saw a preemption. On broccoli under foreign load that cost held teams 3.6-4.1x against 0.1.3 (`held_team` 1.56 → 5.6 ms), because each 20 µs section then woke about 63 sleeping members.
-  - The pool-wide throttle remains a benchmark knob (`--pressure-events N`, off by default): on saturated primerose (load average above the CPU count) it was the faster setting, since there every waiter is preempted anyway.
-  - The leader's join and the barriers end their own spin on a preemption, but have no lasting per-thread deadline: the leader is not a slot.
-  - The hold, the throttled budget and the pool threshold can be varied for the benchmarks (`PoolBuilder::wait_tuning`, hidden; `--pressure-hold-ms`, `--throttled-polls`, `--pressure-events`), and `Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
+- **Response.** The waiter ends its spin at once (yields, then sleeps). The pool counts the observations: once 4 come within 100 ms of each other, every wait of the pool adopts the throttled budget at its first clock read, for 100 ms (moved forward with a `fetch_max`, so an older observation never shortens a newer one).
+  - **Not on one observation.** Throttling the whole pool on a single preemption made every section of a width-64 team on a mildly shared host sleep and pay futex wakes (broccoli, `held_team` 1.48 → 6.12 ms, `c0c024b`'s predecessor). An isolated preemption now ends only its own waiter's spin.
+  - **Not per thread.** `2773c36` tried giving the thread that saw a preemption a 100 ms deadline of its own instead of throttling the pool. On a quiet broccoli that made held teams 1.79x / 1.21x slower than 0.1.3 (against 1.03 / 1.07 with the pool threshold): one member preempted once then slept at every section for the hold, and every join waited for its wake-up. The per-thread hold remains a benchmark knob (`--own-hold-ms`, off by default).
+  - **The pool-wide throttle at all:** on a saturated host (primerose), throttling only the waiter that saw the preemption left the pool as slow as 0.1.3.
+  - **Knobs and counters.** The threshold, the hold, the throttled budget and the per-thread hold can be varied for the benchmarks (`PoolBuilder::wait_tuning`, hidden; `--pressure-events`, `--pressure-hold-ms`, `--throttled-polls`, `--own-hold-ms`). `Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
 - **Cost.** A wait that ends within 64 polls never reads the clock; otherwise one clock read per 64 polls. There is no `getrusage` or other syscall in the poll loop.
 - **Limit.** A pool built for a single call (`with_team`) cannot carry the deadline to the next call. What helps it is the short budget and the sleeps in `join` and `barrier`, which give the scheduler idle CPUs within the call. With `pin_participants`, a sleeping waiter frees its CPU, but a pinned member that is descheduled behind a foreign process cannot move.
 
@@ -129,9 +129,13 @@ Removing the spare therefore needs a new contract for `external`'s width and len
 - with and without a foreign-load generator: child processes that each burn a few % of a CPU;
 - the same work under libgomp (`benches/omp/wait_omp.c`, when `gcc -fopenmp` is available) and under a Rayon `scope`.
 
-The change is accepted when:
-- on a quiet host (evo), `sections`, `gaps` and `nested` do not regress;
-- on broccoli (64 threads, foreign load), the faer#107 arms of `acquire_probe_107` (tensor4all/faer branch `probe/107-acquire-per-call`) are no longer slow.
+The change is accepted when (criteria set by the monitor, 2026-10-30):
+- **(a)** the faer#107 slow mode is zero in every arm of `acquire_probe_107` (tensor4all/faer branch `probe/107-acquire-per-call-wait`);
+- **(b)** on quiet hosts (evo, an unloaded broccoli), `held_team`, `held_pool` and `gaps` (0-1 ms) are within 10 % of the base;
+- **(c)** under foreign load (`--load 8:10`), the same scenarios are no worse than libgomp's. The base is not the reference there: it keeps its spinners on CPUs that other processes need;
+- **(d)** the 10 ms gap is tuned with the spin budget; if 300000 polls closes it, that is accepted as the OpenMP default.
+
+The comparison is `scripts/bench-ab.sh` with `OMP=1`, which runs libgomp's counterpart (`acquire`/`held_team`: calls of 50 sections of 20 µs on the same hot team) in every round, with and without load.
 
 **First reading, primerose (not an acceptance run).** EPYC 7713P, 64 CPUs, saturated by other users (load average 61-63). Width 6 on `taskset -c 0-5`, 40 calls, threadteam only. Base = the bench commit on 0.1.3; head = this change. Median µs per call:
 

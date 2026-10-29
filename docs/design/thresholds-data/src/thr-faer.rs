@@ -1,13 +1,21 @@
-//! Break-even sweep for faer GEMM and LU: serial vs plain token (outside the pool, one install per
-//! call; inside the pool, loop run in `external`) vs team token, 6 participants.
+//! Break-even sweep for faer GEMM and LU: serial vs a width handed over through `external` (the
+//! caller's token gives a width, faer's `team::with_team` reserves a team of that width for the
+//! call) vs a team the probe owns and lends to every call, 6 participants.
 //!
 //! `thr-faer FLOOR(off|default) ROUNDS` prints CSV: family,shape,mode,round,ns
 //!
-//! `off` sets the `gemm` crate's threading threshold and the LU `par_threshold` to zero so the
-//! sweep shows where the parallel route itself starts to pay; `default` keeps faer's own floors.
+//! `off` sets the `gemm` crate's threading threshold and forces the LU regions on
+//! (`ParThreshold::Fixed(1)`) so the sweep shows where the parallel route itself starts to pay;
+//! `default` keeps faer's own floors (`Fixed(128 * 128)` elements, as the driver always did).
+//!
+//! The `external` arm measures what a caller that has only a width pays: faer's `team::with_team`
+//! reserves a team for the call, i.e. builds a pool, which costs about two milliseconds per call.
+//! A caller with a long-lived budget owns a team and lends it (`team` arm); `with_team` is for one
+//! scoped call, a tool or a test.
 use faer::dyn_stack::{MemBuffer, MemStack};
 use faer::linalg::lu::partial_pivoting::factor as lu;
 use faer::linalg::matmul::matmul;
+use faer::utils::cost::ParThreshold;
 use faer::{c64, Accum, Auto, Mat, Par};
 use std::sync::{Arc, Mutex};
 use std::num::NonZeroUsize;
@@ -102,11 +110,12 @@ fn lu_cfg(n: usize, par_threshold: usize, floor: Option<usize>) -> Work {
     let mut perm = vec![0usize; n];
     let mut perm_inv = vec![0usize; n];
     let mut p = <lu::PartialPivLuParams as Auto<f64>>::auto();
-    p.par_threshold = par_threshold;
+    // the floor is a region's serial time now, not a count of elements: `Fixed(1)` forces the
+    // parallel regions on, `Fixed(n)` is the probe's own element floor
+    p.par_threshold = ParThreshold::Fixed(par_threshold.max(1));
     let nz = NonZeroUsize::new(W).unwrap();
-    let r1 = lu::lu_in_place_scratch::<usize, f64>(n, n, faer::ParShape::Team(nz), p.into());
-    let r2 = lu::lu_in_place_scratch::<usize, f64>(n, n, faer::ParShape::Rayon(nz), p.into());
-    let bytes = r1.unaligned_bytes_required().max(r2.unaligned_bytes_required());
+    let req = lu::lu_in_place_scratch::<usize, f64>(n, n, faer::ParShape::team(nz.get()), p.into());
+    let bytes = req.unaligned_bytes_required();
     let mut mem = MemBuffer::new(faer::dyn_stack::StackReq::new::<u8>(bytes + 256));
     Work {
         family: Box::leak(match floor {
@@ -161,8 +170,10 @@ fn workloads(off: bool) -> Vec<Work> {
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
     Seq,
-    PlainOut,
-    PlainIn,
+    /// the caller's token hands a width through `external`, and faer reserves a team of that width
+    /// for the call: the way a library that does not own the pool is called now
+    External,
+    /// a team the probe owns and lends to every call (`Par::Team`)
     Team,
 }
 
@@ -178,24 +189,15 @@ fn measure(mode: Mode, w: &mut Work) -> f64 {
             (w.restore)();
             (w.run)(Par::Seq)
         }),
-        Mode::PlainOut => {
+        Mode::External => {
             let pool = POOL.with(|p| p.borrow().as_ref().map(|p| p as *const Pool).unwrap());
             // SAFETY: the pool outlives the phase that calls this
             let pool = unsafe { &*pool };
             let mut tok = Exec::new(pool, W).unwrap();
             time_calls(|| {
                 (w.restore)();
-                tok.reborrow().external(|n| (w.run)(Par::rayon(n.get())))
-            })
-        }
-        Mode::PlainIn => {
-            let pool = POOL.with(|p| p.borrow().as_ref().map(|p| p as *const Pool).unwrap());
-            let pool = unsafe { &*pool };
-            let tok = Exec::new(pool, W).unwrap();
-            tok.external(|n| {
-                time_calls(|| {
-                    (w.restore)();
-                    (w.run)(Par::rayon(n.get()))
+                tok.reborrow().external(|n| {
+                    faer::team::with_team(n.get(), |par| (w.run)(par))
                 })
             })
         }
@@ -273,12 +275,12 @@ fn main() {
     println!("family,shape,mode,round,ns");
     let mut works = if sweep { lu_sweep() } else { workloads(off) };
     for round in 0..rounds {
-        for (mode, name) in [(Mode::Seq, "seq"), (Mode::PlainOut, "plain_out"), (Mode::PlainIn, "plain_in"), (Mode::Team, "team")] {
-            if sweep && mode == Mode::PlainOut {
+        for (mode, name) in [(Mode::Seq, "seq"), (Mode::External, "external"), (Mode::Team, "team")] {
+            if sweep && mode == Mode::External {
                 continue;
             }
             match mode {
-                Mode::PlainOut | Mode::PlainIn => POOL.with(|p| *p.borrow_mut() = Some(build())),
+                Mode::External => POOL.with(|p| *p.borrow_mut() = Some(build())),
                 Mode::Team => TEAM.with(|t| *t.borrow_mut() = Some(build().into_team(W).expect("team"))),
                 Mode::Seq => {}
             }

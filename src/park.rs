@@ -148,8 +148,8 @@ impl Parker {
 // sleep on a `Parker`. The join and the barrier of a section use them through
 // [`Completion`] and [`Barrier`], which are the exact code `loom` checks.
 
-/// Polls of a wait that start with the throttled budget: the scope is
-/// oversubscribed, or the pool saw a waiter descheduled recently. libgomp's
+/// Default spin budget, in polls, of a wait that starts throttled: the scope
+/// is oversubscribed, or the pool saw a waiter descheduled recently. libgomp's
 /// throttled spin count has the same value.
 pub(crate) const THROTTLED_POLLS: u32 = 100;
 
@@ -165,9 +165,17 @@ const CHECK_EVERY: u32 = 64;
 /// scheduler slice is 0.75 ms or more.
 const PREEMPT_GAP_NS: u64 = 200_000;
 
-/// How long a pool keeps starting its waits throttled after a waiter was
-/// descheduled.
-const CONTENDED_HOLD_NS: u64 = 100_000_000;
+/// Default time a pool keeps starting its waits throttled once its waiters
+/// were descheduled often enough (see [`CONTENDED_EVENTS`]).
+pub(crate) const CONTENDED_HOLD_NS: u64 = 100_000_000;
+
+/// Default number of observed preemptions, within one hold window, that
+/// throttle the whole pool. A single preemption (another user's job taking a
+/// CPU for a slice) only ends the spin of the waiter that saw it: throttling
+/// the pool on it made every section of a width-64 team on a mildly shared
+/// host pay futex wakes (threadteam-rs#14, broccoli). Sustained load produces
+/// many preemptions per window and still throttles.
+pub(crate) const CONTENDED_EVENTS: u32 = 4;
 
 /// What a waiting thread does after one [`Waiter::step`].
 #[doc(hidden)]
@@ -184,14 +192,29 @@ pub enum Step {
 /// A waiter that finds a long gap between two of its clock reads was
 /// descheduled while it spun: something else ran on its CPU (another thread of
 /// the team, a foreign process, or interrupts and VM steal; the signal does not
-/// tell them apart). It records the time, and for [`CONTENDED_HOLD_NS`] every
-/// wait of the pool starts throttled, so the pool's waiters free CPUs quickly
-/// while that pressure lasts.
+/// tell them apart). It records the time, and for its hold time (default
+/// [`CONTENDED_HOLD_NS`]) every wait of the pool starts with the throttled
+/// budget, so the pool's waiters free CPUs quickly while that pressure lasts.
 #[doc(hidden)]
 pub struct Pressure {
     base: std::time::Instant,
     /// Nanoseconds since `base` until which waits start throttled.
     until: AtomicU64,
+    /// How long the pool's waits stay throttled once enough observations
+    /// came within one window of this length; zero throttles only the waiter
+    /// that saw a preemption.
+    hold_ns: u64,
+    /// Observations within one window that throttle the pool.
+    threshold: u32,
+    /// The throttled budget, in polls.
+    throttled: u32,
+    /// Start of the current observation window, and observations in it. A
+    /// heuristic: concurrent updates may lose a count, never an escalation by
+    /// a later window.
+    window: AtomicU64,
+    in_window: AtomicU64,
+    /// Observations so far (a diagnostic).
+    events: AtomicU64,
 }
 
 impl Default for Pressure {
@@ -201,12 +224,35 @@ impl Default for Pressure {
 }
 
 impl Pressure {
-    /// No pressure recorded yet.
+    /// No pressure recorded yet; the default hold and throttled budget.
     pub fn new() -> Self {
+        Self::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, CONTENDED_EVENTS)
+    }
+
+    /// No pressure recorded yet, with a throttled budget of `throttled` polls,
+    /// held for `hold_ns` once `threshold` observations came within `hold_ns`
+    /// of each other (a threshold of 0 or 1 throttles on the first).
+    pub fn tuned(throttled: u32, hold_ns: u64, threshold: u32) -> Self {
         Pressure {
             base: std::time::Instant::now(),
             until: AtomicU64::new(0),
+            hold_ns,
+            threshold,
+            throttled,
+            window: AtomicU64::new(0),
+            in_window: AtomicU64::new(0),
+            events: AtomicU64::new(0),
         }
+    }
+
+    /// The throttled budget, in polls.
+    pub(crate) fn throttled(&self) -> u32 {
+        self.throttled
+    }
+
+    /// Observations so far.
+    pub(crate) fn events(&self) -> u64 {
+        self.events.load(Ordering::Relaxed)
     }
 
     pub(crate) fn now(&self) -> u64 {
@@ -216,18 +262,27 @@ impl Pressure {
     /// Records a descheduled waiter at `now`. A later deadline is never
     /// shortened by an older observation.
     pub(crate) fn note(&self, now: u64) {
-        self.until
-            .fetch_max(now.saturating_add(CONTENDED_HOLD_NS), Ordering::Relaxed);
+        self.events.fetch_add(1, Ordering::Relaxed);
+        if self.hold_ns == 0 {
+            return;
+        }
+        let start = self.window.load(Ordering::Relaxed);
+        let n = if now.saturating_sub(start) > self.hold_ns {
+            // A new window starts with this observation.
+            self.window.store(now, Ordering::Relaxed);
+            self.in_window.store(1, Ordering::Relaxed);
+            1
+        } else {
+            self.in_window.fetch_add(1, Ordering::Relaxed) + 1
+        };
+        if n >= u64::from(self.threshold) {
+            self.until
+                .fetch_max(now.saturating_add(self.hold_ns), Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn active(&self, now: u64) -> bool {
         self.until.load(Ordering::Relaxed) > now
-    }
-
-    /// Whether any pressure was ever recorded (tests).
-    #[cfg(test)]
-    pub(crate) fn recorded(&self) -> bool {
-        self.until.load(Ordering::Relaxed) != 0
     }
 }
 
@@ -246,6 +301,7 @@ pub struct Waiter<'a> {
     yields: u32,
     pressure: Option<&'a Pressure>,
     last: Option<u64>,
+    slept: bool,
 }
 
 impl<'a> Waiter<'a> {
@@ -257,7 +313,13 @@ impl<'a> Waiter<'a> {
             yields: 0,
             pressure,
             last: None,
+            slept: false,
         }
+    }
+
+    /// Whether the episode reached its sleep phase.
+    pub fn slept(&self) -> bool {
+        self.slept
     }
 
     /// One poll of the episode; [`Step::Sleep`] once the spin and the yields
@@ -277,6 +339,7 @@ impl<'a> Waiter<'a> {
             std::thread::yield_now();
             return Step::Poll;
         }
+        self.slept = true;
         Step::Sleep
     }
 
@@ -285,7 +348,7 @@ impl<'a> Waiter<'a> {
         let Some(p) = self.pressure else { return };
         let now = p.now();
         match self.last {
-            None if p.active(now) => self.budget = self.budget.min(THROTTLED_POLLS.max(self.polls)),
+            None if p.active(now) => self.budget = self.budget.min(p.throttled().max(self.polls)),
             Some(last) if now.saturating_sub(last) > PREEMPT_GAP_NS => {
                 p.note(now);
                 self.budget = self.polls;

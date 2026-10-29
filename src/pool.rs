@@ -33,15 +33,18 @@ const PIN_PARTICIPANTS_DEFAULT: bool = false;
 
 /// Default spin budget of a wait, in polls (one PAUSE, or YIELD on aarch64,
 /// per poll); see `docs/design/waiting.md`. On x86-64 a poll measured about
-/// 24 ns on Zen 3 (EPYC 7713P), so 12288 polls are about 300 µs, and longer on
-/// CPUs whose PAUSE is slower (Skylake and later Intel cores: about 2x). On
-/// aarch64 a YIELD is much cheaper than a PAUSE; the larger default aims at the
-/// same order of time and is not measured yet. libgomp's default is 300000
-/// polls ("about 3 ms").
+/// 24 ns on Zen 3 (EPYC 7713P), so 131072 polls are about 3 ms there, the order
+/// of libgomp's default (300000 polls, "about 3 ms"), and longer on CPUs whose
+/// PAUSE is slower (Skylake and later Intel cores: about 2x). A first default of
+/// 12288 polls (about 300 µs) made a team woken after a 1 ms or 10 ms gap 2.3x
+/// and 10.8x slower to start on a quiet host (evo), because its members had gone
+/// to sleep. On aarch64 a YIELD is much cheaper than a PAUSE; the larger default
+/// aims at the same order of time and is not measured yet. Under scheduling
+/// pressure the waits are throttled anyway (`crate::park::Pressure`).
 const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
-    1 << 17
+    1 << 21
 } else {
-    12_288
+    1 << 17
 };
 
 /// A fixed set of worker threads that [`Exec`](crate::Exec) tokens place work on.
@@ -191,6 +194,21 @@ impl Pool {
         self.awake.waits.spin_polls
     }
 
+    /// How often this pool's waits slept, and how often a waiter saw itself
+    /// descheduled, since the pool was built: diagnostics for the wait
+    /// benchmarks (`docs/design/waiting.md`).
+    #[doc(hidden)]
+    pub fn wait_counters(&self) -> WaitCounters {
+        use core::sync::atomic::Ordering::Relaxed;
+        let w = &self.awake.waits;
+        WaitCounters {
+            join_sleeps: w.join_sleeps.load(Relaxed),
+            barrier_sleeps: w.barrier_sleeps.load(Relaxed),
+            member_parks: w.member_parks.load(Relaxed),
+            pressure_events: w.pressure.events(),
+        }
+    }
+
     /// Number of workers currently kept awake as team members, reserved or
     /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
     /// can change at any moment.
@@ -272,6 +290,9 @@ pub struct PoolBuilder {
     costs: DispatchCosts,
     pin_participants: bool,
     spin_polls: u32,
+    throttled_polls: u32,
+    pressure_hold: Duration,
+    pressure_events: u32,
 }
 
 impl PoolBuilder {
@@ -287,6 +308,9 @@ impl PoolBuilder {
             costs: DispatchCosts::host_default(),
             pin_participants: PIN_PARTICIPANTS_DEFAULT,
             spin_polls: SPIN_POLLS_DEFAULT,
+            throttled_polls: crate::park::THROTTLED_POLLS,
+            pressure_hold: Duration::from_nanos(crate::park::CONTENDED_HOLD_NS),
+            pressure_events: crate::park::CONTENDED_EVENTS,
         }
     }
 
@@ -578,6 +602,25 @@ impl PoolBuilder {
         self
     }
 
+    /// Tuning of the throttled waits, for the wait benchmarks only: the spin
+    /// budget of a throttled wait (default 100 polls), how long the pool's
+    /// waits stay throttled (default 100 ms; zero throttles only the waiter
+    /// that saw a preemption), and how many observed preemptions within that
+    /// time throttle the pool (default 4). See `docs/design/waiting.md`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn wait_tuning(
+        mut self,
+        throttled_polls: u32,
+        pressure_hold: Duration,
+        pressure_events: u32,
+    ) -> Self {
+        self.throttled_polls = throttled_polls;
+        self.pressure_hold = pressure_hold;
+        self.pressure_events = pressure_events;
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -661,6 +704,11 @@ impl PoolBuilder {
                 self.costs,
                 self.pin_participants,
                 self.spin_polls,
+                crate::park::Pressure::tuned(
+                    self.throttled_polls,
+                    u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
+                    self.pressure_events,
+                ),
             )),
         })
     }
@@ -676,6 +724,11 @@ impl PoolBuilder {
                 self.costs,
                 self.pin_participants,
                 self.spin_polls,
+                crate::park::Pressure::tuned(
+                    self.throttled_polls,
+                    u64::try_from(self.pressure_hold.as_nanos()).unwrap_or(u64::MAX),
+                    self.pressure_events,
+                ),
             )),
         })
     }
@@ -718,4 +771,18 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("drop on a worker hung");
     }
+}
+
+/// Counters of [`Pool::wait_counters`] (a diagnostic for the wait benchmarks).
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WaitCounters {
+    /// Leaders that slept in a section's join.
+    pub join_sleeps: u64,
+    /// Participants that slept in a barrier.
+    pub barrier_sleeps: u64,
+    /// Reserved members that parked waiting for work.
+    pub member_parks: u64,
+    /// Waiters that saw a gap of more than 200 µs between their clock reads.
+    pub pressure_events: u64,
 }

@@ -123,6 +123,11 @@ pub(crate) struct Waits {
     pub(crate) pressure: crate::park::Pressure,
     /// Spin budget of a wait, in polls (`PoolBuilder::spin_polls`).
     pub(crate) spin_polls: u32,
+    /// Diagnostics (`Pool::wait_counters`): sleeps of leaders in joins, of
+    /// participants in barriers, and parks of members waiting for work.
+    pub(crate) join_sleeps: AtomicU64,
+    pub(crate) barrier_sleeps: AtomicU64,
+    pub(crate) member_parks: AtomicU64,
 }
 
 /// Shared state of the awake members of one pool.
@@ -152,13 +157,17 @@ impl Awake {
         costs: crate::cost::DispatchCosts,
         pin: bool,
         spin_polls: u32,
+        pressure: crate::park::Pressure,
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
             waits: Waits {
                 sync: Parker::new(),
-                pressure: crate::park::Pressure::new(),
+                pressure,
                 spin_polls,
+                join_sleeps: AtomicU64::new(0),
+                barrier_sleeps: AtomicU64::new(0),
+                member_parks: AtomicU64::new(0),
             },
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
@@ -196,7 +205,7 @@ impl Awake {
     /// the throttled one when the scope is oversubscribed.
     pub(crate) fn spin_budget(&self, over: bool) -> u32 {
         if over {
-            crate::park::THROTTLED_POLLS.min(self.waits.spin_polls)
+            self.waits.pressure.throttled().min(self.waits.spin_polls)
         } else {
             self.waits.spin_polls
         }
@@ -548,6 +557,7 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                         )
                     });
                     if w.step() == Step::Sleep {
+                        aw.waits.member_parks.fetch_add(1, Ordering::Relaxed);
                         trace!(aw, Some(id), ParkEnter);
                         park_member(slot, seen);
                         trace!(aw, Some(id), ParkExit);
@@ -766,7 +776,7 @@ impl Section {
         match self.waits() {
             Some(w) => crate::park::Waiter::new(
                 if self.over {
-                    crate::park::THROTTLED_POLLS.min(w.spin_polls)
+                    w.pressure.throttled().min(w.spin_polls)
                 } else {
                     w.spin_polls
                 },
@@ -823,6 +833,11 @@ impl Section {
         }
         let mut waiter = self.waiter();
         self.done.wait(self.waits().map(|w| &w.sync), &mut waiter);
+        if waiter.slept() {
+            if let Some(w) = self.waits() {
+                w.join_sleeps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Sense-reversing barrier over the section's participants; `false` when
@@ -830,8 +845,15 @@ impl Section {
     /// like [`Self::join`].
     pub(crate) fn barrier(&self) -> bool {
         let mut waiter = self.waiter();
-        self.barrier
-            .arrive(&self.cancelled, self.waits().map(|w| &w.sync), &mut waiter)
+        let passed =
+            self.barrier
+                .arrive(&self.cancelled, self.waits().map(|w| &w.sync), &mut waiter);
+        if waiter.slept() {
+            if let Some(w) = self.waits() {
+                w.barrier_sleeps.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        passed
     }
 }
 

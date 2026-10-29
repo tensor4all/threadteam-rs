@@ -86,18 +86,20 @@ The last member of a section therefore pays one extra uncontended read-modify-wr
 ### Budget
 
 - **A count, as in libgomp.** The budget is `PoolBuilder::spin_polls`, a number of polls (one PAUSE, or YIELD on aarch64, per poll). A waiter that is descheduled does not spend it while it waits for its CPU.
-- **Default.** 12288 polls on x86-64: one poll measured about 24 ns on Zen 3 (EPYC 7713P), so about 300 µs there, and about twice that on Intel cores whose PAUSE is slower. On aarch64 a YIELD is much cheaper, and the default of 2^17 aims at the same order of time without a measurement yet.
-  - A section of 5-50 µs, and the gaps between sections inside a call, stay entirely in the spin phase, so the dispatch costs of `benches/dispatch_cost.rs` should not change.
-  - A member that waits longer than the budget between calls sleeps, and the first section of the next call pays one futex wake.
-  - libgomp's default is about 3 ms, and libomp's 200 ms. 300 µs is a starting value that the wait benchmark confirms or moves.
+- **Default: 131072 polls on x86-64** (2^21 on aarch64, not measured yet). One poll measured about 24 ns on Zen 3 (EPYC 7713P), so this is about 3 ms there, the order of libgomp's default (300000 polls, "about 3 ms"); Intel cores with a slower PAUSE take about twice as long.
+  - The first default, 12288 polls (about 300 µs), made the first section after a 1 ms or 10 ms gap 2.3x and 10.8x slower than 0.1.3 on a quiet host (evo, 6 → 16 → 75 µs): the members had gone to sleep, and the next call paid futex wakes. With about 3 ms, a team called again within a few milliseconds is still spinning, as under libgomp; after a longer gap it sleeps, as under libgomp.
+  - libomp keeps 200 ms (`KMP_BLOCKTIME`); 0.1.3 kept 200 ms of wall time for members and never slept in joins.
 - **No calibration.** Converting a time to polls at pool build was considered and dropped (pre-review): a calibration taken while the CPU is contended yields too few polls, and a bare PAUSE loop is not the real poll anyway. The count is approximate in time, as libgomp's is.
-- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed (as before), or while the pool is under recent pressure (below).
+- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed, or while the pool is under sustained pressure (below).
 
 ### Scheduling pressure
 
 - **Detection.** A spinning waiter reads the clock (`Instant::now`, vDSO) every 64 polls. If the gap since its previous read exceeds 200 µs, it was descheduled while it spun. Sixty-four polls take well under 10 µs, and a scheduler slice is 0.75 ms or more.
 - **What it means.** This is a pressure heuristic, not proof of foreign load. A foreign process, another thread of the team, interrupts, page faults or VM steal all look the same, and a short preemption can escape the threshold. It is acceptable because the response only shortens active waiting; it never changes affinity or correctness.
-- **Response.** The waiter ends its spin at once (yields, then sleeps), and moves the pool's `contended_until` forward to now + 100 ms with a `fetch_max`, so an older observation never shortens a newer one. While that deadline holds, every wait of the pool adopts the throttled budget at its first clock read.
+- **Response.** The waiter ends its spin at once (yields, then sleeps). The pool counts the observations: once 4 of them come within 100 ms of each other, every wait of the pool adopts the throttled budget at its first clock read, for 100 ms (moved forward with a `fetch_max`, so an older observation never shortens a newer one).
+  - Why a count: throttling the whole pool on a single observation made every section of a width-64 team on a mildly shared host (broccoli, another user's job) sleep and pay futex wakes, 4x slower than 0.1.3 (`held_team` 1.48 → 6.12 ms). An isolated preemption now ends only its own waiter's spin; sustained load still throttles the pool.
+  - Why the pool-wide throttle at all: on a saturated host (primerose), throttling only the waiter that saw the preemption left the pool as slow as 0.1.3.
+  - The threshold, the hold and the throttled budget can be varied for the benchmarks (`PoolBuilder::wait_tuning`, hidden; `--pressure-events`, `--pressure-hold-ms`, `--throttled-polls`), and `Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
 - **Cost.** A wait that ends within 64 polls never reads the clock; otherwise one clock read per 64 polls. There is no `getrusage` or other syscall in the poll loop.
 - **Limit.** A pool built for a single call (`with_team`) cannot carry the deadline to the next call. What helps it is the short budget and the sleeps in `join` and `barrier`, which give the scheduler idle CPUs within the call. With `pin_participants`, a sleeping waiter frees its CPU, but a pinned member that is descheduled behind a foreign process cannot move.
 

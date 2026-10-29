@@ -71,6 +71,8 @@ pub use park::Parker;
 #[doc(hidden)]
 pub use park::{Barrier, Completion, Waiter};
 pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
+#[doc(hidden)]
+pub use pool::WaitCounters;
 pub use pool::{Pool, PoolBuilder};
 pub use reserve::{IntoTeamError, Team};
 pub use team::{Cancelled, Participant, TeamExec};

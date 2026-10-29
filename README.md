@@ -141,6 +141,13 @@ cargo bench --bench wait_scenarios -- --scenario gaps --widths 8   # one scenari
   `probe/107-acquire-per-call`). The acceptance check is that width 64 under load is no longer
   slow and width 48 does not regress.
 
+To compare two commits on a shared host, `scripts/bench-ab.sh <base-rev> <head-rev> <rounds>
+[bench args]` builds both and alternates them, so a drift of other users' load falls on both sides;
+`HEAD_VARIANTS='--spin-polls 12288;--pressure-events 1'` adds head runs with tuning flags (this
+version only). The base of the waits change is its bench commit `a3a9320` (the bench on the 0.1.3
+waits). Under every threadteam row, a `waits per call` line counts join and barrier sleeps, member
+parks and the preemptions waiters saw.
+
 Results are committed as CSV under [`docs/design/waiting-data/`](docs/design/waiting-data/), one
 file per host, with the label naming the commit; the summary tables live in `waiting.md`.
 

@@ -28,11 +28,16 @@
 //!
 //! Options: `--scenario sections|gaps|acquire|nested|all`, `--widths 64,48`, `--impl threadteam,rayon`,
 //! `--load K:P`, `--calls N` (default 200; `gaps` and `acquire` use N/2), `--csv <file>`,
-//! `--label <text>` (the version or commit, written to the CSV).
+//! `--label <text>` (the version or commit, written to the CSV); tuning of the waits (this
+//! version only, `docs/design/waiting.md`): `--spin-polls N`, `--throttled-polls N`,
+//! `--pressure-hold-ms N` (0 throttles only the waiter that saw a preemption),
+//! `--pressure-events N` (preemptions within the hold that throttle the pool). Under each
+//! threadteam row a `waits per call` line counts join and barrier sleeps, member parks and the
+//! preemptions waiters saw.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
-use threadteam::{Pool, Team};
+use threadteam::{Pool, Team, WaitCounters};
 
 fn busy(us: u64) {
     let end = Instant::now() + Duration::from_micros(us);
@@ -128,12 +133,61 @@ fn stats(mut v: Vec<f64>) -> Stats {
     }
 }
 
+/// Pool settings from the command line (`--spin-polls`, `--throttled-polls`,
+/// `--pressure-hold-ms`); `None` keeps the library default.
+type Tuning = (Option<u32>, Option<(u32, Duration, u32)>);
+static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
+
 fn pool(width: usize) -> Pool {
-    Pool::builder()
+    let mut b = Pool::builder()
         .threads(width)
-        .acquire_timeout(Duration::from_secs(30))
-        .build()
-        .expect("a pool")
+        .acquire_timeout(Duration::from_secs(30));
+    if let Some((spin, throttle)) = TUNING.get() {
+        if let Some(n) = spin {
+            b = b.spin_polls(*n);
+        }
+        if let Some((polls, hold, events)) = throttle {
+            b = b.wait_tuning(*polls, *hold, *events);
+        }
+    }
+    b.build().expect("a pool")
+}
+
+/// Counters of the waits between two snapshots.
+fn waits_between(a: WaitCounters, b: WaitCounters) -> WaitCounters {
+    WaitCounters {
+        join_sleeps: b.join_sleeps - a.join_sleeps,
+        barrier_sleeps: b.barrier_sleeps - a.barrier_sleeps,
+        member_parks: b.member_parks - a.member_parks,
+        pressure_events: b.pressure_events - a.pressure_events,
+    }
+}
+
+fn waits_sum(a: WaitCounters, b: WaitCounters) -> WaitCounters {
+    WaitCounters {
+        join_sleeps: a.join_sleeps + b.join_sleeps,
+        barrier_sleeps: a.barrier_sleeps + b.barrier_sleeps,
+        member_parks: a.member_parks + b.member_parks,
+        pressure_events: a.pressure_events + b.pressure_events,
+    }
+}
+
+fn snap(t: &Option<Team>) -> WaitCounters {
+    t.as_ref()
+        .map(|t| t.pool().wait_counters())
+        .unwrap_or_default()
+}
+
+/// Prints what the waits of the cell just reported did (stdout only).
+fn waits_line(c: WaitCounters, calls: usize) {
+    let per = |n: u64| n as f64 / calls.max(1) as f64;
+    println!(
+        "          waits per call: join sleeps {:.1}, barrier sleeps {:.1}, member parks {:.1}, preemptions seen {:.2}",
+        per(c.join_sleeps),
+        per(c.barrier_sleeps),
+        per(c.member_parks),
+        per(c.pressure_events)
+    );
 }
 
 fn team(width: usize) -> Team {
@@ -288,6 +342,20 @@ fn main() {
     });
     let calls: usize = value("--calls").map_or(200, |v| v.parse().expect("--calls"));
     let label = value("--label").unwrap_or_default();
+    let spin = value("--spin-polls").map(|v| v.parse().expect("--spin-polls"));
+    let throttle = match (
+        value("--throttled-polls"),
+        value("--pressure-hold-ms"),
+        value("--pressure-events"),
+    ) {
+        (None, None, None) => None,
+        (t, h, e) => Some((
+            t.map_or(100, |v| v.parse().expect("--throttled-polls")),
+            Duration::from_millis(h.map_or(100, |v| v.parse().expect("--pressure-hold-ms"))),
+            e.map_or(4, |v| v.parse().expect("--pressure-events")),
+        )),
+    };
+    TUNING.get_or_init(|| (spin, throttle));
     let load_text = load_spec.map_or("none".into(), |(k, p)| format!("{k}x{p}%"));
 
     let csv = value("--csv").map(|path| {
@@ -341,6 +409,7 @@ fn main() {
                 let param = format!("work={work}us,sections={sections}");
                 let ideal = (sections as u64 * work) as f64;
                 if let Some(t) = &held {
+                    let c0 = snap(&held);
                     let v = (0..calls)
                         .map(|_| call_team(t, w, sections, work).1)
                         .collect();
@@ -353,6 +422,7 @@ fn main() {
                         s: stats(v),
                         ideal_us: ideal,
                     });
+                    waits_line(waits_between(c0, snap(&held)), calls);
                 }
                 if let Some(p) = &rayon_pool {
                     let v = (0..calls)
@@ -390,7 +460,9 @@ fn main() {
                     (stats(first), stats(whole))
                 };
                 if let Some(t) = &held {
+                    let c0 = snap(&held);
                     let (a, b) = run(&mut || call_team(t, w, sections, work));
+                    let c = waits_between(c0, snap(&held));
                     out.row(Row {
                         scenario: "gaps",
                         imp: "threadteam",
@@ -409,6 +481,7 @@ fn main() {
                         s: b,
                         ideal_us: (sections as u64 * work) as f64,
                     });
+                    waits_line(c, calls / 2);
                 }
                 if let Some(p) = &rayon_pool {
                     let (a, b) = run(&mut || call_rayon(p, w, sections, work));
@@ -437,6 +510,7 @@ fn main() {
         if want("nested") && w >= 4 {
             if let Some(t) = &held {
                 let (splits, work) = (100, 20u64);
+                let c0 = snap(&held);
                 let v = (0..calls / 2)
                     .map(|_| call_nested(t, w, splits, work))
                     .collect();
@@ -449,6 +523,7 @@ fn main() {
                     s: stats(v),
                     ideal_us: (splits as u64 * work) as f64,
                 });
+                waits_line(waits_between(c0, snap(&held)), calls / 2);
             }
         }
 
@@ -470,28 +545,36 @@ fn main() {
             };
             {
                 let t = team(w);
+                let c0 = t.pool().wait_counters();
                 let v = (0..calls / 2)
                     .map(|_| call_team(&t, w, sections, work).1)
                     .collect();
                 row("held_team", "call", v);
+                waits_line(waits_between(c0, t.pool().wait_counters()), calls / 2);
             }
             {
                 let p = pool(w);
+                let c0 = p.wait_counters();
                 let v = (0..calls / 2)
                     .map(|_| call_pool(&p, w, sections, work))
                     .collect();
                 row("held_pool", "call", v);
+                waits_line(waits_between(c0, p.wait_counters()), calls / 2);
             }
             let (mut call, mut total) = (Vec::new(), Vec::new());
+            let mut c = WaitCounters::default();
             for _ in 0..calls / 2 {
                 let t0 = Instant::now();
                 let t = team(w);
+                let c0 = t.pool().wait_counters();
                 call.push(call_team(&t, w, sections, work).1);
+                c = waits_sum(c, waits_between(c0, t.pool().wait_counters()));
                 drop(t);
                 total.push(t0.elapsed().as_secs_f64() * 1e6);
             }
             row("fresh_pool", "call", call);
             row("fresh_pool", "total", total);
+            waits_line(c, calls / 2);
         }
     }
 }

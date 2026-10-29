@@ -221,7 +221,6 @@ fn class_rows_and_host_default() {
     // Classes without a measurement take the generic row: 3, 15, 40 us at the
     // anchors 2, 4, 6 and proportional to the width above them.
     for class in [
-        HostClass::X86_64Avx2,
         HostClass::X86_64Scalar,
         HostClass::Aarch64,
         HostClass::Generic,
@@ -279,4 +278,59 @@ fn class_names() {
     assert_eq!(HostClass::Aarch64Apple.name(), "aarch64-apple");
     assert_eq!(HostClass::Aarch64.name(), "aarch64");
     assert_eq!(HostClass::Generic.name(), "generic");
+}
+
+#[test]
+fn avx2_class_has_the_measured_zen2_team_row() {
+    // threadteam-rs#6: broccoli (EPYC 7702P, Zen2), pool 64,
+    // team/load10us-minus-10us rounded to the nanosecond.
+    let a = DispatchCosts::for_class(HostClass::X86_64Avx2);
+    let g = DispatchCosts::for_class(HostClass::Generic);
+    assert_ne!(a, g);
+    for (w, ns) in [
+        (2, 1423),
+        (4, 1992),
+        (6, 2329),
+        (8, 2738),
+        (12, 3558),
+        (16, 4076),
+        (24, 4292),
+        (32, 4838),
+        (48, 6402),
+        (64, 9333),
+    ] {
+        assert_eq!(
+            a.cost(DispatchKind::Team, nz(w)),
+            Duration::from_nanos(ns),
+            "team width {w}"
+        );
+    }
+    // Between anchors: linear (width 10 is halfway between 8 and 12).
+    assert_eq!(
+        a.cost(DispatchKind::Team, nz(10)),
+        Duration::from_nanos(3148)
+    );
+    // Above the last anchor: in proportion to the width.
+    assert_eq!(
+        a.cost(DispatchKind::Team, nz(128)),
+        Duration::from_nanos(18666)
+    );
+    // The plain kinds stay the generic row, also above its anchors.
+    for w in [2, 4, 6, 8, 64] {
+        for kind in [DispatchKind::InPool, DispatchKind::Outside] {
+            assert_eq!(
+                a.cost(kind, nz(w)),
+                g.cost(kind, nz(w)),
+                "{kind:?} width {w}"
+            );
+        }
+    }
+    assert_eq!(
+        a.cost(DispatchKind::InPool, nz(64)),
+        Duration::from_nanos(160_000)
+    );
+    assert_eq!(
+        a.cost(DispatchKind::Outside, nz(64)),
+        Duration::from_nanos(426_666)
+    );
 }

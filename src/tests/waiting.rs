@@ -4,7 +4,7 @@
 //! deadlines are set explicitly, and the only real delay (a sleep) can only make
 //! a measured gap longer.
 
-use crate::park::{Pressure, Step, Waiter, CONTENDED_HOLD_NS, THROTTLED_POLLS};
+use crate::park::{Pressure, Step, Waiter, CONTENDED_HOLD_NS, PREEMPT_GAP_NS, THROTTLED_POLLS};
 use std::time::Duration;
 
 /// Steps until the waiter says sleep; the number of `Poll` steps before it.
@@ -42,7 +42,8 @@ fn a_pool_under_pressure_starts_its_waits_throttled() {
 
 #[test]
 fn a_descheduled_spinner_ends_its_spin_and_records_the_pressure() {
-    let p = Pressure::new();
+    // Detection on (as during a new pool's warm-up, or with a nonzero gap).
+    let p = Pressure::new().with_gap(PREEMPT_GAP_NS);
     assert_eq!(p.events(), 0);
     let mut w = Waiter::new(1_000_000, Some(&p));
     // The first clock read is at poll 64; a gap longer than 200 µs before the
@@ -89,7 +90,8 @@ fn with_a_per_thread_hold_a_preemption_throttles_the_thread_that_saw_it() {
     use core::sync::atomic::AtomicU64;
     // The per-thread hold is a benchmark knob (off by default); the pool
     // threshold is off here so that only the thread's own deadline acts.
-    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 0, CONTENDED_HOLD_NS);
+    let p = Pressure::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, 0, CONTENDED_HOLD_NS)
+        .with_gap(PREEMPT_GAP_NS);
     let own = AtomicU64::new(0);
     // A member's wait sees itself descheduled (a gap before its second clock
     // read): its spin ends, and its slot's deadline is set.
@@ -117,7 +119,7 @@ fn with_a_per_thread_hold_a_preemption_throttles_the_thread_that_saw_it() {
 #[test]
 fn by_default_a_preemption_sets_no_per_thread_deadline() {
     use core::sync::atomic::{AtomicU64, Ordering};
-    let p = Pressure::new();
+    let p = Pressure::new().with_gap(PREEMPT_GAP_NS);
     let own = AtomicU64::new(0);
     let mut w = Waiter::of_thread(1_000_000, Some(&p), Some(&own));
     for _ in 0..64 {
@@ -139,7 +141,7 @@ fn by_default_a_preemption_sets_no_per_thread_deadline() {
 fn with_detection_off_a_descheduled_spinner_keeps_spinning() {
     // A preemption gap of zero: no clock-based detection at all (libgomp's
     // waits); the spin runs its whole budget whatever the scheduler did.
-    let p = Pressure::new().with_gap(0);
+    let p = Pressure::new().with_gap(0).with_warm_up(0);
     let mut w = Waiter::new(1_000, Some(&p));
     for _ in 0..64 {
         assert_eq!(w.step(), Step::Poll);
@@ -147,4 +149,24 @@ fn with_detection_off_a_descheduled_spinner_keeps_spinning() {
     std::thread::sleep(Duration::from_millis(2));
     assert_eq!(polls_until_sleep(&mut w), 1_000 - 64 + 16);
     assert_eq!(p.events(), 0);
+}
+
+#[test]
+fn by_default_a_new_pool_detects_preemptions_only_during_its_warm_up() {
+    let spin_through_a_gap = |p: &Pressure| {
+        let mut w = Waiter::new(1_000, Some(p));
+        for _ in 0..64 {
+            w.step();
+        }
+        std::thread::sleep(Duration::from_millis(2));
+        polls_until_sleep(&mut w)
+    };
+    // During the warm-up (a fresh pressure): the gap ends the spin.
+    let warm = Pressure::new();
+    assert_eq!(spin_through_a_gap(&warm), 64 + 16);
+    assert_eq!(warm.events(), 1);
+    // After it (here: no warm-up), the default detects nothing.
+    let steady = Pressure::new().with_warm_up(0);
+    assert_eq!(spin_through_a_gap(&steady), 1_000 - 64 + 16);
+    assert_eq!(steady.events(), 0);
 }

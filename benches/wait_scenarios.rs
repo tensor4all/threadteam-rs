@@ -34,8 +34,9 @@
 //! `--pressure-hold-ms N` (0 throttles only the waiter that saw a preemption),
 //! `--pressure-events N` (preemptions within the hold that throttle the pool; 0 never),
 //! `--own-hold-ms N` (how long a preemption throttles the member that saw it; default 0),
-//! `--preempt-gap-us N` (the gap that counts as a preemption; default 200; 0 turns detection
-//! and every throttle off, as libgomp). Under each
+//! `--preempt-gap-us N` (the gap that counts as a preemption after the warm-up; default 0:
+//! no detection, as libgomp), `--warm-ms N` (how long after a pool is built preemptions are
+//! detected with a 200 µs gap; default 200; 0: none). Under each
 //! threadteam row a `waits per call` line counts join and barrier sleeps, member parks and the
 //! preemptions waiters saw.
 
@@ -143,6 +144,7 @@ type Tuning = (
     Option<u32>,
     Option<(u32, Duration, u32, Duration)>,
     Option<Duration>,
+    Option<Duration>,
 );
 static TUNING: std::sync::OnceLock<Tuning> = std::sync::OnceLock::new();
 
@@ -150,9 +152,12 @@ fn pool(width: usize) -> Pool {
     let mut b = Pool::builder()
         .threads(width)
         .acquire_timeout(Duration::from_secs(30));
-    if let Some((spin, throttle, gap)) = TUNING.get() {
+    if let Some((spin, throttle, gap, warm)) = TUNING.get() {
         if let Some(g) = gap {
             b = b.preempt_gap(*g);
+        }
+        if let Some(w) = warm {
+            b = b.warm_up(*w);
         }
         if let Some(n) = spin {
             b = b.spin_polls(*n);
@@ -370,7 +375,8 @@ fn main() {
     };
     let gap = value("--preempt-gap-us")
         .map(|v| Duration::from_micros(v.parse().expect("--preempt-gap-us")));
-    TUNING.get_or_init(|| (spin, throttle, gap));
+    let warm = value("--warm-ms").map(|v| Duration::from_millis(v.parse().expect("--warm-ms")));
+    TUNING.get_or_init(|| (spin, throttle, gap, warm));
     let load_text = load_spec.map_or("none".into(), |(k, p)| format!("{k}x{p}%"));
 
     let csv = value("--csv").map(|path| {

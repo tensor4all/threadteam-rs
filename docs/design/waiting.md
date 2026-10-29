@@ -90,20 +90,37 @@ The last member of a section therefore pays one extra uncontended read-modify-wr
   - 12288 polls (about 300 µs) made the first section after a 1 ms or 10 ms gap 2.3x and 10.8x slower than 0.1.3 on a quiet host (evo): the members had gone to sleep. 131072 closed the 1 ms gap; 300000 also closes the 10 ms gap (evo, `d430347` runs), and is accepted as the OpenMP default (criterion d).
   - libomp keeps 200 ms (`KMP_BLOCKTIME`); 0.1.3 kept 200 ms of wall time for members and never slept in joins.
 - **No calibration.** Converting a time to polls at pool build was considered and dropped (pre-review): a calibration taken while the CPU is contended yields too few polls, and a bare PAUSE loop is not the real poll anyway. The count is approximate in time, as libgomp's is.
-- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed, or while the pool is under sustained pressure (below).
+- **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed, or while a new pool is under sustained pressure (below).
 
-### Scheduling pressure
+### Scheduling pressure: only while a pool is new
 
-- **Detection.** A spinning waiter reads the clock (`Instant::now`, vDSO) every 64 polls. If the gap since its previous read exceeds 200 µs, it was descheduled while it spun. Sixty-four polls take well under 10 µs, and a scheduler slice is 0.75 ms or more.
-- **What it means.** This is a pressure heuristic, not proof of foreign load. A foreign process, another thread of the team, interrupts, page faults or VM steal all look the same, and a short preemption can escape the threshold. It is acceptable because the response only shortens active waiting; it never changes affinity or correctness.
-- **Response.** The waiter ends its spin at once (yields, then sleeps). The pool counts the observations: once 4 come within 100 ms of each other, every wait of the pool adopts the throttled budget at its first clock read, for 100 ms (moved forward with a `fetch_max`, so an older observation never shortens a newer one).
-  - **Not on one observation.** Throttling the whole pool on a single preemption made every section of a width-64 team on a mildly shared host sleep and pay futex wakes (broccoli, `held_team` 1.48 → 6.12 ms, `c0c024b`'s predecessor). An isolated preemption now ends only its own waiter's spin.
-  - **Not per thread.** `2773c36` tried giving the thread that saw a preemption a 100 ms deadline of its own instead of throttling the pool. On a quiet broccoli that made held teams 1.79x / 1.21x slower than 0.1.3 (against 1.03 / 1.07 with the pool threshold): one member preempted once then slept at every section for the hold, and every join waited for its wake-up. The per-thread hold remains a benchmark knob (`--own-hold-ms`, off by default).
-  - **The pool-wide throttle at all:** on a saturated host (primerose), throttling only the waiter that saw the preemption left the pool as slow as 0.1.3.
-  - **Knobs and counters.** The threshold, the hold, the throttled budget and the per-thread hold can be varied for the benchmarks (`PoolBuilder::wait_tuning`, hidden; `--pressure-events`, `--pressure-hold-ms`, `--throttled-polls`, `--own-hold-ms`). `Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
-- **Open comparison (after `d430347`).** Under load the throttle made held teams 3.45x slower than libgomp (5842 against 1693 µs) and the gaps 4-5x, while libgomp, which detects nothing, neither throttles nor collapses. The variant without any detection (`--preempt-gap-us 0`: spin 300000, yield, sleep, as libgomp) is measured against criteria (a)-(c); if it keeps (a), it becomes the default, otherwise the throttle is kept only for long preemptions (a larger `--preempt-gap-us`, for example 2000).
-- **Cost.** A wait that ends within 64 polls never reads the clock; otherwise one clock read per 64 polls. There is no `getrusage` or other syscall in the poll loop.
-- **Limit.** A pool built for a single call (`with_team`) cannot carry the deadline to the next call. What helps it is the short budget and the sleeps in `join` and `barrier`, which give the scheduler idle CPUs within the call. With `pin_participants`, a sleeping waiter frees its CPU, but a pinned member that is descheduled behind a foreign process cannot move.
+**Default: libgomp's waits.** Once a pool is past its warm-up, its waits detect nothing: every wait spins 300000 polls, yields 16 times and sleeps, as libgomp's do (`GOMP_SPINCOUNT`, futex).
+- On broccoli (`e76036c`, 16:58Z) this was the only configuration that met criteria (b) and (c) together: on quiet hosts held teams within 10 % of 0.1.3, and under load `held_team` at 0.91x libgomp, `held_pool` +7.8 %, gaps on par with libgomp.
+- Every detecting variant made held teams under load 3.5-4x slower than libgomp, because detection throttled waits that libgomp keeps spinning.
+- The main path of real use is a held pool: tenferro's `CpuEngine` holds its pool, and libomp and libgomp hold hot teams.
+
+**Warm-up: detection while a pool is new (default 200 ms after it is built).** Without any detection, a pool built for one call (`fresh_pool`, faer's `with_team`) collapsed (87.6 ms): its freshly spawned threads start stacked, because the scheduler places new threads before it knows their load, and spinning members never leave a CPU idle to pull one over. So during the warm-up a new pool's waiters detect preemptions and the pool can throttle, as in `c0c024b`, which kept the faer#107 arms at zero:
+- **Detection.** A spinning waiter reads the clock every 64 polls. A gap of more than 200 µs between two reads means it was descheduled while it spun: 64 polls take well under 10 µs, and a scheduler slice is 0.75 ms or more.
+- **Response.** That waiter ends its spin (yields, then sleeps). The pool counts the observations, and once 4 come within 100 ms of each other, every wait of the pool adopts the throttled budget (100 polls) at its first clock read, for 100 ms (`fetch_max`).
+- **Limits of the signal.** It is a pressure heuristic: foreign load, the team's own threads, interrupts and VM steal look alike, and it only shortens active waiting.
+- **Cost after the warm-up.** None in the poll loop: a wait's first clock read finds detection off, and that wait stops reading the clock.
+
+**What was tried and measured on the way** (broccoli and evo, threadteam-rs#14):
+
+| detection | quiet held teams | held teams under load | fresh pool |
+| --- | --- | --- | --- |
+| a pool-wide throttle on one preemption | 4x slower than 0.1.3 | — | fixed |
+| a pool-wide throttle on 4 preemptions within 100 ms (`c0c024b`) | within 10 % | 3.5-4x libgomp | fixed |
+| a per-thread 100 ms throttle (`2773c36`) | 1.2-1.8x slower | — | fixed |
+| none (`e76036c` variant) | within 10 % | about libgomp | collapsed (87.6 ms) |
+
+**Knobs and counters for the benchmarks** (`PoolBuilder::preempt_gap`, `warm_up`, `wait_tuning`, all hidden; bench flags `--preempt-gap-us`, `--warm-ms`, `--pressure-events`, `--pressure-hold-ms`, `--throttled-polls`, `--own-hold-ms`):
+- detection after the warm-up (a nonzero gap);
+- the warm-up length;
+- the pool threshold, the hold and the throttled budget;
+- a per-thread hold.
+
+`Pool::wait_counters` (hidden) counts join and barrier sleeps, member parks and observed preemptions, printed under every bench row.
 
 ### Start of a section: no arrival barrier
 

@@ -293,6 +293,7 @@ pub struct PoolBuilder {
     pressure_events: u32,
     own_hold: Duration,
     preempt_gap: Duration,
+    warm_up: Duration,
 }
 
 impl PoolBuilder {
@@ -312,7 +313,8 @@ impl PoolBuilder {
             pressure_hold: Duration::from_nanos(crate::park::CONTENDED_HOLD_NS),
             pressure_events: crate::park::CONTENDED_EVENTS,
             own_hold: Duration::ZERO,
-            preempt_gap: Duration::from_nanos(crate::park::PREEMPT_GAP_NS),
+            preempt_gap: Duration::ZERO,
+            warm_up: Duration::from_nanos(crate::park::WARM_NS),
         }
     }
 
@@ -628,13 +630,25 @@ impl PoolBuilder {
     }
 
     /// The gap between two clock reads of a spinning waiter that counts as a
-    /// preemption (default 200 µs), for the wait benchmarks only. Zero turns
-    /// the detection off: every wait then spins its full budget, yields and
-    /// sleeps, as libgomp's waits do. See `docs/design/waiting.md`.
+    /// preemption after the pool's warm-up, for the wait benchmarks only.
+    /// Zero (the default) turns the detection off: every wait then spins its
+    /// full budget, yields and sleeps, as libgomp's waits do. See
+    /// `docs/design/waiting.md`.
     #[doc(hidden)]
     #[must_use]
     pub fn preempt_gap(mut self, gap: Duration) -> Self {
         self.preempt_gap = gap;
+        self
+    }
+
+    /// How long after the pool is built its waiters detect preemptions (gap
+    /// 200 µs) and the pool can throttle, whatever [`preempt_gap`](Self::preempt_gap)
+    /// says (default 200 ms; zero: no warm-up), for the wait benchmarks only.
+    /// See `docs/design/waiting.md`.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn warm_up(mut self, warm: Duration) -> Self {
+        self.warm_up = warm;
         self
     }
 
@@ -727,7 +741,8 @@ impl PoolBuilder {
                     self.pressure_events,
                     u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
                 )
-                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX)),
+                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX))
+                .with_warm_up(u64::try_from(self.warm_up.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }
@@ -749,7 +764,8 @@ impl PoolBuilder {
                     self.pressure_events,
                     u64::try_from(self.own_hold.as_nanos()).unwrap_or(u64::MAX),
                 )
-                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX)),
+                .with_gap(u64::try_from(self.preempt_gap.as_nanos()).unwrap_or(u64::MAX))
+                .with_warm_up(u64::try_from(self.warm_up.as_nanos()).unwrap_or(u64::MAX)),
             )),
         })
     }

@@ -160,10 +160,20 @@ const YIELD_POLLS: u32 = if cfg!(loom) { 0 } else { 16 };
 /// A spinning waiter reads the clock once per this many polls.
 const CHECK_EVERY: u32 = 64;
 
-/// Default gap between two clock reads of a spinning waiter that counts as a
-/// preemption: 64 polls take well under 10 µs, and a scheduler slice is 0.75 ms
-/// or more. Zero turns the detection off (libgomp's behaviour).
+/// The gap between two clock reads of a spinning waiter that counts as a
+/// preemption while detection is on: 64 polls take well under 10 µs, and a
+/// scheduler slice is 0.75 ms or more.
 pub(crate) const PREEMPT_GAP_NS: u64 = 200_000;
+
+/// How long after a pool is built its waiters detect preemptions (with
+/// [`PREEMPT_GAP_NS`]) and the pool can throttle; after that, by default,
+/// nothing is detected and every wait spins, yields and sleeps as libgomp's
+/// do. A pool's first calls are where freshly spawned threads sit stacked
+/// (the scheduler places new threads before it knows their load): a pool
+/// built for one call (`with_team`) collapsed without detection (broccoli,
+/// threadteam-rs#14 `e76036c`: 87.6 ms), while a held pool, past its first
+/// moments, ran as fast as libgomp only without it.
+pub(crate) const WARM_NS: u64 = 200_000_000;
 
 /// Default time a pool keeps starting its waits throttled once its waiters
 /// were descheduled often enough (see [`CONTENDED_EVENTS`]).
@@ -215,9 +225,13 @@ pub struct Pressure {
     own_hold_ns: u64,
     /// The throttled budget, in polls.
     throttled: u32,
-    /// A gap between two clock reads longer than this is a preemption; zero
-    /// turns the detection (and with it every throttle) off.
+    /// After the warm-up: a gap between two clock reads longer than this is a
+    /// preemption; zero (the default) turns the detection, and with it every
+    /// throttle, off.
     gap_ns: u64,
+    /// Nanoseconds since `base` until which waiters detect preemptions with
+    /// [`PREEMPT_GAP_NS`] whatever `gap_ns` says (the warm-up of a new pool).
+    warm_until: u64,
     /// Start of the current observation window, and observations in it. A
     /// heuristic: concurrent updates may lose a count, never an escalation by
     /// a later window.
@@ -239,11 +253,29 @@ impl Pressure {
         Self::tuned(THROTTLED_POLLS, CONTENDED_HOLD_NS, CONTENDED_EVENTS, 0)
     }
 
-    /// This pressure with a preemption gap of `gap_ns` (0: no detection).
+    /// This pressure with a preemption gap of `gap_ns` after the warm-up (0: no
+    /// detection).
     #[must_use]
     pub fn with_gap(mut self, gap_ns: u64) -> Self {
         self.gap_ns = gap_ns;
         self
+    }
+
+    /// This pressure with a warm-up of `warm_ns` after its creation, during
+    /// which waiters detect preemptions whatever the gap after it (0: none).
+    #[must_use]
+    pub fn with_warm_up(mut self, warm_ns: u64) -> Self {
+        self.warm_until = warm_ns;
+        self
+    }
+
+    /// The preemption gap that applies at `now` (0: no detection).
+    fn gap_at(&self, now: u64) -> u64 {
+        if now < self.warm_until {
+            PREEMPT_GAP_NS
+        } else {
+            self.gap_ns
+        }
     }
 
     /// No pressure recorded yet, with a throttled budget of `throttled` polls,
@@ -258,7 +290,8 @@ impl Pressure {
             threshold,
             own_hold_ns,
             throttled,
-            gap_ns: PREEMPT_GAP_NS,
+            gap_ns: 0,
+            warm_until: WARM_NS,
             window: AtomicU64::new(0),
             in_window: AtomicU64::new(0),
             events: AtomicU64::new(0),
@@ -385,16 +418,20 @@ impl<'a> Waiter<'a> {
     #[cold]
     fn checkpoint(&mut self) {
         let Some(p) = self.pressure else { return };
-        if p.gap_ns == 0 {
+        let now = p.now();
+        let gap = p.gap_at(now);
+        if gap == 0 {
+            // No detection now, and none later in this episode: stop reading
+            // the clock.
+            self.pressure = None;
             return;
         }
-        let now = p.now();
         let own_active = || self.own.is_some_and(|o| o.load(Ordering::Relaxed) > now);
         match self.last {
             None if p.active(now) || own_active() => {
                 self.budget = self.budget.min(p.throttled().max(self.polls))
             }
-            Some(last) if now.saturating_sub(last) > p.gap_ns => {
+            Some(last) if now.saturating_sub(last) > gap => {
                 p.note(now);
                 if let (Some(o), hold @ 1..) = (self.own, p.own_hold_ns()) {
                     o.fetch_max(now.saturating_add(hold), Ordering::Relaxed);

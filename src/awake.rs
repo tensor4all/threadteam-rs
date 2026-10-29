@@ -56,13 +56,56 @@ const RESERVED: usize = 3;
 pub(crate) struct Padded<T>(pub(crate) T);
 
 /// Pure spin for a while, then yield the CPU between polls.
+///
+/// Used where progress needs cooperation with other threads on the same CPUs:
+/// `acquire`, the cold claim, and the loops that are not reserved dispatch
+/// polls (`IDLE`, and the states a loop is leaving). Reserved members and a
+/// leader waiting on a section poll with [`spin_wait`] instead.
 #[inline]
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub(crate) fn backoff(spins: &mut u32) {
     if *spins < (1 << 14) {
         *spins += 1;
         std::hint::spin_loop();
     } else {
         std::thread::yield_now();
+    }
+}
+
+/// One PAUSE per poll (YIELD on aarch64), never a yield.
+///
+/// The wait of a reserved member polling `gen`, and of a leader in
+/// `Section::join` / `Section::barrier`, in a scope that is not oversubscribed:
+/// a thread that only spins with PAUSE stays runnable but does not repeatedly
+/// re-enter the scheduler, so a stacked pair can be separated and a share does
+/// not pay for a `sched_yield` on every poll. A parked member is woken by the
+/// leader through [`Parker`].
+#[inline]
+pub(crate) fn spin_wait() {
+    std::hint::spin_loop();
+}
+
+/// How many polls a joined section spins before it yields, in an oversubscribed
+/// scope (more participants than CPUs in the caller's set).
+const OVERSUBSCRIBED_SPINS: u32 = 100;
+
+/// One poll of a leader waiting on a section.
+///
+/// Not oversubscribed: [`spin_wait`]. Oversubscribed: about
+/// [`OVERSUBSCRIBED_SPINS`] PAUSE spins, then one `yield_now` per poll, so the
+/// waiting participants do not hold every CPU while their peers are queued
+/// behind them (the shape libomp takes when it detects oversubscription).
+#[inline]
+fn wait_poll(over: bool, polls: &mut u32) {
+    if !over {
+        spin_wait();
+        return;
+    }
+    if *polls >= OVERSUBSCRIBED_SPINS {
+        std::thread::yield_now();
+    } else {
+        *polls += 1;
+        std::hint::spin_loop();
     }
 }
 
@@ -82,6 +125,10 @@ struct Slot {
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
     lent: AtomicBool,
+    /// The mask this member saved before pinning itself; only the member thread
+    /// of this slot touches it (see [`crate::pin::SavedMask`]).
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    saved: crate::pin::SavedMask,
     /// Where this member sleeps once its park delay has passed; woken by the
     /// leader after it changed `gen`, `state` or `lent` of this slot.
     park: Parker,
@@ -98,6 +145,7 @@ impl Slot {
             idle_yield: AtomicBool::new(false),
             park_ns: AtomicU64::new(u64::MAX),
             lent: AtomicBool::new(false),
+            saved: crate::pin::SavedMask::new(),
             park: Parker::new(),
         }
     }
@@ -111,6 +159,8 @@ pub(crate) struct Awake {
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
     pub(crate) costs: crate::cost::DispatchCosts,
+    /// Opt-in participant pinning (`PoolBuilder::pin_participants`).
+    pub(crate) pin: bool,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
     #[cfg(feature = "trace")]
@@ -123,6 +173,7 @@ impl Awake {
         defaults: WaitPolicy,
         acquire_timeout: Duration,
         costs: crate::cost::DispatchCosts,
+        pin: bool,
     ) -> Self {
         Awake {
             slots: (0..width).map(|_| Slot::new()).collect(),
@@ -130,6 +181,7 @@ impl Awake {
             release_epoch: AtomicUsize::new(0),
             defaults,
             costs,
+            pin,
             acquire_timeout,
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),
@@ -154,6 +206,34 @@ impl Awake {
                 .store(policy.idle_runs_rayon(), Ordering::Relaxed);
             s.state.store(IDLE, Ordering::SeqCst);
             s.park.wake();
+        }
+    }
+
+    /// Sets the park delay of the given reserved members, in nanoseconds.
+    ///
+    /// A root team scope writes it once at entry: zero (park after the short
+    /// spin) when the scope is oversubscribed, the effective `idle_spin`
+    /// otherwise. Nothing else changes it, so a member keeps the value of the
+    /// scope it was reserved for.
+    pub(crate) fn set_park_ns(&self, ids: &[usize], ns: u64) {
+        for &id in ids {
+            self.slots[id].park_ns.store(ns, Ordering::Relaxed);
+        }
+    }
+
+    /// Restores the saved mask of member slot `id`, on the calling thread.
+    ///
+    /// Only the worker whose index is `id` may call this (`sched::unpin_worker`
+    /// does), and that worker owns the slot's saved mask (see
+    /// [`crate::pin::SavedMask`]). It is used when a pinned participant's own
+    /// thread is about to run work that is not its team's (`Exec::external`,
+    /// for example in the member that leads a `fork` child), so the foreign
+    /// work does not keep the team's placement. The member re-pins only at the
+    /// next pin section.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pub(crate) fn unpin_member(&self, id: usize) {
+        if let Some(slot) = self.slots.get(id) {
+            slot.saved.restore();
         }
     }
 
@@ -412,7 +492,9 @@ fn claim_job(aw: &std::sync::Arc<Awake>, acq: &std::sync::Arc<Acq>) {
 /// another member does not move it, and it is read only while polling. When it
 /// is older than the member's park delay the member parks and stays reserved;
 /// a member whose team runs no section therefore costs CPU for the park delay
-/// at most, then nothing.
+/// at most, then nothing. The delay is zero in an oversubscribed root scope, so
+/// `polls` and `spins` are reset at the start of each idle episode there: the
+/// member then spins one short episode of `polls` and parks.
 #[cfg(feature = "parallel")]
 fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     use std::time::Instant;
@@ -420,14 +502,27 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
     let mut idle_since: Option<Instant> = None;
     let mut last_work: Option<Instant> = None;
     let mut was_lent = false;
+    let mut reserved = true;
     let mut spins = 0u32;
     let mut polls = 0u32;
     trace!(aw, Some(id), Enter);
     loop {
-        match slot.state.load(Ordering::Acquire) {
+        let state = slot.state.load(Ordering::Acquire);
+        // Pinning ends with the reservation, and it ends on this thread: a
+        // member restores its own mask before it leaves `RESERVED` and before
+        // it serves Rayon work (a lend restores it below).
+        if state == RESERVED {
+            reserved = true;
+        } else if reserved {
+            reserved = false;
+            slot.saved.restore();
+        }
+        match state {
             RESERVED if slot.lent.load(Ordering::Acquire) => {
                 if !was_lent {
                     was_lent = true;
+                    // The thread serves the pool's jobs now: undo our pin first.
+                    slot.saved.restore();
                     trace!(aw, Some(id), LentBegin);
                 }
                 idle_since = None;
@@ -447,8 +542,14 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                 idle_since = None;
                 let g = slot.gen.load(Ordering::Acquire);
                 if g == seen {
+                    let fresh = last_work.is_none();
                     let since = *last_work.get_or_insert_with(Instant::now);
-                    backoff(&mut spins);
+                    if fresh {
+                        // A new idle episode: the park check counts from here.
+                        spins = 0;
+                        polls = 0;
+                    }
+                    spin_wait();
                     polls = polls.wrapping_add(1);
                     if polls & 0x3F == 0 {
                         let park_ns = slot.park_ns.load(Ordering::Relaxed);
@@ -458,18 +559,26 @@ fn member_loop(aw: &Awake, id: usize, mut seen: usize, epoch: usize) {
                             trace!(aw, Some(id), ParkExit);
                             last_work = None;
                             spins = 0;
+                            polls = 0;
                         }
                     }
                 } else {
                     seen = g;
                     spins = 0;
+                    polls = 0;
                     last_work = None;
                     let ptr = slot.ptr.load(Ordering::Relaxed);
                     let arg = slot.arg.load(Ordering::Relaxed);
-                    trace!(aw, Some(id), SectionBegin);
                     // SAFETY: the leader keeps the section alive until its
                     // completion counter reaches zero, which happens only
-                    // after this call decremented it.
+                    // after the call below decremented it.
+                    if unsafe { (*ptr).pin } {
+                        // A pin section: this member saves its previous mask
+                        // here, before it pins itself in its share.
+                        slot.saved.save_if_unpinned();
+                    }
+                    trace!(aw, Some(id), SectionBegin);
+                    // SAFETY: as above.
                     unsafe { Section::execute_member(ptr, arg) };
                     trace!(aw, Some(id), SectionEnd);
                 }
@@ -534,6 +643,16 @@ pub(crate) struct Section {
     dispatched: usize,
     slot_of: unsafe fn(*const (), usize) -> usize,
     slot_data: *const (),
+    /// The root scope this section belongs to has more participants than the
+    /// caller's CPU set has CPUs. Nested sections of the same root inherit it;
+    /// it is never recomputed from a child's size.
+    pub(crate) over: bool,
+    /// This is the *pin* section of a root scope (the extra section a root
+    /// scope runs when participant pinning is on): a member that sees it saves
+    /// its own mask before its share pins it. The CPU set itself lives in the
+    /// section's closure, which captures it.
+    #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+    pin: bool,
     /// Dispatched participants that have not finished.
     remaining: Padded<AtomicUsize>,
     arrived: Padded<AtomicUsize>,
@@ -545,18 +664,39 @@ pub(crate) struct Section {
 }
 
 // SAFETY: `data` points to a `Sync` closure that outlives the section; every
-// other field is an atomic or a mutex.
+// other field is an atomic, a plain flag written before the section is
+// published (and read only after a member observed the publishing `gen` with
+// acquire ordering), or a function pointer.
 unsafe impl Sync for Section {}
+
+/// The geometry of a section: its shares, its participants, and the flags of
+/// the root scope it belongs to.
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    /// Number of dispatched targets (participants minus the leader).
+    pub(crate) dispatched: usize,
+    /// Number of participants, leader included.
+    pub(crate) size: usize,
+    /// The root scope is oversubscribed.
+    pub(crate) over: bool,
+    /// This is the pin section of a root scope (see `Section::pin`).
+    pub(crate) pin: bool,
+}
 
 impl Section {
     pub(crate) fn new(
         call: unsafe fn(*const (), &Section, usize),
         data: *const (),
-        size: usize,
-        dispatched: usize,
         slot_of: unsafe fn(*const (), usize) -> usize,
         slot_data: *const (),
+        geometry: Geometry,
     ) -> Self {
+        let Geometry {
+            dispatched,
+            size,
+            over,
+            pin,
+        } = geometry;
         Section {
             call,
             data,
@@ -564,6 +704,8 @@ impl Section {
             dispatched,
             slot_of,
             slot_data,
+            over,
+            pin,
             remaining: Padded(AtomicUsize::new(dispatched)),
             arrived: Padded(AtomicUsize::new(0)),
             epoch: Padded(AtomicUsize::new(0)),
@@ -639,10 +781,13 @@ impl Section {
     }
 
     /// Waits until every dispatched participant has finished.
+    ///
+    /// Polls with [`spin_wait`] (one PAUSE, no yield) unless the root scope is
+    /// oversubscribed, where it spins about 100 times and then yields per poll.
     pub(crate) fn join(&self) {
-        let mut spins = 0;
+        let mut polls = 0;
         while self.remaining.0.load(Ordering::Acquire) != 0 {
-            backoff(&mut spins);
+            wait_poll(self.over, &mut polls);
         }
     }
 
@@ -661,7 +806,7 @@ impl Section {
             self.epoch.0.store(epoch.wrapping_add(1), Ordering::Release);
             return true;
         }
-        let mut spins = 0;
+        let mut polls = 0;
         loop {
             if self.epoch.0.load(Ordering::Acquire) != epoch {
                 return true;
@@ -669,7 +814,7 @@ impl Section {
             if self.is_cancelled() {
                 return false;
             }
-            backoff(&mut spins);
+            wait_poll(self.over, &mut polls);
         }
     }
 }

@@ -94,6 +94,10 @@ pub(crate) struct TeamAuth<'p> {
     pub(crate) awake: &'p Awake,
     pub(crate) ids: &'p [usize],
     pub(crate) policy: WaitPolicy,
+    /// The root scope of the token is oversubscribed (see [`TeamExec`]).
+    /// Fixed when the root token is minted and carried into `reborrow`,
+    /// `limit`, `fork` children and every section.
+    pub(crate) over: bool,
 }
 
 impl Exec<'static> {
@@ -434,7 +438,9 @@ impl<'p> Exec<'p> {
                     size: budget,
                     children: tasks,
                 };
-                split_raw(Some(t.awake), t.ids, &plan, |k, ids| body(k, Some(ids)));
+                split_raw(Some(t.awake), t.ids, &plan, t.over, |k, ids| {
+                    body(k, Some(ids));
+                });
             }
             (None, Some(pool)) if tasks > 1 => {
                 sched::run_tasks(pool, tasks, &self.track, |k| body(k, None));
@@ -484,7 +490,9 @@ impl<'p> Exec<'p> {
             f(split::chunk_range(len, chunk, k));
         };
         match (self.team, self.pool) {
-            (Some(t), _) if tasks > 1 => spread_raw(Some(t.awake), t.ids, tasks, body),
+            (Some(t), _) if tasks > 1 => {
+                spread_raw(Some(t.awake), t.ids, tasks, t.over, body);
+            }
             (None, Some(pool)) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
             _ => {
                 for k in 0..tasks {
@@ -550,7 +558,7 @@ impl<'p> Exec<'p> {
             // runs at once, also for a child produced by `fork`.
             let _released = self.track.release();
             let track = &self.track;
-            spread_raw(Some(t.awake), t.ids, self.budget.get(), |i| {
+            spread_raw(Some(t.awake), t.ids, self.budget.get(), t.over, |i| {
                 let _live = track.task();
                 f(i);
             });
@@ -635,6 +643,15 @@ impl<'p> Exec<'p> {
     /// its own responsibility. Without the `parallel` feature, `f` runs inline
     /// and receives a width of one.
     ///
+    /// # Placement
+    ///
+    /// The token's reserved members are **lent** for the call: each restores its
+    /// own affinity mask and serves the pool's jobs until the call returns. The
+    /// calling thread does the same when it is itself a pinned participant of
+    /// this pool (for example a member that leads a [`fork`](Exec::fork) child),
+    /// so the foreign work never keeps a team's single-CPU placement. Both
+    /// re-pin at the next pin section, that is at the next root team scope.
+    ///
     /// # Examples
     ///
     /// ```
@@ -652,6 +669,11 @@ impl<'p> Exec<'p> {
                 // A team token lends its reserved members to the pool for the
                 // call: the library's Rayon work runs on them as well.
                 let _lent = self.team.map(|t| LendGuard::new(t.awake, t.ids));
+                // The calling thread may itself be a pinned participant of this
+                // pool (the member that leads a `fork` child, or a token used
+                // from inside a share): it restores its own mask before it
+                // serves foreign work, as a lent member does.
+                sched::unpin_worker(pool);
                 return sched::enter(pool, &self.track, move || f(width));
             }
         }
@@ -679,6 +701,16 @@ impl<'p> Exec<'p> {
     /// acquisition leaves it available for a barrier-free fallback such as
     /// [`fork`](Exec::fork). It is conserved as usual: while `f` runs the token
     /// is borrowed.
+    ///
+    /// This call opens a **root team scope**: it reads the calling thread's
+    /// affinity mask, which decides two things. With
+    /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants) on
+    /// it places every member on its own CPU of that mask for the scope (the
+    /// leader is never pinned).
+    /// Whether or not pinning is on, it records whether the scope is
+    /// *oversubscribed* (more participants than CPUs in the mask), which decides
+    /// how the members park and how a joining leader waits. See the design
+    /// record.
     ///
     /// # Errors
     ///
@@ -722,12 +754,37 @@ impl<'p> Exec<'p> {
     ) -> Result<R, Refused> {
         if let Some(t) = self.team {
             // Carried members: the (sub)team is available without acquisition.
-            return Ok(f(TeamExec {
+            let mut team = TeamExec {
                 awake: Some(t.awake),
                 ids: t.ids,
                 policy: t.policy.with(over),
                 track: self.track.alias(),
-            }));
+                over: t.over,
+            };
+            // Only the root token minted by a `Team` opens a root scope; a
+            // child, a reborrow or a sub-team re-pins nothing of its own.
+            if self._leader.is_some() {
+                // Root-scope entry, on the executing thread: the root pressure
+                // and the members' park delay are decided by *this* thread's CPU
+                // set. A token minted on another thread (or another mask) is
+                // paced by the thread that enters the scope, exactly as its pin
+                // section is placed by that thread. Descendants inherit it.
+                let oversubscribed = crate::pin::oversubscribed(team.size().get());
+                team.over = oversubscribed;
+                if let Some(awake) = team.awake {
+                    awake.set_park_ns(
+                        team.ids,
+                        crate::pin::park_delay(team.policy, oversubscribed),
+                    );
+                }
+                if let Some(auth) = self.team.as_mut() {
+                    auth.over = oversubscribed;
+                }
+                if team.size().get() > 1 {
+                    pin_scope(&mut team);
+                }
+            }
+            return Ok(f(team));
         }
         let pool = match self.pool {
             Some(pool) if self.budget.get() > 1 => pool,
@@ -738,20 +795,37 @@ impl<'p> Exec<'p> {
                     ids: &[],
                     policy: policy.with(over),
                     track: self.track.alias(),
+                    over: false,
                 }));
             }
         };
         let policy = pool.wait_policy().with(over);
-        let reservation =
-            pool.awake
-                .acquire(pool, self.budget.get() - 1, policy, policy.idle_spin())?;
+        // Root-scope entry: the CPU set of this calling thread decides both the
+        // placement of the participants and whether the scope is
+        // oversubscribed, whatever the pool's pinning setting.
+        let oversubscribed = crate::pin::oversubscribed(self.budget.get());
+        let park_spin = if oversubscribed {
+            Duration::ZERO
+        } else {
+            policy.idle_spin()
+        };
+        let reservation = pool
+            .awake
+            .acquire(pool, self.budget.get() - 1, policy, park_spin)?;
         let mut team = TeamExec {
             awake: Some(&pool.awake),
             ids: &reservation.ids,
             policy,
             track: self.track.alias(),
+            over: oversubscribed,
         };
-        team.acknowledge();
+        // The pin section is also the acknowledgement; without pinning the
+        // participants acknowledge as before. The leader is never pinned, so
+        // there is nothing to restore when the scope ends or unwinds.
+        let pinned = team.size().get() > 1 && pin_scope(&mut team);
+        if !pinned {
+            team.acknowledge();
+        }
         Ok(f(team))
     }
 
@@ -776,6 +850,25 @@ impl<'p> Exec<'p> {
     pub fn ledger_root(&self) -> Option<u64> {
         self.track.root_id()
     }
+}
+
+/// Runs the pin section of a root team scope: every member places itself on its
+/// own CPU of the calling thread's set. The leader is never pinned.
+///
+/// `false` when member pinning is off for this pool, when the platform has no
+/// CPU set (off Linux), or when the calling thread's mask could not be read:
+/// then nothing ran and the caller acknowledges as usual.
+fn pin_scope(team: &mut TeamExec<'_>) -> bool {
+    if !team.awake.is_some_and(|awake| awake.pin) {
+        return false;
+    }
+    // The leader reads its own mask, and never changes it: that set is where
+    // the members are placed.
+    let Some(set) = crate::pin::read_here() else {
+        return false;
+    };
+    team.pin_section(&set);
+    true
 }
 
 impl fmt::Debug for Exec<'_> {

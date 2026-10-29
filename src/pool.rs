@@ -19,6 +19,18 @@ const DEFAULT_STACK_BYTES: usize = 16 << 20;
 /// Default time an acquisition waits for idle workers to wake: 2 ms.
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 
+/// Whether a pool pins the members of a root team scope by default.
+///
+/// The one switch for the default of [`PoolBuilder::pin_participants`]: off, as
+/// in every compared runtime (libgomp, libomp, OpenBLAS, faer) and as measured
+/// on broccoli, where the slow mode of tensor4all/faer#107 disappears only with
+/// member placement (arm C: 0 of 20 processes slow, 0 % stacked samples) while it
+/// persists with a free CPU (arm B: 7 of 20). Turning it on by default would take
+/// CPUs away from other users of the process, fight the caller's `taskset`, and
+/// confine any vendor thread team a member creates, so the decision stays per
+/// pool.
+const PIN_PARTICIPANTS_DEFAULT: bool = false;
+
 /// A fixed set of worker threads that [`Exec`](crate::Exec) tokens place work on.
 ///
 /// `Pool` is the only way to make a pool. It wraps the scheduler privately: no
@@ -146,6 +158,20 @@ impl Pool {
         self.awake.costs
     }
 
+    /// Whether the pool pins the **members** of a root team scope (see
+    /// [`PoolBuilder::pin_participants`]); the leader is never pinned.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(1).build()?;
+    /// assert!(!pool.pin_participants()); // off by default
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn pin_participants(&self) -> bool {
+        self.awake.pin
+    }
+
     /// Number of workers currently kept awake as team members, reserved or
     /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
     /// can change at any moment.
@@ -225,6 +251,7 @@ pub struct PoolBuilder {
     acquire_timeout: Duration,
     qos: Option<Qos>,
     costs: DispatchCosts,
+    pin_participants: bool,
 }
 
 impl PoolBuilder {
@@ -238,6 +265,7 @@ impl PoolBuilder {
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             qos: None,
             costs: DispatchCosts::host_default(),
+            pin_participants: PIN_PARTICIPANTS_DEFAULT,
         }
     }
 
@@ -423,6 +451,86 @@ impl PoolBuilder {
         self
     }
 
+    /// Pins the **members** of a root team scope onto the calling thread's CPU
+    /// set. Off by default; Linux only, where it does something.
+    ///
+    /// With it on, the leader of a root team scope
+    /// ([`Exec::team`](crate::Exec::team), or the root token of a
+    /// [`Team`](crate::Team)) reads **its own** affinity mask `S` with
+    /// `sched_getaffinity`, and every member pins itself with
+    /// `sched_setaffinity` onto one CPU of `S`: member `k` (participant `k`,
+    /// counting the leader as 0) onto the `k`-th set CPU of `S`, wrapping modulo
+    /// `|S|` when the team is wider than the set. `S[0]` is thereby left to the
+    /// leader, without enforcing it.
+    ///
+    /// **The leader is never pinned.** Its mask is never changed, not even for
+    /// the scope: it keeps all of `S` while the members work. A vendor library
+    /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
+    /// thread that calls it, and a team created from a one-CPU thread silently
+    /// confines the whole provider team to that CPU — measured at 3-20x slower
+    /// dgemm and LU at 4 threads. Engines call such libraries from the
+    /// coordinating thread, so that thread must keep its CPU set.
+    ///
+    /// A member saves its previous mask in its own slot and restores it
+    /// *itself* before it stops being reserved: before it returns to Rayon, and
+    /// before its thread serves work that is not its team's — while it is lent
+    /// by [`Exec::external`](crate::Exec::external), and when it runs such work
+    /// itself (a member that leads a `fork` child and calls `external`). No
+    /// thread ever changes another thread's affinity.
+    ///
+    /// # What it is for
+    ///
+    /// It keeps the members of a team apart. Measured on broccoli (16 threads on
+    /// 16 allowed CPUs, 20 processes, tensor4all/faer#107): with the scheduler
+    /// free to place the threads, 11 of 20 processes ran a `qr_factor` 512 at
+    /// the one-thread time, with 92 % of the samples showing two runnable team
+    /// threads on one CPU; with the participants pinned, 0 of 20 did, and no
+    /// sample was stacked. Giving the team one spare CPU did not help (7 of 20
+    /// slow). That arm pinned every participant including the leader; this crate
+    /// leaves the leader on the caller's whole set, which is what the rule above
+    /// requires and only relaxes the placement of participant 0.
+    ///
+    /// # Assumptions and limits
+    ///
+    /// * **Linux only.** The CPU set is a stack `cpu_set_t` and the placement is
+    ///   `sched_setaffinity(0, ...)`. On every other target the option is
+    ///   accepted and does nothing.
+    /// * **The caller's CPU set is the source of placement**, so the caller's
+    ///   mask should belong to this team alone. Two teams whose leaders see the
+    ///   same mask place their members on the same CPUs; give each team (in
+    ///   practice: each process) its own CPU set (`taskset -c`).
+    /// * **Best effort.** A refused syscall (a mask larger than `cpu_set_t`, a
+    ///   cpuset that changed under us, a CPU offlined) leaves that thread where
+    ///   it was; an empty mask pins nobody; a failed pin or restore never fails
+    ///   the scope.
+    /// * **A pinned member must not create a foreign thread team.** A member
+    ///   that calls OpenMP, OpenBLAS or any library that builds its team from
+    ///   the calling thread *directly inside a share* confines that library's
+    ///   team to one CPU. Call it through
+    ///   [`Exec::external`](crate::Exec::external), which restores the member's
+    ///   mask first, or keep this option off.
+    /// * Only the members of a team are placed. A token of a
+    ///   [`Team`](crate::Team) that never opens a team scope
+    ///   (`exec.for_ranges(...)` directly) is not re-pinned; its members keep
+    ///   the placement of the last root scope (or of `Pool::into_team`).
+    ///
+    /// Off by default, consistently with the rule above and with libgomp,
+    /// libomp, OpenBLAS and faer, which leave threads unpinned unless asked.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(2).pin_participants(true).build()?;
+    /// assert!(pool.pin_participants());
+    /// # let _ = pool;
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn pin_participants(mut self, on: bool) -> Self {
+        self.pin_participants = on;
+        self
+    }
+
     /// Starts the workers.
     ///
     /// Without the `parallel` feature no thread is started and the pool has
@@ -504,6 +612,7 @@ impl PoolBuilder {
                 self.wait,
                 self.acquire_timeout,
                 self.costs,
+                self.pin_participants,
             )),
         })
     }
@@ -512,7 +621,13 @@ impl PoolBuilder {
     fn build_checked(self) -> Result<Pool, Error> {
         Ok(Pool {
             width: NonZeroUsize::MIN,
-            awake: Arc::new(Awake::new(1, self.wait, self.acquire_timeout, self.costs)),
+            awake: Arc::new(Awake::new(
+                1,
+                self.wait,
+                self.acquire_timeout,
+                self.costs,
+                self.pin_participants,
+            )),
         })
     }
 }
@@ -524,6 +639,7 @@ impl fmt::Debug for PoolBuilder {
             .field("stack_size", &self.stack_size)
             .field("wait", &self.wait)
             .field("acquire_timeout", &self.acquire_timeout)
+            .field("pin_participants", &self.pin_participants)
             .finish_non_exhaustive()
     }
 }

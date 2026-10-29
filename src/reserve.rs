@@ -303,10 +303,23 @@ impl Team {
 
     fn token(&self, budget: usize) -> Exec<'_> {
         let budget = budget.clamp(1, self.size().get());
+        let ids = &self.reservation.ids[..budget - 1];
+        // Root-scope entry of the token: `exec` is serialized (one leader at a
+        // time), so the calling thread's CPU set decides here whether the scope
+        // is oversubscribed. When it is, the members park after their short
+        // spin instead of spinning for the whole park delay; otherwise they get
+        // the policy's delay. `Exec::team_with` on the minted token repeats
+        // this on the thread that enters each scope, so a token that travels to
+        // a thread with a different CPU set is paced by that set.
+        let oversubscribed = crate::pin::oversubscribed(budget);
+        self.pool
+            .awake
+            .set_park_ns(ids, crate::pin::park_delay(self.policy, oversubscribed));
         let auth = TeamAuth {
             awake: &self.pool.awake,
-            ids: &self.reservation.ids[..budget - 1],
+            ids,
             policy: self.policy,
+            over: oversubscribed,
         };
         Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
     }

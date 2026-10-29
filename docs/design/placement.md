@@ -70,6 +70,7 @@ impl PoolBuilder {
     pub fn thread_name(self, f: impl Fn(usize) -> String + 'static) -> Self;
     pub fn stack_size(self, bytes: usize) -> Self;   // default sized for LU recursion
     pub fn on_start(self, f: impl Fn(usize) + Send + Sync + 'static) -> Self; // e.g. pinning
+    pub fn pin_participants(self, on: bool) -> Self;  // opt-in, Linux; off by default
     pub fn build(self) -> Result<Pool>;
 }
 
@@ -324,11 +325,12 @@ A section is a stack object (`Section`): a type-erased pointer to the
 closure, the participant count, a padded completion counter, a sense-reversing
 barrier, a cancellation flag and an atomic cell for the first panic payload.
 The leader stores the section address and the participant index into each
-member slot and bumps its `gen` counter with release ordering; members spin on
-`gen` and `state` (pure spin, then `yield_now` between polls) and run their
-share and decrement the completion counter. After the reservation's park delay
-(the effective `idle_spin`) without work, a member parks (see below). The leader runs
-share 0, then waits for the counter. Nothing is allocated and nobody is woken
+member slot and bumps its `gen` counter with release ordering; members poll
+`gen` and `state` with one PAUSE per poll (`spin_loop`, no `sched_yield`) and
+run their share and decrement the completion counter. After the reservation's
+park delay (the effective `idle_spin`, or zero in an oversubscribed root scope,
+see below) without work, a member parks (see below). The leader runs
+share 0, then waits for the counter, polling the same way. Nothing is allocated and nobody is woken
 (`tests/team_alloc_free.rs`; acquisition allocates a small `Vec` and, for
 members not already awake, the claim jobs).
 
@@ -450,6 +452,54 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
 No allocation happens on the dispatch path. Dropping the team stores `IDLE`
 with a zero idle spin and broadcasts, so the members return to Rayon at once.
 
+### How a reserved member and a joining leader wait
+
+Two waits exist, both allocation-free and both unchanged in the handshake:
+
+* **Reserved members polling `gen`, and a leader in `Section::join` or
+  `Section::barrier`, in a scope that is not oversubscribed**: one
+  `std::hint::spin_loop()` per poll (PAUSE on x86, YIELD/ISB on aarch64), never
+  a `yield_now`. A thread that only issues PAUSE stays runnable but does not
+  re-enter the scheduler on every poll, so a pair the scheduler stacked on one
+  CPU can be separated instead of preempting each other in a yield loop, and a
+  share does not pay a syscall per poll. This is libgomp's shape. A reserved
+  member still parks after its park delay, which is what ends the spin; nothing
+  else wakes it.
+* **Acquisition, the cold claim, and the `IDLE` / leaving states**: `backoff`
+  as before (a bounded pure spin, then one `yield_now` per poll). Those threads
+  are not reserved yet or are on their way out, so they must cooperate to make
+  progress on a loaded host.
+
+**Oversubscription.** A root team scope is oversubscribed when its participants
+number more than the CPUs in the **entering thread's** affinity mask (on
+non-Linux targets: `std::thread::available_parallelism()`). It is decided at
+root-scope entry on that thread, whether or not participant pinning is on: at
+`Exec::team_with` (acquisition path and the carried path of a root token minted
+by a `Team`), and for a `Team` also when its root token is minted
+(`Team::exec`/`try_exec`), which is the pressure a token used without a team
+scope reports. Because the scope entry repeats it, a token minted on one CPU set
+and used on another is paced and placed by the set of the thread that enters the
+scope, never by the one it was minted on. The result is carried into
+`TeamExec`, team-carrying `Exec` tokens, `reborrow`, `limit`, `split` and `fork`
+children and every `Section`, so a nested section of an oversubscribed root
+knows it too; it is never recomputed from a child's size. The members' park
+delay is written to their slots at the same entry. In such a scope:
+
+* the park delay of the reserved members is **zero**, so a member that finds no
+  section spins one short episode (64 polls) and parks instead of holding a CPU
+  for the whole `idle_spin`. `polls` and `spins` are reset at the start of each
+  idle episode, so the episode is counted afresh;
+* `Section::join` and `Section::barrier` spin about 100 times and then
+  `yield_now` per poll, the shape libomp takes when it detects more threads than
+  CPUs, so the waiting participants do not hold every CPU while their peers are
+  queued behind them.
+
+The flag is per scope and per root; overlapping teams or pools are the caller's
+business (see the placement warning below). This is the behaviour libgomp
+throttles to about 100 spins when oversubscribed; measured on broccoli, parking
+alone did not remove the tensor4all/faer#107 slow mode, so the zero park delay is
+about the CPU a member burns, not about the mode.
+
 **Quality of service.** `PoolBuilder::qos(Qos)` sets the class of each worker
 when it starts (`pthread_set_qos_class_self_np` on Apple targets, nothing
 elsewhere; no platform type is public). The default is `UserInitiated` on
@@ -462,10 +512,89 @@ measurable difference to the wake latency on this host. Dropping the
 team stores `IDLE` with a zero idle spin and wakes them, so the members return to
 Rayon at once.
 
+### Participant placement (opt-in)
+
+`PoolBuilder::pin_participants(bool)` (default off; `Pool::pin_participants()`
+reads it back) makes a root team scope place its members. It exists because
+of the measurement in tensor4all/faer#107: `qr_factor` f64 512 at 16 threads on
+16 allowed CPUs, 20 processes on broccoli (EPYC 7702P, boost 0, governor
+`performance`), 20 repetitions each.
+
+| arm | slow processes (>= 6 ms) | samples with two runnable team threads on one CPU | publish-to-share |
+| --- | --- | --- | --- |
+| A, width 16, unpinned | 11 / 20 | 92 % in the slow half | 225 us fast / 835 us slow |
+| B, width 15 on the same 16 CPUs (one spare CPU) | 7 / 20 | 91 % in the slow half | 196 / 757 us |
+| C, width 16, every participant pinned to CPUs 48-63 | **0 / 20** | **0 %** | 218 us |
+
+Arm C pinned the leader too; `threadteam` pins only the members and leaves the
+leader on the caller's whole set (the rule below), which relaxes the placement of
+participant 0 only.
+
+12.4 ms is the one-thread time of the call, so the slow mode is the members'
+work not overlapping: they are alive, unparked and receiving the same shares,
+but queued on one CPU. A spare CPU does not stop the scheduler from stacking the
+pair; deterministic placement does. That is why placement is the load-bearing
+part of the change and parking is not, and why placement stays **opt-in**: all
+four compared runtimes leave threads unpinned by default, and pinning takes CPUs
+away from the rest of the process and fights the caller's `taskset`.
+
+How it works:
+
+* At the start of a **root team scope** — `Exec::team_with` on the acquisition
+  path, and on the carried path when the token is the root token minted by a
+  persistent `Team` (`Team::exec`/`try_exec`; not a child, a reborrow or a
+  sub-team) — the leader reads **its own** mask `S` with
+  `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
+  section machinery (it also serves as the rendezvous, replacing
+  `acknowledge`). Member `k` (participant `k >= 1`) pins itself with
+  `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`, wrapping modulo
+  `|S|` when the team is wider than the set. A team of one is left alone.
+* **The leader is never pinned**, and its mask is never changed, not even for
+  the scope. `S[0]` is left to it without enforcing it. A vendor library (an
+  OpenMP or OpenBLAS runtime, a LAPACK provider) builds its thread team from the
+  thread that calls it, and a team built from a one-CPU thread silently confines
+  the whole provider team to that CPU (`tenferro-rs` `PERFORMANCE_TIPS.md`: 3-20x
+  slower `dgemm` and LU at 4 threads); engines call such libraries from the
+  coordinating thread, so that thread keeps its CPU set. Consequently a **pinned
+  member must not build a foreign thread team directly inside a share**: it
+  would confine that library to its one CPU. Route the call through
+  `Exec::external`, which restores the member's own mask first, or keep pinning
+  off — it is off by default.
+* **Every affinity change is made by the thread itself.** A member
+  saves its previous mask in its own slot (an `UnsafeCell<cpu_set_t>` plus a
+  flag that only the member thread of that slot touches) the first time it is
+  pinned, and restores it itself, in the member loop, before it leaves
+  `RESERVED` (so before it returns its thread to Rayon) and before it serves
+  Rayon work while lent by `Exec::external` — and it does the same when it is
+  the thread that runs work outside its team itself, for example the member
+  that leads a `fork` child and calls `external` (there the call runs inline on
+  that worker, so it restores its own mask on its own thread before entering);
+  it re-pins only at the next pin section. A persistent team therefore keeps the
+  mask of its first scope and re-pins at each scope relative to that scope's
+  leader.
+* **Best effort.** A refused syscall (a kernel mask larger than `cpu_set_t`, a
+  cpuset that changed under us) leaves that thread as it was; an empty mask pins
+  nobody; a failed pin or restore never fails the scope.
+* **Linux only.** Other targets accept the option and do nothing. No libc type
+  appears in the public API; the masks are stack `cpu_set_t` values and the
+  `k`-th set CPU is found by scanning one, so the path allocates nothing
+  (`tests/team_alloc_free.rs`).
+* **Assumption: the caller's CPU set belongs to this team.** Placement maps the
+  participants onto the caller's mask, so two teams whose leaders see the same
+  mask stack on the same CPUs. Give each team (in practice: each process) its
+  own CPU set with `taskset -c`; there is no CPU allocator in this crate and none
+  is planned for this fix. Overlapping teams and pools of one process stay
+  caller-managed.
+* Only the members of a team are placed. A token of a `Team` that never opens a
+  team scope (`exec.for_ranges(...)` directly) is not re-pinned; its members
+  keep the placement of the last root scope, or of `Pool::into_team`.
+
 ### Waiting policy
 
 `PoolBuilder::idle_spin` (default 200 ms, may be zero) and
-`PoolBuilder::idle_runs_rayon` (default `false`) set `WaitPolicy` defaults;
+`PoolBuilder::idle_runs_rayon` (default `false`) set `WaitPolicy` defaults; an
+oversubscribed root scope overrides the park delay with zero for its own
+reservation only;
 `acquire_timeout` is separate. `WaitOverride` (partial policy) applies to one
 operation: `Exec::team_with` for a root reservation, `TeamExec::with_wait` for a
 scope. Children inherit the effective policy and may override it for their own
@@ -549,8 +678,10 @@ on a pool worker grants no reservation.
 
 Reproducible reductions are left to numerical kernels (fixed logical chunks,
 chunk-owned partials, fixed merge order): the crate gives no stealing within a
-team, so a section's shares are exactly the participants. Cache-domain layout and
-pinning are not handled.
+team, so a section's shares are exactly the participants. Cache-domain layout is
+not handled, and placement is opt-in and per team (see below): there is no CPU
+allocator, so two teams whose leaders see the same CPU set would place onto the
+same CPUs.
 
 ## Dispatch cost and the parallel rule
 

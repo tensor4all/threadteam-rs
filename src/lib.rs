@@ -47,6 +47,7 @@ mod exec;
 #[cfg(feature = "ledger")]
 pub mod ledger;
 mod park;
+mod pin;
 mod policy;
 mod pool;
 mod reserve;

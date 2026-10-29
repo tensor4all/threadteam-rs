@@ -150,17 +150,48 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
     if in_pool(pool) {
         return f();
     }
-    let job = std::sync::Mutex::new(Some(f));
-    let out = std::sync::Mutex::new(None);
+    // No lock: a `Mutex` allocates on its first lock on some platforms
+    // (macOS), and this runs on every call.
+    let job = Handoff(core::cell::UnsafeCell::new(Some(f)));
+    let out = Handoff(core::cell::UnsafeCell::new(None));
     run_tasks(pool, 1, track, |_| {
-        let f = job.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // SAFETY: the batch has one index, claimed exactly once (under the
+        // queue lock), so this body runs once; the caller reads `out` only
+        // after the batch's completion, which orders this write before it.
+        let f = unsafe { job.take() };
         if let Some(f) = f {
             let r = f();
-            *out.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+            // SAFETY: as above.
+            unsafe { out.put(r) };
         }
     });
-    let r = out.into_inner().unwrap_or_else(|e| e.into_inner());
+    let r = out.0.into_inner();
     r.expect("the task ran")
+}
+
+/// A value passed into and out of the single task of [`enter`]'s batch: that
+/// task is its only user until the batch completes.
+#[cfg(feature = "parallel")]
+struct Handoff<T>(core::cell::UnsafeCell<Option<T>>);
+
+// SAFETY: one thread at a time touches the value: the task while it runs, the
+// caller after the batch completed (see `enter`); `T: Send` lets it move.
+#[cfg(feature = "parallel")]
+unsafe impl<T: Send> Sync for Handoff<T> {}
+
+#[cfg(feature = "parallel")]
+impl<T> Handoff<T> {
+    /// # Safety
+    /// No other thread accesses the value meanwhile.
+    unsafe fn take(&self) -> Option<T> {
+        (*self.0.get()).take()
+    }
+
+    /// # Safety
+    /// As [`take`](Self::take).
+    unsafe fn put(&self, v: T) {
+        *self.0.get() = Some(v);
+    }
 }
 
 /// Runs `f(i)` for every worker index `i < budget` at once, each on worker

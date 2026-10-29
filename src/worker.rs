@@ -236,7 +236,8 @@ fn worker_main(ctl: &Arc<WorkerCtl>) {
         let _ = slot.thread.set(std::thread::current().id());
         *ctl.current.lock().unwrap_or_else(|e| e.into_inner()) =
             Some((Arc::clone(&lease.aw), lease.id));
-        slot.attached.store(true, Ordering::SeqCst);
+        // `serve` takes its section baseline before it marks the slot
+        // attached (claimable): a section published after that is seen.
         crate::awake::serve(&lease.aw, lease.id);
         // Epilogue: no access to the pool after the acknowledgement.
         slot.saved.restore();

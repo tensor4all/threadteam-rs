@@ -779,7 +779,8 @@ impl BroadcastList {
     }
 
     /// The next broadcast for worker `i` at or after its cursor `seq`, which
-    /// moves past every broadcast it inspects. The caller runs the returned
+    /// moves past every broadcast it inspects (past every publication so far
+    /// when none is left for `i`). The caller runs the returned
     /// share with [`Broadcast::run_share`].
     pub fn next_for(&self, i: usize, seq: &mut u64) -> Option<*const Broadcast> {
         let l = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -795,6 +796,9 @@ impl BroadcastList {
             }
             cur = b.link.get();
         }
+        // Broadcasts published before and already unlinked are past too, or
+        // `has_after` would keep reporting them.
+        *seq = (*seq).max(l.next_seq);
         None
     }
 

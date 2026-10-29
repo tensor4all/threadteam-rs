@@ -91,7 +91,12 @@ pub(crate) struct Slot {
     /// The worker's broadcast cursor (only the worker touches it).
     bseq: AtomicU64,
     /// Set while the worker waits for a batch and serves its pool meanwhile.
-    helping: AtomicBool,
+    pub(crate) helping: AtomicBool,
+    /// Broadcast shares on this worker's stack (only the worker touches it).
+    /// While one runs, the worker takes no other share: a later broadcast run
+    /// above an unfinished one could wait at its barrier for a worker that
+    /// waits at the earlier one's.
+    in_bcast: AtomicUsize,
     /// A released member that has not gone to sleep since (it still spins,
     /// claimable without a wake): what `Pool::resident_members` counts besides
     /// reserved members.
@@ -115,6 +120,7 @@ impl Slot {
             thread: std::sync::OnceLock::new(),
             bseq: AtomicU64::new(0),
             helping: AtomicBool::new(false),
+            in_bcast: AtomicUsize::new(0),
             lingering: AtomicBool::new(false),
             attached: AtomicBool::new(false),
             acked: AtomicBool::new(false),
@@ -148,7 +154,6 @@ pub(crate) struct Awake {
     /// What the joins and barriers of this pool's sections sleep on, and the
     /// pool's spin budget (`docs/design/waiting.md`).
     pub(crate) waits: Waits,
-    pub(crate) shutdown: AtomicBool,
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
@@ -181,7 +186,6 @@ impl Awake {
                 barrier_sleeps: AtomicU64::new(0),
                 member_parks: AtomicU64::new(0),
             },
-            shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
             costs,
@@ -327,7 +331,6 @@ impl Awake {
     /// with a running task.
     pub(crate) fn acquire(
         self: &std::sync::Arc<Self>,
-        _pool: &crate::pool::Pool,
         need: usize,
         policy: WaitPolicy,
         spin_budget: u32,
@@ -387,13 +390,16 @@ impl Awake {
     pub(crate) fn run_one(&self, id: usize) -> bool {
         let slot = &self.slots[id];
         let mut seq = slot.bseq.load(Ordering::Relaxed);
-        if self.bcast.has_after(seq) {
+        if slot.in_bcast.load(Ordering::Relaxed) == 0 && self.bcast.has_after(seq) {
             let next = self.bcast.next_for(id, &mut seq);
             slot.bseq.store(seq, Ordering::Relaxed);
             if let Some(b) = next {
+                slot.in_bcast.fetch_add(1, Ordering::Relaxed);
                 // SAFETY: a linked broadcast that targets `id`; its caller
-                // keeps it alive until this share completed.
+                // keeps it alive until this share completed. `run_share`
+                // catches a panic of the share.
                 unsafe { crate::park::Broadcast::run_share(b, id) };
+                slot.in_bcast.fetch_sub(1, Ordering::Relaxed);
                 return true;
             }
         }
@@ -408,10 +414,10 @@ impl Awake {
     /// Whether worker `id` has work it could run now (a hint).
     #[cfg(feature = "parallel")]
     fn work_for(&self, id: usize) -> bool {
+        let slot = &self.slots[id];
         self.queue.has_work()
-            || self
-                .bcast
-                .has_after(self.slots[id].bseq.load(Ordering::Relaxed))
+            || (slot.in_bcast.load(Ordering::Relaxed) == 0
+                && self.bcast.has_after(slot.bseq.load(Ordering::Relaxed)))
     }
 
     /// A free worker or a lent member takes one piece of work: it wins `BUSY`
@@ -437,7 +443,9 @@ impl Awake {
     #[cfg(feature = "parallel")]
     pub(crate) fn help_while(&self, me: usize, done: impl Fn() -> bool) {
         let slot = &self.slots[me];
-        slot.helping.store(true, Ordering::SeqCst);
+        // Waits nest (a task run while helping waits in turn): the outer wait
+        // stays wakeable after the inner one returns.
+        let outer = slot.helping.swap(true, Ordering::SeqCst);
         let mut waiter = crate::park::Waiter::new(self.waits.spin_polls);
         while !done() {
             if self.run_one(me) {
@@ -449,7 +457,7 @@ impl Awake {
                 waiter = crate::park::Waiter::new(self.waits.spin_polls);
             }
         }
-        slot.helping.store(false, Ordering::SeqCst);
+        slot.helping.store(outer, Ordering::SeqCst);
     }
 }
 
@@ -487,6 +495,9 @@ pub(crate) fn serve(aw: &Awake, id: usize) {
     use crate::park::{Step, Waiter};
     let slot = &aw.slots[id];
     let mut seen = slot.gen.load(Ordering::Acquire);
+    // Claimable only from now on: a leader that reserves this slot publishes
+    // its first section after the baseline above.
+    slot.attached.store(true, Ordering::SeqCst);
     let mut waiter: Option<Waiter> = None;
     let mut was_lent = false;
     let mut reserved = false;

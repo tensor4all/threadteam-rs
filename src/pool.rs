@@ -61,16 +61,20 @@ const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
 /// caller), where each call acquires its members with
 /// [`Exec::team`](crate::Exec::team) or uses plain tokens.
 ///
-/// Dropping a `Pool` (or the `Team` that owns it) shuts its workers down and
-/// joins them: when `drop` returns, every worker thread has exited, so the
-/// thread-local destructors of the workers (including state set up by an
-/// [`on_start`](PoolBuilder::on_start) hook) have already run. Without the
-/// `parallel` feature there are no workers and nothing is joined.
+/// Dropping a `Pool` (or the `Team` that owns it) detaches its workers and
+/// waits until each one acknowledged; after that no worker touches the pool.
+/// Workers of a pool with default thread settings are *shared*: they go back,
+/// asleep, to a process-wide reserve that the next pool reuses, so their
+/// threads keep running. A pool with a [`thread_name`](PoolBuilder::thread_name),
+/// an [`on_start`](PoolBuilder::on_start) hook, a stack size or a QoS of its
+/// own has *dedicated* workers, which `drop` joins: when it returns, their
+/// thread-local destructors (including state set up by the hook) have run.
+/// Without the `parallel` feature there are no workers and nothing is joined.
 ///
 /// A pool dropped from one of its own workers cannot wait for itself: that drop
-/// signals shutdown and returns without joining, so the workers exit shortly
-/// after instead of before the return. Drop the pool from a plain thread when
-/// the guarantee matters.
+/// neither waits for nor joins the calling worker, which acknowledges and leaves
+/// after its task returns. Drop the pool from a plain thread when the guarantee
+/// matters.
 ///
 /// # Examples
 ///
@@ -239,7 +243,6 @@ impl Pool {
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.awake.shutdown.store(true, Ordering::Release);
         #[cfg(feature = "parallel")]
         {
             // Detach every worker, then wait for their acknowledgements: after
@@ -664,8 +667,14 @@ impl PoolBuilder {
             self.pin_participants,
             self.spin_polls,
         ));
-        // A worker takes the caller's CPU set, as a thread it spawned would.
-        let mask = crate::pin::read_here();
+        // A reused worker takes the caller's CPU set, as a thread it spawned
+        // would. A dedicated worker was spawned by this caller and inherited
+        // it already; resetting it would undo the pinning of an `on_start` hook.
+        let mask = if shared {
+            crate::pin::read_here()
+        } else {
+            None
+        };
         for (id, w) in workers.iter().enumerate() {
             w.assign(crate::worker::Lease {
                 aw: Arc::clone(&awake),
@@ -774,6 +783,47 @@ mod tests {
                 "the pool was dropped by its worker"
             );
         }
+    }
+
+    /// Waits nest: an inner wait that returns leaves the outer one wakeable
+    /// for new work of the pool (`wake_for_work` looks at `helping`).
+    #[test]
+    fn a_nested_wait_keeps_the_outer_wait_wakeable() {
+        let pool = Pool::builder().threads(1).build().unwrap();
+        let aw = &pool.awake;
+        let helping = || aw.slots[0].helping.load(Ordering::SeqCst);
+        // Both conditions hold at once, so neither wait runs work of slot 0
+        // (whose worker serves it meanwhile).
+        aw.help_while(0, || {
+            aw.help_while(0, || true);
+            assert!(helping(), "the inner wait cleared the outer one's flag");
+            true
+        });
+        assert!(!helping());
+    }
+
+    /// A broadcast that completed and was unlinked before a worker outside
+    /// its budget looked: that worker's cursor still moves past it, so it
+    /// does not see pending work forever (and never parks).
+    #[test]
+    fn a_cursor_moves_past_a_broadcast_unlinked_before_it_looked() {
+        unsafe fn nothing(_: *const (), _: usize) {}
+        let waker = Arc::new(crate::park::Parker::new());
+        let list = crate::park::BroadcastList::new();
+        // SAFETY: `waker` outlives the broadcast; `nothing` reads no data.
+        let b = unsafe { crate::park::Broadcast::new(nothing, core::ptr::null(), 2, &waker) };
+        list.publish(&b);
+        for i in 0..2 {
+            let mut seq = 0;
+            let share = list.next_for(i, &mut seq).expect("a share for i");
+            // SAFETY: linked, alive, and targets `i`.
+            unsafe { crate::park::Broadcast::run_share(share, i) };
+        }
+        list.unlink(&b);
+        let mut seq = 0;
+        assert!(list.has_after(seq));
+        assert!(list.next_for(2, &mut seq).is_none());
+        assert!(!list.has_after(seq), "the cursor stayed before it");
     }
 
     /// A pool built, used and dropped inside a task of another pool: the drop

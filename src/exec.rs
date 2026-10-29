@@ -831,7 +831,6 @@ impl<'p> Exec<'p> {
         // oversubscribed, whatever the pool's pinning setting.
         let oversubscribed = crate::pin::oversubscribed(self.budget.get());
         let reservation = pool.awake.acquire(
-            pool,
             self.budget.get() - 1,
             policy,
             pool.awake.spin_budget(oversubscribed),

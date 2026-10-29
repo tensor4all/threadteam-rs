@@ -36,24 +36,17 @@ The answer to question (i) of #15 is therefore (ii): if no `Pool` spawns threads
 - **Compatibility.** A worker of the reserve was spawned with the default stack (16 MiB), the platform's default QoS and no hooks. A pool with any `thread_name`, `on_start`, a different stack size or a QoS gets **dedicated** workers: spawned for it and joined when it is dropped, exactly as before. tcontract's C API names its workers and sets a thread-local in `on_start`; it keeps today's semantics.
 - **`Pool::build`.** It takes `width` idle workers from the reserve and spawns the missing ones; a spawn failure is a build error. A worker learns its pool and its index when leased.
 - **`Pool` drop (shared workers).** Every worker is told to detach. Each one finishes, restores its own affinity mask (a pinned member) and acknowledges. Only then is the worker back in the reserve. The drop waits for all acknowledgements (quiescence) and does not join.
-  - The reserve keeps at most `C` idle workers, `C` being the available parallelism when it was created; a worker beyond the cap exits and is joined by the drop.
+  - The reserve keeps at most `C` idle workers (pre-review resolution 6 sets `C`); a worker beyond the cap exits.
   - A pool dropped from one of its own workers (a worker running a task that owns the pool) cannot wait for itself: it detaches the others, and that worker detaches when its task returns.
 - **Contract change.** "Dropping a `Pool` joins every worker thread" now holds for dedicated workers only; a shared worker outlives the pool, parked in the reserve.
 
 ### The worker loop
-Each leased worker runs one native loop over its member slot, the slot of the existing team machinery (`awake.rs`). Slot states:
-
-| state | meaning |
-| --- | --- |
-| `IDLE` | serves the pool's queue and its own mailbox; claimable by a team (CAS) |
-| `RUNNING` | runs a task of the pool's queue or a broadcast share; not claimable |
-| `RESERVED` | a team member, as before; with `lent`, it also serves the pool's queue |
-| `DETACH` | the pool is being dropped; the worker acknowledges and leaves |
+Each leased worker runs one native loop over its member slot, the slot of the existing team machinery (`awake.rs`). The slot's state word and its transitions are pre-review resolution 3 (`RESERVED`, `LENT`, `BUSY`, `DETACH`; free is `0`).
 
 Work, in the order the loop looks for it:
-1. A **broadcast share** in its mailbox.
+1. A **broadcast share** for this worker in the pool's broadcast list (pre-review resolution 2).
 2. A **task** from the pool's queue.
-3. Otherwise the staged wait: spin, yield, then park on its slot's `Parker`, until the queue generation, the mailbox, or the state changes.
+3. Otherwise the staged wait: spin, yield, then park on its slot's `Parker`, until the queue generation, the broadcast generation, or the state changes.
 
 The `ABSENT` state, the claim jobs (`claim_cold`) and the `YIELD` state of the Rayon design disappear: every leased worker is always in its loop.
 
@@ -73,8 +66,8 @@ The `ABSENT` state, the claim jobs (`claim_cold`) and the `YIELD` state of the R
   - A team token: its members are lent to the pool's queue for the call, and serve tasks the callback's code publishes to the same pool.
 
 ### Broadcast
-- The pool holds a broadcast mutex for the whole broadcast. The caller is never a worker of the pool (`CallerInPool` refusal), so holding it cannot deadlock a worker, and concurrent broadcasts run one after the other, in the same order for every worker.
-- The share for worker `i` goes into slot `i`'s mailbox. The caller waits for all `budget` shares, as today; a reserved member serves no broadcast, again as today.
+- Broadcasts go into the pool's ordered broadcast list (pre-review resolution 2, which replaced a first draft's whole-broadcast lock and per-slot mailboxes). The caller is never a worker of the pool (`CallerInPool` refusal). Every worker runs the broadcasts that target it in publication order.
+- The caller waits for all `budget` shares, as today; a reserved member serves no broadcast, again as today.
 
 ### Identity without thread-locals
 Each slot records its worker's `ThreadId` when leased. "Is the caller a worker of this pool, and which one" is a scan of the pool's slots (`width` comparisons), done at entry points only, never on the team dispatch path.
@@ -124,7 +117,7 @@ The gpt-6.1-sol pre-review (`work/runs/threadteam-own/pre.out`) found one deadlo
    - **Self-drop from a worker.** It does not wait for the dropping worker, which acknowledges after its task returns. The other workers cannot be running work of this pool, because any such work borrows the pool, so their acknowledgements come promptly.
    - **Locks.** No reserve lock is held while waiting.
    - **Workers above the cap.** They exit, and their handles are detached; only dedicated workers are joined.
-5. **Affinity on lease.** `Pool::build` reads the calling thread's affinity mask, and every worker applies it to itself when it is leased (Linux), as a newly spawned thread would inherit it. A worker whose pin restore failed is not returned to the reserve; it exits.
+5. **Affinity on lease.** `Pool::build` reads the calling thread's affinity mask, and every reused (shared) worker applies it to itself when it is leased (Linux), as a newly spawned thread would inherit it. A dedicated worker was spawned by that caller and inherited it already; it keeps whatever its `on_start` hook set (post-review 5). A worker whose pin restore failed is not returned to the reserve; it exits.
 6. **Reserve cap.** The cap is the largest of the available parallelism and every width leased so far. So repeated wide pools (faer's per-call `with_team`) keep reusing their workers, whatever the first caller's affinity was.
 7. **Panics.**
    - Every claimed task and broadcast share runs under `catch_unwind` and always reaches its completion. The first payload is kept on the batch.
@@ -137,10 +130,21 @@ The gpt-6.1-sol pre-review (`work/runs/threadteam-own/pre.out`) found one deadlo
 
 Kept against the review's delete list: the opt-in Rayon layer, which the maintainer asked for ("Rayon との相互運用が要る機能は opt-in の層として残す"), and `idle_runs_rayon`, as a documented no-op, so the public API does not break.
 
+## Post-review resolutions
+
+The gpt-6.1-sol post-review of the implementation (`work/runs/threadteam-own/post.out`) found three deadlocks, an endless wake-up and an affinity regression. Each fix has a regression test that fails (or hangs) with the fix undone.
+
+1. **Attachment against the first section.** A worker marked its slot claimable before it read the slot's section generation; a leader that reserved it in between published a section the worker then took as already seen, and both waited forever. `serve` now reads the generation first and marks the slot attached after it. (The window is a few instructions wide; no test forces it.)
+2. **Nested helping.** A wait that runs a task which waits in turn cleared the outer wait's `helping` flag on return, so `wake_for_work` skipped a worker still waiting, and A → B → A could hang. The flag is now saved and restored (`a_nested_wait_keeps_the_outer_wait_wakeable`).
+3. **A later broadcast above an unfinished one.** A broadcast share that waits on another pool helps its own pool meanwhile; it could start a later broadcast's share, whose shares meet at a barrier, while the earlier broadcast's other share waited at its own barrier for this worker. A worker with a broadcast share on its stack now takes queued tasks but no further share (`a_waiting_broadcast_share_does_not_start_a_later_broadcast`).
+4. **Cursor past unlinked broadcasts.** A worker outside a broadcast's budget that looked only after the broadcast was unlinked kept its cursor before it; `has_after` stayed true, so the worker never parked. The cursor now moves past every publication when nothing is left for the worker (`a_cursor_moves_past_a_broadcast_unlinked_before_it_looked`).
+5. **Dedicated workers and `on_start` pinning.** The lease reset a dedicated worker's mask to the caller's, undoing a hook's pin. Only reused workers take the caller's mask now (`a_dedicated_worker_keeps_the_pin_of_its_start_hook`).
+6. **Docs.** `Pool`'s and `Team`'s shutdown docs distinguish shared and dedicated workers, as the README does. The unused `shutdown` flag and `acquire`'s unused pool argument are gone.
+
 ## Verification
 - **loom, new paths, small models:**
   - a batch published with one owner and two claimers, the owner asleep until completion;
-  - an idle worker's wait on the queue generation, its mailbox and its state, against a publish and a detach;
+  - an idle worker's wait on the queue generation, the broadcast generation and its state, against a publish and a detach;
   - the detach handshake of a pool drop.
 - **The existing tests:** alloc-free (the plain paths and the team paths, warm), ledger, compile-fail, no-public-rayon, and the feature matrix.
 - **New tests:**

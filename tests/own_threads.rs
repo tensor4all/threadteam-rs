@@ -230,3 +230,89 @@ fn a_reused_worker_takes_the_leasing_callers_cpu_set() {
     .join()
     .unwrap();
 }
+
+/// A dedicated worker keeps the CPU set its `on_start` hook pinned it to: the
+/// lease does not reset it to the caller's set.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_dedicated_worker_keeps_the_pin_of_its_start_hook() {
+    let _w = watchdog();
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    fn cpus() -> Vec<usize> {
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set);
+            (0..libc::CPU_SETSIZE as usize)
+                .filter(|&c| libc::CPU_ISSET(c, &set))
+                .collect()
+        }
+    }
+    let all = cpus();
+    if all.len() < 2 {
+        eprintln!("skipped: needs 2 allowed CPUs");
+        return;
+    }
+    let target = all[1];
+    let pool = Pool::builder()
+        .threads(2)
+        .on_start(move |_| unsafe {
+            let mut s: libc::cpu_set_t = std::mem::zeroed();
+            libc::CPU_ZERO(&mut s);
+            libc::CPU_SET(target, &mut s);
+            libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &s);
+        })
+        .build()
+        .unwrap();
+    let masks = Mutex::new(Vec::new());
+    Exec::new(&pool, 2)
+        .unwrap()
+        .broadcast(|_| masks.lock().unwrap().push(cpus()))
+        .unwrap();
+    for m in masks.into_inner().unwrap() {
+        assert_eq!(m, vec![target], "the lease undid the hook's pin");
+    }
+}
+
+/// Broadcast X's share 0 waits on another pool while X's share 1 waits at a
+/// barrier of X's shares; meanwhile broadcast Y, whose shares meet at a barrier
+/// too, is published. The waiting share 0 must not start Y's share on top of
+/// X's: Y's barrier would wait for worker 1, which waits for X.
+#[test]
+fn a_waiting_broadcast_share_does_not_start_a_later_broadcast() {
+    let _w = watchdog();
+    let _turn = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let a = Pool::builder().threads(2).build().unwrap();
+    let b = Pool::builder().threads(2).build().unwrap();
+    for _ in 0..20 {
+        let x_bar = std::sync::Barrier::new(2);
+        let y_bar = std::sync::Barrier::new(2);
+        let x_waiting = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                Exec::new(&a, 2)
+                    .unwrap()
+                    .broadcast(|i| {
+                        if i == 0 {
+                            x_waiting.store(true, Ordering::SeqCst);
+                            Exec::new(&b, 2).unwrap().fork(2, |_, _| {
+                                std::thread::sleep(Duration::from_millis(20));
+                            });
+                        }
+                        x_bar.wait();
+                    })
+                    .unwrap();
+            });
+            s.spawn(|| {
+                while !x_waiting.load(Ordering::SeqCst) {
+                    std::thread::yield_now();
+                }
+                Exec::new(&a, 2)
+                    .unwrap()
+                    .broadcast(|_| {
+                        y_bar.wait();
+                    })
+                    .unwrap();
+            });
+        });
+    }
+}

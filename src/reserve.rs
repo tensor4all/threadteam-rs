@@ -67,8 +67,8 @@ impl Drop for LeaderGuard<'_> {
 /// A `Team` **owns** its [`Pool`] and has no lifetime: an engine stores a `Team`
 /// (or a plain `Pool` when it wants no team). `Pool` is not `Clone`, no method
 /// hands out a second handle, and [`pool`](Team::pool) only borrows. Dropping
-/// the `Team` releases the members and then drops the pool, which joins the
-/// workers; [`into_pool`](Team::into_pool) releases the members and gives the
+/// the `Team` releases the members and then drops the pool (see [`Pool`] for
+/// what that does to its workers); [`into_pool`](Team::into_pool) releases the members and gives the
 /// pool back instead. Tokens borrow the `Team`, so none outlives it.
 ///
 /// # Examples
@@ -191,7 +191,7 @@ impl Pool {
         let reservation =
             match self
                 .awake
-                .acquire(&self, width - 1, release, self.awake.spin_budget(false))
+                .acquire(width - 1, release, self.awake.spin_budget(false))
             {
                 Ok(r) => r,
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),

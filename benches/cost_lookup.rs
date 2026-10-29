@@ -9,7 +9,7 @@
 use std::hint::black_box;
 use std::num::NonZeroUsize;
 use std::time::{Duration, Instant};
-use threadteam::{DispatchCosts, DispatchKind, WidthCosts};
+use threadteam::{DispatchCosts, DispatchKind};
 
 fn ns_per_call(mut f: impl FnMut(u64) -> u64) -> f64 {
     let iters = 2_000_000u64;
@@ -80,8 +80,6 @@ fn main() {
 
     #[cfg(feature = "parallel")]
     token_rows(costs);
-
-    let _ = WidthCosts::flat(Duration::ZERO);
 }
 
 /// The lookups on a real team token: the kind is read at call time, so these are

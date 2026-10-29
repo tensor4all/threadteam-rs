@@ -310,12 +310,13 @@ forward scan over at most `MAX_ANCHORS` = 12 of them, so the lookup allocates no
 cores 4-11 (previous phase, flat table whose `at` was an index): `at` 7.9 to 1.2 ns, `pays_at` after `at` 10.1 to
 2.2 ns, `width_for` at budget 8 83 to 32 ns. The anchor scan costs an integer division per interpolated width where
 the table held the value: on the 4-core run of issue #6 (cores 56-59, best of 9 x 2M calls, same bench file on both
-trees) `at` 0.89 -> 7.35 ns, `width_for` budget 8 25.8 -> 72.9 ns and budget 64 222 -> 553 ns, `min_cost`
-6.0 -> 4.3 ns, a by-value `DispatchCosts` copy 4.5 -> 12.6 ns (144 -> 384 bytes), `Exec::dispatch_cost` on a team
-3.3 -> 8.8 ns. That stays far below one section, which the rows above charge 0.6 to 427 us, but a consumer that
+trees, with the 64-bit fast path that falls back to 128 bits only when a product overflows) `at` 0.89 -> 4.12 ns,
+`pays_at` after `at` 1.97 -> 7.84 ns, `width_for` budget 8 25.9 -> 61.8 ns and budget 64 222 -> 522 ns, `min_cost`
+6.7 -> 4.8 ns, a by-value `DispatchCosts` copy 4.5 -> 11.0 ns (144 -> 384 bytes), `Exec::dispatch_cost` on a team
+3.3 -> 6.3 ns. That stays far below one section, which the rows above charge 0.6 to 427 us, but a consumer that
 calls `width_for` on every tiny region should use `min_cost` first. `min_cost(kind)` /
-`WidthCosts::min()` is the cheapest cost over all widths: the minimum over the anchors (neither interpolation nor
-the extrapolation can undershoot the anchor it starts from), so a region below `PAYS * min_cost` pays at no width.
+`WidthCosts::min()` is the cheapest cost over all widths: the minimum over the anchors (an interpolated value lies
+between its two anchors, and the extrapolation never falls below the last anchor), so a region below `PAYS * min_cost` pays at no width.
 A test compares the rows with the former interpolation for widths 1 to 6 and pins the extrapolation above them.
 
 Width model: the value at the first anchor below it, linear interpolation between two anchors, and above the

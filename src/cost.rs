@@ -233,9 +233,9 @@ impl WidthCosts {
         Duration::from_nanos(self.ns_at(width))
     }
 
-    /// The cheapest cost over all widths: the minimum over the anchors (neither
-    /// interpolation nor the extrapolation can undershoot the anchor they start
-    /// from). A region whose serial estimate is below `PAYS * min()` pays at no
+    /// The cheapest cost over all widths: the minimum over the anchors (an
+    /// interpolated value lies between its two anchors, and the extrapolation
+    /// never falls below the last anchor). A region whose serial estimate is below `PAYS * min()` pays at no
     /// width, which is the cheap rejection before a per-width search.
     #[inline]
     pub fn min(&self) -> Duration {
@@ -949,5 +949,15 @@ mod tests {
         assert_eq!(c.ns_at(nz(200)), u64::MAX);
         let want = u128::from(u64::MAX / 2) * 100 / 64;
         assert_eq!(u128::from(c.ns_at(nz(100))), want.min(u128::from(u64::MAX)));
+    }
+
+    #[test]
+    fn falling_interpolation_truncates_toward_zero() {
+        // 4 + (0 - 4) * 1 / 3 = 4 - 1.33..: truncation toward zero gives 3, floor
+        // rounding would give 2. Pins the old model's integer semantics.
+        let ns = Duration::from_nanos;
+        let c = WidthCosts::from_anchors(&[(2, ns(4)), (5, ns(0))]).unwrap();
+        assert_eq!(c.at(nz(3)), ns(3));
+        assert_eq!(c.at(nz(4)), ns(2));
     }
 }

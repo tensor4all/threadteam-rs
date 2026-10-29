@@ -61,11 +61,25 @@ const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
 /// caller), where each call acquires its members with
 /// [`Exec::team`](crate::Exec::team) or uses plain tokens.
 ///
-/// Dropping a `Pool` (or the `Team` that owns it) shuts its workers down and
-/// joins them: when `drop` returns, every worker thread has exited, so the
-/// thread-local destructors of the workers (including state set up by an
-/// [`on_start`](PoolBuilder::on_start) hook) have already run. Without the
-/// `parallel` feature there are no workers and nothing is joined.
+/// Dropping a `Pool` (or the `Team` that owns it) ends its team members. What
+/// happens to the worker threads depends on how the pool was built:
+///
+/// * A pool with a [`thread_name`](PoolBuilder::thread_name), an
+///   [`on_start`](PoolBuilder::on_start) hook, a
+///   [`stack_size`](PoolBuilder::stack_size) or a [`qos`](PoolBuilder::qos) of
+///   its own has **dedicated** workers: the drop shuts them down and joins
+///   them, so when `drop` returns every worker thread has exited and its
+///   thread-local destructors (including state set up by the hook) have run.
+/// * A pool with the default thread settings has **shared** workers: the drop
+///   waits until its members left, then keeps the idle workers in a
+///   process-wide cache, keyed by width. The next `build` of a default pool of
+///   the same width takes them instead of starting threads, and gives each
+///   worker the calling thread's CPU set. A cached set of workers belongs to
+///   one pool at a time. The cache holds at most as many threads as the
+///   larger of the available parallelism and the widest pool built so far;
+///   the oldest entries beyond that are joined.
+///
+/// Without the `parallel` feature there are no workers and nothing is joined.
 ///
 /// A pool dropped from one of its own workers cannot wait for itself: that drop
 /// signals shutdown and returns without joining, so the workers exit shortly
@@ -82,17 +96,26 @@ const SPIN_POLLS_DEFAULT: u32 = if cfg!(target_arch = "aarch64") {
 /// # Ok::<(), threadteam::Error>(())
 /// ```
 pub struct Pool {
-    // Field order matters: `inner` is dropped (shutdown signalled) before
-    // `joiner` waits for the threads.
+    /// `None` only inside `drop`, which moves the workers to the cache.
     #[cfg(feature = "parallel")]
-    pub(crate) inner: rayon::ThreadPool,
+    workers: Option<Workers>,
+    /// Default thread settings: the workers go to the cache on drop.
     #[cfg(feature = "parallel")]
-    _joiner: Joiner,
+    shared: bool,
     pub(crate) width: NonZeroUsize,
     pub(crate) awake: Arc<Awake>,
 }
 
 impl Pool {
+    /// The private Rayon pool.
+    #[cfg(feature = "parallel")]
+    pub(crate) fn inner(&self) -> &rayon::ThreadPool {
+        match &self.workers {
+            Some(w) => &w.inner,
+            None => unreachable!("the workers leave the pool only in drop"),
+        }
+    }
+
     /// Starts configuring a pool.
     ///
     /// # Examples
@@ -225,8 +248,100 @@ impl Drop for Pool {
     fn drop(&mut self) {
         // Idle members leave their loops so that the workers can be joined.
         self.awake.shutdown.store(true, Ordering::Release);
+        #[cfg(feature = "parallel")]
+        if let Some(workers) = self.workers.take() {
+            // A pool dropped on one of its own workers cannot wait for that
+            // worker's member loop: its workers are not reused.
+            if self.shared && workers.inner.current_thread_index().is_none() {
+                // No member loop of this pool may run on the threads when the
+                // next pool takes them.
+                let mut spins = 0u32;
+                while self.awake.resident() > 0 {
+                    if spins < 64 {
+                        spins += 1;
+                        std::thread::yield_now();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(50));
+                    }
+                }
+                cache::put(workers);
+            }
+        }
     }
 }
+
+/// A Rayon pool and its threads. Field order matters: `inner` is dropped
+/// (shutdown signalled) before `_joiner` waits for the threads.
+#[cfg(feature = "parallel")]
+struct Workers {
+    inner: rayon::ThreadPool,
+    _joiner: Joiner,
+}
+
+/// Idle shared workers, kept between pools of the same width.
+#[cfg(feature = "parallel")]
+mod cache {
+    use super::Workers;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, PoisonError};
+
+    static IDLE: Mutex<Vec<Workers>> = Mutex::new(Vec::new());
+    /// The widest shared pool built so far.
+    static WIDEST: AtomicUsize = AtomicUsize::new(0);
+
+    /// Takes the idle workers of a pool of `width` threads, if any are cached.
+    pub(super) fn take(width: usize) -> Option<Workers> {
+        WIDEST.fetch_max(width, Ordering::Relaxed);
+        let mut idle = IDLE.lock().unwrap_or_else(PoisonError::into_inner);
+        let at = idle
+            .iter()
+            .position(|w| w.inner.current_num_threads() == width)?;
+        Some(idle.remove(at))
+    }
+
+    /// Keeps `workers` for a later pool; joins the oldest entries beyond the
+    /// cap (the larger of the available parallelism and the widest pool).
+    pub(super) fn put(workers: Workers) {
+        let cap = std::thread::available_parallelism()
+            .map_or(1, core::num::NonZeroUsize::get)
+            .max(WIDEST.load(Ordering::Relaxed));
+        let evicted: Vec<Workers> = {
+            let mut idle = IDLE.lock().unwrap_or_else(PoisonError::into_inner);
+            idle.push(workers);
+            let mut total: usize = idle.iter().map(|w| w.inner.current_num_threads()).sum();
+            let mut n = 0;
+            while total > cap && n + 1 < idle.len() {
+                total -= idle[n].inner.current_num_threads();
+                n += 1;
+            }
+            idle.drain(..n).collect()
+        };
+        // Joined outside the lock.
+        drop(evicted);
+    }
+
+    /// The widest shared pool built so far (tests).
+    #[cfg(test)]
+    pub(super) fn widest() -> usize {
+        WIDEST.load(Ordering::Relaxed)
+    }
+
+    /// Threads currently cached (tests).
+    #[cfg(test)]
+    pub(super) fn cached_threads() -> usize {
+        let idle = IDLE.lock().unwrap_or_else(PoisonError::into_inner);
+        idle.iter().map(|w| w.inner.current_num_threads()).sum()
+    }
+}
+
+/// Worker threads started by shared and dedicated pools since the process
+/// started; a diagnostic for the reuse tests and benchmarks.
+#[doc(hidden)]
+pub fn spawned_workers() -> usize {
+    SPAWNED.load(Ordering::Relaxed)
+}
+
+static SPAWNED: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
 /// The worker threads of a pool, joined when it is dropped.
 #[cfg(feature = "parallel")]
@@ -617,10 +732,47 @@ impl PoolBuilder {
     }
 
     #[cfg(feature = "parallel")]
-    fn build_checked(self) -> Result<Pool, Error> {
+    fn build_checked(mut self) -> Result<Pool, Error> {
         let n = self
             .threads
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, NonZeroUsize::get));
+        let shared = self.thread_name.is_none()
+            && self.on_start.is_none()
+            && self.stack_size == DEFAULT_STACK_BYTES
+            && self.qos.is_none();
+        let workers = match shared.then(|| cache::take(n)).flatten() {
+            Some(workers) => {
+                // A reused worker takes the caller's CPU set, as a thread the
+                // caller spawned would.
+                if let Some(mask) = crate::pin::read_here() {
+                    workers.inner.broadcast(|_| {
+                        crate::pin::set_here(&mask);
+                    });
+                }
+                workers
+            }
+            None => self.spawn(n)?,
+        };
+        let width =
+            NonZeroUsize::new(workers.inner.current_num_threads()).unwrap_or(NonZeroUsize::MIN);
+        Ok(Pool {
+            workers: Some(workers),
+            shared,
+            width,
+            awake: Arc::new(Awake::new(
+                width.get(),
+                self.wait,
+                self.acquire_timeout,
+                self.costs,
+                self.pin_participants,
+                self.spin_polls,
+            )),
+        })
+    }
+
+    /// Starts `n` new worker threads.
+    #[cfg(feature = "parallel")]
+    fn spawn(&mut self, n: usize) -> Result<Workers, Error> {
         let handles = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let sink = std::sync::Arc::clone(&handles);
         let qos = self.qos.or(Qos::PLATFORM_DEFAULT);
@@ -635,6 +787,7 @@ impl PoolBuilder {
                 if let Some(size) = thread.stack_size() {
                     b = b.stack_size(size);
                 }
+                SPAWNED.fetch_add(1, Ordering::Relaxed);
                 let handle = b.spawn(move || {
                     if let Some(q) = qos {
                         q.apply_to_current_thread();
@@ -647,10 +800,10 @@ impl PoolBuilder {
                 }
                 Ok(())
             });
-        if let Some(name) = self.thread_name {
+        if let Some(name) = self.thread_name.take() {
             builder = builder.thread_name(name);
         }
-        if let Some(hook) = self.on_start {
+        if let Some(hook) = self.on_start.take() {
             builder = builder.start_handler(hook);
         }
         // On failure `builder` drops its handler, but threads already started
@@ -663,19 +816,9 @@ impl PoolBuilder {
                 return Err(Error::PoolBuild(e.to_string()));
             }
         };
-        let width = NonZeroUsize::new(inner.current_num_threads()).unwrap_or(NonZeroUsize::MIN);
-        Ok(Pool {
+        Ok(Workers {
             inner,
             _joiner: Joiner { handles },
-            width,
-            awake: Arc::new(Awake::new(
-                width.get(),
-                self.wait,
-                self.acquire_timeout,
-                self.costs,
-                self.pin_participants,
-                self.spin_polls,
-            )),
         })
     }
 
@@ -721,7 +864,7 @@ mod tests {
         let last = Arc::clone(&pool);
         let (gate_tx, gate_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        pool.inner.spawn(move || {
+        pool.inner().spawn(move || {
             gate_rx.recv().unwrap();
             drop(last); // the last reference: runs `Pool::drop` on this worker
             done_tx.send(()).unwrap();
@@ -731,6 +874,22 @@ mod tests {
         done_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("drop on a worker hung");
+    }
+
+    /// The cache never holds more threads than its cap, whatever the number
+    /// of pools dropped.
+    #[test]
+    fn the_cache_keeps_at_most_its_cap_of_threads() {
+        let cap = std::thread::available_parallelism().map_or(1, NonZeroUsize::get);
+        let pools: Vec<Pool> = (0..cap + 2)
+            .map(|_| Pool::builder().threads(1).build().unwrap())
+            .collect();
+        drop(pools);
+        // Other tests of this binary build wider pools concurrently, which
+        // can only raise the cap.
+        let cached = cache::cached_threads();
+        let cap = cap.max(cache::widest());
+        assert!(cached <= cap, "{cached} cached threads, cap {cap}");
     }
 }
 

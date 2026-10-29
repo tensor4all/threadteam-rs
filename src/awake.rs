@@ -354,7 +354,7 @@ impl Awake {
         let acq = Arc::new(Acq::new(missing));
         for _ in 0..missing {
             let (aw, a) = (Arc::clone(self), Arc::clone(&acq));
-            pool.inner.spawn(move || claim_job(&aw, &a));
+            pool.inner().spawn(move || claim_job(&aw, &a));
         }
         let deadline = Instant::now() + self.acquire_timeout;
         let mut spins = 0;

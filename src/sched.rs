@@ -10,7 +10,7 @@ use crate::track::Track;
 /// Whether the calling thread is a worker of `pool`.
 #[cfg(feature = "parallel")]
 pub(crate) fn in_pool(pool: &Pool) -> bool {
-    pool.inner.current_thread_index().is_some()
+    pool.inner().current_thread_index().is_some()
 }
 
 #[cfg(not(feature = "parallel"))]
@@ -31,7 +31,7 @@ pub(crate) fn in_pool(_pool: &Pool) -> bool {
 /// re-pins at the next pin section.
 #[cfg(feature = "parallel")]
 pub(crate) fn unpin_worker(pool: &Pool) {
-    if let Some(worker) = pool.inner.current_thread_index() {
+    if let Some(worker) = pool.inner().current_thread_index() {
         pool.awake.unpin_member(worker);
     }
 }
@@ -55,7 +55,7 @@ pub(crate) fn run_tasks<F: Fn(usize) + Sync>(pool: &Pool, tasks: usize, track: &
         join_tree(0, tasks, &task);
     } else {
         track.note_install();
-        pool.inner.install(|| join_tree(0, tasks, &task));
+        pool.inner().install(|| join_tree(0, tasks, &task));
     }
 }
 
@@ -84,7 +84,7 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
         f()
     } else {
         track.note_install();
-        pool.inner.install(f)
+        pool.inner().install(f)
     }
 }
 
@@ -98,7 +98,7 @@ pub(crate) fn broadcast(pool: &Pool, track: &Track, budget: usize, f: impl Fn(us
     // would deadlock a foreign-pool caller that steals a second broadcast onto
     // its own stack while waiting.
     track.note_install();
-    pool.inner.broadcast(|ctx| {
+    pool.inner().broadcast(|ctx| {
         let i = ctx.index();
         if i < budget {
             let _live = track.task();

@@ -66,12 +66,18 @@ for r in $(seq 1 "$rounds"); do
 done
 echo "rows in $csv, waits in $log"
 python3 - "$csv" <<'PY'
-import csv, collections, statistics, sys
-rows = list(csv.DictReader(open(sys.argv[1])))
+import collections, statistics, sys
+# `param` may hold commas (`work=5us,sections=200`), unquoted: the fields around it are fixed.
 cells = collections.defaultdict(list)
-for r in rows:
-    name = r["label"].split("#")[0]
-    cells[(r["scenario"], r["width"], r["param"], r["metric"], name)].append(float(r["median_us"]))
+for line in open(sys.argv[1]).read().splitlines()[1:]:
+    f = line.split(",")
+    host, label, cpus, load, scenario, impl, width = f[:7]
+    metric, median = f[-5], f[-4]
+    param = ",".join(f[7:-5])
+    name = label.split("#")[0]
+    if impl not in ("threadteam", "libgomp"):
+        name = f"{name} ({impl})"
+    cells[(scenario, width, param, metric, name)].append(float(median))
 print(f"{'scenario':<9} {'width':>5} {'param':<24} {'metric':<6} {'side':<40} {'n':>3} {'median of medians us':>21}")
 for k in sorted(cells):
     v = cells[k]

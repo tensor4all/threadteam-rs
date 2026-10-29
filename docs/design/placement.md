@@ -584,13 +584,15 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   machine takes, not by the CPU model: `x86_64-avx512` (runtime `avx512f`), `x86_64-avx2` (`avx2` + `fma`),
   `x86_64-scalar`, `aarch64-apple` (aarch64 on macOS), `aarch64`, `generic`; detected once per process.
   `x86_64-avx512` holds the measured Ryzen row (team 0.6/0.7/0.9 at widths 2/4/6 and the measured 0.98 at width 8,
-  in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us), `aarch64-apple` the measured Apple M5 row at widths 2, 4 and 6, and
-  every class without a measurement the conservative generic row (3, 15, 40 microseconds at the anchors; the
+  in pool 3.0/3.6/3.5, outside 9.7/10.1/8.7 us), `aarch64-apple` the measured Apple M5 row at widths 2, 4 and 6,
+  `x86_64-avx2` a measured Zen2 team row at ten widths from 2 to 64 (1.42 to 9.33 us; in pool and outside generic;
+  thresholds section 3.7), and every class without a measurement the conservative generic row (3, 15, 40 microseconds at the anchors; the
   extrapolation charges 32, 160 and 427 microseconds at width 64). A consumer that measured its own host at more
   widths overrides the row with `WidthCosts::from_anchors` (up to `WidthCosts::MAX_ANCHORS` = 12 anchors). The rates
   of the consumer crates (strided-rs, tcontract-rs, faer) are
-  tables of their own, keyed by the same class names, and a class's rates and dispatch costs come from the same
-  machine in the same clock state: boost on/off moves both by about 1.66x and leaves the ratio stable within a
+  tables of their own, keyed by the same class names, and a measured class's rates and dispatch costs come from the
+  same machine in the same clock state (the exception is the `x86_64-avx2` team row, whose consumer rates are still
+  generic; thresholds section 3.7): boost on/off moves both by about 1.66x and leaves the ratio stable within a
   few percent (`faer-benchmark` `raw-exec3-boost`, `tables-*-exec3-boost.md`). Each crate carries an identical
   `HostClass` and `detect()`, kept in sync with `threadteam`'s by hand.
   `PoolBuilder::dispatch_costs` overrides it.

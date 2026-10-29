@@ -328,7 +328,8 @@ impl HostClass {
 ///
 /// [`for_class`](DispatchCosts::for_class) holds measured rows for the host
 /// classes it knows (`x86_64-avx512`; `aarch64-apple`, QoS `UserInitiated`, the
-/// pool default) and a conservative generic row for every other class;
+/// pool default; the team kind of `x86_64-avx2`) and a conservative generic row
+/// for everything else;
 /// [`host_default`](DispatchCosts::host_default) picks the row of the detected
 /// class. A pool owner that measured its own host overrides them with
 /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs).
@@ -364,6 +365,39 @@ const fn us_f(x: f64) -> Duration {
     Duration::from_nanos((x * 1000.0) as u64)
 }
 
+/// A measured row built at compile time: an invalid anchor list fails the
+/// build, never a caller.
+const fn anchored(anchors: &[(usize, Duration)]) -> WidthCosts {
+    match WidthCosts::from_anchors(anchors) {
+        Some(costs) => costs,
+        None => panic!("invalid measured anchors"),
+    }
+}
+
+/// `x86_64-avx512` team row (post-fix run, with its width 8 anchor).
+const AVX512_TEAM: WidthCosts = anchored(&[
+    (2, us_f(0.6)),
+    (4, us_f(0.7)),
+    (6, us_f(0.9)),
+    (8, us_f(0.98)),
+]);
+
+/// `x86_64-avx2` team row: broccoli (AMD EPYC 7702P, Zen2), pool 64,
+/// `team/load10us-minus-10us`, nanoseconds rounded to the nearest
+/// (`docs/design/thresholds-data/raw/broccoli-dispatch-20261029.csv`).
+const AVX2_TEAM: WidthCosts = anchored(&[
+    (2, Duration::from_nanos(1423)),
+    (4, Duration::from_nanos(1992)),
+    (6, Duration::from_nanos(2329)),
+    (8, Duration::from_nanos(2738)),
+    (12, Duration::from_nanos(3558)),
+    (16, Duration::from_nanos(4076)),
+    (24, Duration::from_nanos(4292)),
+    (32, Duration::from_nanos(4838)),
+    (48, Duration::from_nanos(6402)),
+    (64, Duration::from_nanos(9333)),
+]);
+
 impl DispatchCosts {
     /// Costs of the three kinds.
     pub fn new(team: WidthCosts, in_pool: WidthCosts, outside: WidthCosts) -> Self {
@@ -374,9 +408,12 @@ impl DispatchCosts {
         }
     }
 
-    /// The row of a host class. Both the dispatch costs of a row and the rates
-    /// of the consumer crates' tables for the same class come from one machine
-    /// in one clock state, so a class is never mixed across crates' tables.
+    /// The row of a host class. For `x86_64-avx512` and `aarch64-apple` the
+    /// dispatch costs and the rates of the consumer crates' tables for the same
+    /// class come from one machine in one clock state. The `x86_64-avx2` team
+    /// row is the exception: it is measured (on a Zen2 host, below) while the
+    /// consumer crates' rates for that class are still their generic rows, so
+    /// the gate compares a measured dispatch cost with a conservative rate.
     ///
     /// * [`HostClass::X86_64Avx512`]: measured on an AMD Ryzen AI 9 HX 470
     ///   under Linux, 8 threads on cores 4-11, boost off (2.0 GHz), from the
@@ -391,6 +428,18 @@ impl DispatchCosts {
     ///   QoS `UserInitiated`, from the back to back sections whose shares
     ///   carry 10 us of work (`docs/design/thresholds-data/`), at widths 2, 4,
     ///   6: team 3.0, 2.3, 1.4; in pool 6.0, 11, 5.5; outside 14, 18, 19.
+    /// * [`HostClass::X86_64Avx2`]: the team row measured on `broccoli`, an
+    ///   AMD EPYC 7702P (Zen2, 64 cores, SMT off), boost off, governor
+    ///   `performance`, pool 64 pinned to CPUs 0-63, with the Linux port of
+    ///   `benches/dispatch_cost.rs` in `faer-benchmark` (back to back sections
+    ///   whose shares carry 10 us of work, threadteam 0.1.0;
+    ///   tensor4all/threadteam-rs#6, `docs/design/thresholds.md` section 3.7), in microseconds at widths 2, 4, 6, 8,
+    ///   12, 16, 24, 32, 48, 64: 1.42, 1.99, 2.33, 2.74, 3.56, 4.08, 4.29,
+    ///   4.84, 6.40, 9.33. In pool and outside deliberately keep the generic
+    ///   row. The class covers every AVX2 host, also small desktops, so the
+    ///   team row is a representative default for the class, not a guarantee
+    ///   for a given topology; a pool owner overrides it with
+    ///   [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs).
     /// * Every other class has no measurement and takes the conservative
     ///   generic row: 3 us for a team, 15 us in the pool and 40 us from
     ///   outside at the anchors 2, 4 and 6, and above width 6 the width
@@ -403,13 +452,7 @@ impl DispatchCosts {
     pub fn for_class(class: HostClass) -> Self {
         match class {
             HostClass::X86_64Avx512 => DispatchCosts {
-                team: WidthCosts::from_anchors(&[
-                    (2, us_f(0.6)),
-                    (4, us_f(0.7)),
-                    (6, us_f(0.9)),
-                    (8, us_f(0.98)),
-                ])
-                .expect("the avx512 team row has four valid anchors"),
+                team: AVX512_TEAM,
                 in_pool: WidthCosts::new([us_f(3.0), us_f(3.6), us_f(3.5)]),
                 outside: WidthCosts::new([us_f(9.7), us_f(10.1), us_f(8.7)]),
             },
@@ -418,10 +461,12 @@ impl DispatchCosts {
                 in_pool: WidthCosts::new([us_f(6.0), us_f(11.0), us_f(5.5)]),
                 outside: WidthCosts::new([us_f(14.0), us_f(18.0), us_f(19.0)]),
             },
-            HostClass::X86_64Avx2
-            | HostClass::X86_64Scalar
-            | HostClass::Aarch64
-            | HostClass::Generic => DispatchCosts {
+            HostClass::X86_64Avx2 => DispatchCosts {
+                team: AVX2_TEAM,
+                in_pool: WidthCosts::flat(us_f(15.0)),
+                outside: WidthCosts::flat(us_f(40.0)),
+            },
+            HostClass::X86_64Scalar | HostClass::Aarch64 | HostClass::Generic => DispatchCosts {
                 team: WidthCosts::flat(us_f(3.0)),
                 in_pool: WidthCosts::flat(us_f(15.0)),
                 outside: WidthCosts::flat(us_f(40.0)),

@@ -326,7 +326,8 @@ and `from_anchors` accepts measured anchors up to `u16::MAX`, so a row measured 
 extrapolation where it has data. Above the last anchor the cost is never flat: a wide section is charged at least
 in proportion to its width, so `width_for` no longer answers the full width just because the largest anchor pays (a
 flat 1 us row gives 1, 2, 4 and 8 us at widths 6, 12, 24 and 48; a 24 us region on such a row selects width 12 of a
-budget 64). Section 3.6 keeps the historical reason for the earlier flat model. A host that is not measured gets the
+budget 64). Section 3.6 keeps the historical reason for the earlier flat model; section 3.7 is the `x86_64-avx2` team
+row with anchors to width 64. A host that is not measured gets the
 flat generic row (team 3, in pool 15, outside 40 microseconds at the anchors 2, 4 and 6, and the width proportion
 above), which errs towards staying serial.
 
@@ -548,7 +549,7 @@ there: width 8 is 4.67 us in the pool and 11.6 us from outside.
 | plain in pool | 3.0 | 3.6 | 3.5 | |
 | plain outside | 9.7 | 10.1 | 8.7 | |
 
-The row is `DispatchCosts::for_class(HostClass::X86_64Avx512)` in `cost.rs`, and `host_default()` returns it on a host whose runtime detection finds `avx512f` (the other x86_64 classes, `x86_64-avx2` and `x86_64-scalar`, take the generic row until measured). The row and the rates of the consumer crates for the same class come from this machine at 2.0 GHz (boost off); boost on moves both by about 1.66x with a stable ratio (`raw-exec3-boost`, `tables-*-exec3-boost.md`):
+The row is `DispatchCosts::for_class(HostClass::X86_64Avx512)` in `cost.rs`, and `host_default()` returns it on a host whose runtime detection finds `avx512f` (`x86_64-avx2` has its own team row since section 3.7; `x86_64-scalar` takes the generic row until measured). The row and the rates of the consumer crates for the same class come from this machine at 2.0 GHz (boost off); boost on moves both by about 1.66x with a stable ratio (`raw-exec3-boost`, `tables-*-exec3-boost.md`):
 
 ```rust
 HostClass::X86_64Avx512 => DispatchCosts {
@@ -608,6 +609,43 @@ section on the whole team with empty shares for the members outside the width co
 needs the ledger and `Participant::size` to exclude the empty shares to keep "a width-k token never runs more
 than k tasks of real work". the `x86_64-avx512` row now holds the post-fix row (0.6, 0.7, 0.9), re-measured by the Linux
 campaign.
+
+### 3.7 Zen2 team row (x86_64-avx2, threadteam-rs#6)
+
+`for_class(HostClass::X86_64Avx2)` carries a measured team row with ten anchors. Host `broccoli`: AMD EPYC 7702P
+(Zen2, 64 physical cores, SMT off, NUMA 1, 16 MiB L3 per 4-core CCX), `cpufreq/boost = 0`, governor `performance`,
+nothing else running. The Linux port of this crate's `benches/dispatch_cost.rs` that takes the pool size and the
+widths from the environment (`faer-benchmark` branch `bench/awake-team-linux`,
+`data/probes/20261026-awake-team-linux/bench/tt/src/bin/dispatch_cost.rs`, unchanged; the checked-in bench here
+does not read these variables) built against threadteam 0.1.0, `TT_POOL=64`, `TT_WIDTHS=2,4,6,8,12,16,24,32,48,64`,
+process pinned to CPUs 0-63, 2026-10-29. The row is
+`team/load10us-minus-10us`, the same quantity as the other rows (back to back sections whose shares carry 10 us of
+work, minus the 10 us), rounded to the nearest nanosecond. Raw output: `thresholds-data/raw/broccoli-dispatch-20261029.csv`.
+
+| width | 2 | 4 | 6 | 8 | 12 | 16 | 24 | 32 | 48 | 64 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| team, us | 1.42 | 1.99 | 2.33 | 2.74 | 3.56 | 4.08 | 4.29 | 4.84 | 6.40 | 9.33 |
+
+The cost grows more slowly than the width between 6 and 64 (2.33 to 9.33 us for a width ratio of 10.7). Widths
+between the ten anchors interpolate, so a host of up to 64 cores never reaches the extrapolation; above 64 the
+linear extrapolation is the chosen conservative policy, not a measured bound.
+
+What the row does not claim:
+
+* **Mixed provenance.** For `x86_64-avx512` and `aarch64-apple` the dispatch row and the consumer crates' rates of
+  the class come from one machine in one clock state. The consumer crates (faer, tcontract-rs, strided-rs) still
+  hold their generic rates for `x86_64-avx2`, so on this class the gate compares a measured dispatch cost with a
+  conservative rate. It is a heuristic exception, recorded here, until those rates are measured on the same host.
+* **One class, many hosts.** `x86_64-avx2` covers every AVX2 + FMA host, small desktops included. The width 2 team
+  floor moves from the generic 9 us (`PAYS * 3 us`) to 4.3 us. The row is a representative default for the class, not
+  a guarantee for a given topology; a pool owner with its own measurement overrides it with
+  `PoolBuilder::dispatch_costs`.
+* **Plain kinds unchanged.** In pool and outside deliberately keep the generic row (15 and 40 us at the anchors). The
+  run has plain-token numbers too (in the CSV), but they are a control the measurement was not designed for and are
+  not promoted to the row.
+* **Fresh team entry.** tensor4all/faer#91 saw, on the same host, an intermittent section of about 0.62 ms when a
+  caller enters a fresh `Team::exec(w).team(...)` per call; the anchor instrument reuses one token and never shows it.
+  Its cause is not attributed. The row is the steady-state cost of a reused token and does not include it.
 
 ## 4. Limits of this data
 

@@ -94,6 +94,9 @@ impl<'p> Exec<'p> {
 
     /// Run `jobs` jobs on min(jobs, budget) tasks; job i gets a child token.
     pub fn fork(self, jobs: usize, f: impl Fn(usize, Exec<'_>) + Sync);
+    /// One child per share, child i gets exactly shares[i] slots; the shares
+    /// sum to at most the budget (never clamped). `fork` is its even case.
+    pub fn fork_sized(self, shares: &[usize], f: impl Fn(usize, Exec<'_>) + Sync) -> Result<(), Error>;
     /// Data-parallel loop over 0..len, ranges of at least `grain`, at most `budget` tasks.
     pub fn for_ranges(self, len: usize, grain: NonZeroUsize, f: impl Fn(Range<usize>) + Sync);
     /// The only place a bare width exists: enter the pool, hand the budget to
@@ -124,6 +127,12 @@ construction:
   to the budget. When `jobs > budget` the `t` tasks take job indices from a
   shared counter, so the bound holds and the load balances. A job's child token
   can be passed to any kernel, which may `fork` again inside its share.
+  `fork_sized` takes explicit shares instead; their sum must not exceed the
+  budget (an error names both, nothing is clamped), each child's budget is
+  exactly its share, and slots the shares leave over run nothing during the
+  call and are the parent's again after the join. Both entries go through one
+  splitter over the same `Plan` that `TeamExec::split` uses, so join, panic
+  propagation and job-to-task placement are one code path.
 - **No other spawner.** Only `threadteam` depends on Rayon among tensor4all
   crates (`cargo deny` with `wrappers`), so nothing else can start a task on
   the pool.
@@ -257,7 +266,8 @@ global-pool test green.
   a non-`Clone` token is also useless to store.
 - Static shares: a `fork` task that finishes early does not hand its slots to
   a sibling. `for_ranges` and `fork` with more jobs than budget balance through
-  the shared counter; uneven `fork` with few jobs does not.
+  the shared counter; uneven `fork` with few jobs does not. `fork_sized` lets
+  the caller size the shares to the work instead.
 - External BLAS keeps its own worker team; that asymmetry stays documented and
   is out of scope for the budget.
 - The cross-pool hand-off remains a microsecond-scale cost on a rare nesting.
@@ -400,6 +410,7 @@ On a token with team authority the `Exec` methods dispatch through the same
 | Method | Behaviour |
 | --- | --- |
 | `fork(jobs, f)` | `tasks = min(jobs, budget)`; task `k` runs on the first member of its index range of the same even plan as `split`, with the share of `split::share`; the child token carries that range's sub-team; more jobs than tasks pull from the shared counter as before |
+| `fork_sized(shares, f)` | the plan of `split(shares)`: child `k` leads its index range of `shares[k]` participants and carries that sub-team; members past the sum stay parked |
 | `for_ranges` | the leader and the first `tasks - 1` members run the chunks; no Rayon entry |
 | `broadcast` | every participant of the budget at once on the reserved members; never refused (a `fork` child owns its members too), `can_broadcast` is true |
 | `team(f)` / `team_with` | hands out the carried (sub)team at once, no acquisition |
@@ -676,5 +687,4 @@ signatures do not change.
 
 ## Open questions
 
-1. Whether weighted shares (`fork_with(&[w0, w1], ...)`) are needed; omitted
-   until a caller has uneven parts.
+None at present. Explicit uneven shares are `Exec::fork_sized`.

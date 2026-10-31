@@ -57,6 +57,7 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | `Exec::reborrow(&mut self)` | same pool and budget while the parent is exclusively borrowed |
 | `Exec::limit(max)` | narrow to `min(budget, max)` |
 | `Exec::fork(jobs, f)` | `min(jobs, budget)` tasks; shares differ by at most one and sum to the budget; job `i` gets a child token |
+| `Exec::fork_sized(&shares, f)` | one child per share, child `i` gets a token of exactly `shares[i]` slots; shares sum to at most the budget (`Err(Error::SharesExceedBudget)` otherwise, never clamped; a zero share is `Err(Error::ZeroBudget)`); leftover slots stay idle and return to the parent after the join; `fork` is its even special case |
 | `Exec::for_ranges(len, grain, f)` | at most `budget` tasks, ranges of at least `grain` except possibly the last |
 | `Exec::broadcast(f)` | `f(i)` for `i in 0..budget`, all concurrent, or `Err(Refused)` |
 | `Exec::can_broadcast()` | non-consuming: true exactly when `broadcast` would not refuse right now; ask before building an expensive setup |

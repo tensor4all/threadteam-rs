@@ -214,7 +214,7 @@ impl Plan<'_> {
     }
 
     /// Team index of child `c`'s leader and its size.
-    fn child(&self, c: usize) -> (usize, usize) {
+    pub(crate) fn child(&self, c: usize) -> (usize, usize) {
         match self {
             Plan::Sizes(s) => (s[..c].iter().sum(), s[c]),
             Plan::Even { size, children } => {

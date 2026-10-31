@@ -28,8 +28,10 @@ use core::time::Duration;
 /// * Only [`Exec::new`] mints a token, and it needs the `&Pool`; a token never
 ///   hands its pool back out, so a kernel cannot mint a fresh full-budget token.
 /// * [`fork`](Exec::fork) divides the budget among its tasks (shares differ by
-///   at most one and sum to the budget), so the number of tasks running at once
-///   under one root token is at most its budget at every nesting depth.
+///   at most one and sum to the budget), and [`fork_sized`](Exec::fork_sized)
+///   hands out explicit shares that sum to at most the budget, so the number of
+///   tasks running at once under one root token is at most its budget at every
+///   nesting depth.
 ///
 /// A parent waiting for its children keeps no slot.
 ///
@@ -400,17 +402,98 @@ impl<'p> Exec<'p> {
         if jobs == 0 {
             return;
         }
+        let size = self.budget.get();
+        let plan = Plan::Even {
+            size,
+            children: jobs.min(size),
+        };
+        self.fork_plan(&plan, jobs, f);
+    }
+
+    /// Runs one child per entry of `shares`; child `i` gets a token of exactly
+    /// `shares[i]` slots.
+    ///
+    /// For work of uneven size: give a large item several slots and the small
+    /// ones one slot each. Child `i` always runs job `i` (there is no shared
+    /// counter), and join, panic propagation and placement are those of
+    /// [`fork`](Exec::fork), which is the even special case of this call.
+    /// One child, or a serial token, runs inline on the calling thread without
+    /// any scheduler call. An empty `shares` does nothing. Returns when every
+    /// child has finished.
+    ///
+    /// **Leftover slots.** When the shares sum to less than the budget, the
+    /// remaining slots are given to no child and stay idle for the call: no
+    /// task runs on them and, on a team token, their reserved members stay
+    /// parked. They remain the parent's: fork through
+    /// [`reborrow`](Exec::reborrow) and the parent token has its full budget
+    /// again after the join.
+    ///
+    /// # Errors
+    ///
+    /// Nothing runs and the token is consumed when
+    ///
+    /// * a share is zero: [`Error::ZeroBudget`];
+    /// * the shares sum to more than the budget:
+    ///   [`Error::SharesExceedBudget`], naming the budget and the sum. Shares
+    ///   are never clamped.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic from any child after every child has finished.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Error, Exec, Pool};
+    ///
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
+    /// let mut exec = Exec::new(&pool, 4)?;
+    /// let budget = exec.budget().get(); // 1 without the `parallel` feature
+    /// if budget == 4 {
+    ///     // One large item on three slots, one small item on the last slot.
+    ///     exec.reborrow().fork_sized(&[3, 1], |i, child| {
+    ///         assert_eq!(child.budget().get(), [3, 1][i]);
+    ///     })?;
+    /// }
+    /// let err = exec.fork_sized(&[budget, 1], |_, _| {}).unwrap_err();
+    /// assert_eq!(err, Error::SharesExceedBudget { budget, sum: budget + 1 });
+    /// # Ok::<(), Error>(())
+    /// ```
+    pub fn fork_sized<F>(self, shares: &[usize], f: F) -> Result<(), Error>
+    where
+        F: Fn(usize, Exec<'_>) + Sync,
+    {
+        if shares.contains(&0) {
+            return Err(Error::ZeroBudget);
+        }
         let budget = self.budget.get();
-        let tasks = jobs.min(budget);
+        let sum = shares.iter().fold(0usize, |a, &s| a.saturating_add(s));
+        if sum > budget {
+            return Err(Error::SharesExceedBudget { budget, sum });
+        }
+        if !shares.is_empty() {
+            self.fork_plan(&Plan::Sizes(shares), shares.len(), f);
+        }
+        Ok(())
+    }
+
+    /// The one splitter of `fork` and `fork_sized`: task `k` of `plan` gets a
+    /// child token of `plan.child(k).1` slots. More `jobs` than tasks pull job
+    /// indices from a shared counter; otherwise job `k` runs on task `k`.
+    fn fork_plan<F>(self, plan: &Plan<'_>, jobs: usize, f: F)
+    where
+        F: Fn(usize, Exec<'_>) + Sync,
+    {
+        let tasks = plan.children();
         let _released = self.track.release();
         let next = AtomicUsize::new(0);
         let this = &self;
         let body = |k: usize, team_ids: Option<&[usize]>| {
             let _live = this.track.task();
-            let share = split::share(budget, tasks, k);
+            let share = plan.child(k).1;
             let child = || Exec {
                 pool: this.pool,
-                // `share >= 1` because `tasks <= budget`.
+                // Every share of a validated plan is at least one.
                 budget: NonZeroUsize::new(share).unwrap_or(NonZeroUsize::MIN),
                 child: true,
                 track: this.track.child(),
@@ -434,11 +517,7 @@ impl<'p> Exec<'p> {
         };
         match (self.team, self.pool) {
             (Some(t), _) if tasks > 1 => {
-                let plan = Plan::Even {
-                    size: budget,
-                    children: tasks,
-                };
-                split_raw(Some(t.awake), t.ids, &plan, t.over, |k, ids| {
+                split_raw(Some(t.awake), t.ids, plan, t.over, |k, ids| {
                     body(k, Some(ids));
                 });
             }
@@ -447,7 +526,9 @@ impl<'p> Exec<'p> {
             }
             _ => {
                 for k in 0..tasks {
-                    body(k, self.team.map(|t| t.ids));
+                    // The members of child `k`, as `split_raw` hands them out.
+                    let (start, size) = plan.child(k);
+                    body(k, self.team.map(|t| &t.ids[start..start + size - 1]));
                 }
             }
         }

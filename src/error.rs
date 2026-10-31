@@ -30,6 +30,16 @@ pub enum Error {
     /// empty, contain a zero, or sum to more than the team size.
     #[error("child team sizes must be non-empty, non-zero and sum to at most the team size")]
     InvalidSplit,
+    /// [`Exec::fork_sized`](crate::Exec::fork_sized) was given shares that sum
+    /// to more than the token's budget. Nothing ran; the shares are not
+    /// clamped.
+    #[error("fork shares sum to {sum} slots, more than the token's budget of {budget}")]
+    SharesExceedBudget {
+        /// The budget of the token that was asked to fork.
+        budget: usize,
+        /// The sum of the requested shares (saturated at `usize::MAX`).
+        sum: usize,
+    },
 }
 
 /// A [`broadcast`](crate::Exec::broadcast) that cannot guarantee co-scheduling.

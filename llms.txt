@@ -1,0 +1,21 @@
+# threadteam
+
+> Scoped CPU thread team placement for Rust: a `Pool` and a non-Clone `Exec` with fork, for_ranges, external and broadcast.
+
+`threadteam` gives a caller explicit control over where parallel work runs. A pool is created once,
+an `Exec` borrows it for the duration of a region, and work is forked into disjoint ranges or
+broadcast across a team. No Rayon type appears in the public API, and there is no global pool.
+
+## Key documentation
+
+- [README](README.md): the placement model and a worked example.
+- [API reference](https://docs.rs/threadteam): `Pool`, `Exec`, `fork_sized`, and the error types.
+- [Placement](docs/design/placement.md): what a team owns and how nesting is rejected.
+- [Waiting](docs/design/waiting.md): how a join is structured and what it costs.
+- [Thresholds](docs/design/thresholds.md): when splitting pays for itself, with the data behind it.
+- [Repository rules](REPOSITORY_RULES.md): conventions for changes, tests, and releases.
+
+## Repository
+
+- GitHub: https://github.com/tensor4all/threadteam-rs
+- Language: Rust (edition 2021), workspace at the repository root.

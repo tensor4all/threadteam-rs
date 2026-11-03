@@ -57,6 +57,18 @@ fn allocs_in(f: impl FnOnce()) -> usize {
     ALLOCS.load(Ordering::SeqCst) - before
 }
 
+/// Parks every worker of `pool` once, before the windows below are counted.
+///
+/// A Rayon worker's `Sleep` keeps its `pthread_mutex_t` in a `OnceBox`, so the
+/// first `lock()` inside `Sleep::sleep` allocates it. That is upstream of this
+/// crate and happens once per worker, but it lands in whichever measured window
+/// contains a worker's first sleep, which made this test fail at random rounds.
+/// Idling each pool before it is used takes that first sleep outside the
+/// windows.
+fn park_workers(_pool: &Pool) {
+    std::thread::sleep(Duration::from_millis(300));
+}
+
 // One test: the counter is process-global.
 #[test]
 fn team_dispatch_does_not_allocate_after_warm_up() {
@@ -67,6 +79,7 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
         .acquire_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    park_workers(&pool);
     let mut exec = Exec::new(&pool, 4).unwrap();
     let sink = AtomicUsize::new(0);
     exec.team(|mut team| {
@@ -105,6 +118,7 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
         .acquire_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    park_workers(&pool);
     let team = pool.into_team(4).unwrap();
     let mut exec = team.exec(4);
     let grain = std::num::NonZeroUsize::MIN;
@@ -150,6 +164,7 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
         .acquire_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    park_workers(&pool);
     let team = pool.into_team(4).unwrap();
     let token_phases = |team: &threadteam::Team| {
         let mut exec = team.exec(4); // mint
@@ -186,6 +201,7 @@ fn team_dispatch_does_not_allocate_after_warm_up() {
         .acquire_timeout(Duration::from_secs(5))
         .build()
         .unwrap();
+    park_workers(&pool);
     let team = pool.into_team(4).unwrap();
     let mut exec = team.exec(4);
     let sleeping_phases = |exec: &mut Exec<'_>| {

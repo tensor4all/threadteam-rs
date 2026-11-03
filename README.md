@@ -188,6 +188,17 @@ parks and the preemptions waiters saw.
 Results are committed as CSV under [`docs/design/waiting-data/`](docs/design/waiting-data/), one
 file per host, with the label naming the commit; the summary tables live in `waiting.md`.
 
+## Resident-split benchmark
+
+`benches/resident_split.rs` measures what a team fork pays when its shares read data the leader
+has just written (issue #27): a copy split over `k` jobs, disjoint or shared, with the source hot
+in the leader's caches or evicted. Run one die at a time and derive the per-host transfer rate
+as described in the file header:
+
+```sh
+numactl --cpunodebind=0 --membind=0 cargo bench --bench resident_split -- --widths 1,2,4,8 > out.csv
+```
+
 ## License
 
 Licensed under either of MIT or Apache-2.0 at your option.

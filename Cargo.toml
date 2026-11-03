@@ -88,3 +88,8 @@ harness = false
 name = "wait_scenarios"
 harness = false
 required-features = ["parallel"]
+
+[[bench]]
+name = "resident_split"
+harness = false
+required-features = ["parallel"]

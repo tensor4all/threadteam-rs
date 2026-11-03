@@ -661,7 +661,8 @@ them pull. The growth in `D` is stalled CPU time, which `width_for` does not cha
 `moved / rate` with `moved = resident_bytes (k - 1) / k`, once, at one rate per host class. `(k - 1) / k` is the
 leader's own share staying resident.
 
-On the M5 Max (18 threads, `max` QoS default, 2026-11-03, `hot`, mode `D`, rate from the slowest member at
+On the M5 Max (18 threads, 6 P plus 12 E cores, the bench does not raise QoS; 2026-11-03, `hot`, mode `D`, rate
+from the slowest member at
 `k >= 4`):
 
 | bytes written by the leader | 384 KiB | 1 MiB | 4 MiB |

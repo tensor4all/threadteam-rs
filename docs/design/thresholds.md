@@ -647,6 +647,47 @@ What the row does not claim:
   caller enters a fresh `Team::exec(w).team(...)` per call; the anchor instrument reuses one token and never shows it.
   Its cause is not attributed. The row is the steady-state cost of a reused token and does not include it.
 
+### 3.8 Resident data: the transfer term (threadteam-rs#27)
+
+`D(k) + est / k` assumes the shares of a section work on data the members reach at their own speed. A caller that
+has just produced the input has it in *its* caches, so the members pull it across: a cost the serial estimate does
+not contain. `benches/resident_split.rs` measures it: the leader writes a source, one `fork(k)` copies it in `k`
+disjoint shares (`D`) or `k` equal first-quarter shares (`S`), source hot or evicted, and each job times its own copy.
+
+The result is **one transfer on the wall, not one per member**. On one die of a 2 x Xeon Platinum 9242 (Cascade
+Lake-AP, 392 KiB, hot): `S` stays flat at `54 + 1.1 k` ns/KiB, `D` grows as `33 + 28 k` ns/KiB in *summed* busy, but
+the slowest member is constant over `k` and the pullers drain the moved bytes at 20 to 26 GB/s whether 2 or 23 of
+them pull. The growth in `D` is stalled CPU time, which `width_for` does not charge. So the section pays
+`moved / rate` with `moved = resident_bytes (k - 1) / k`, once, at one rate per host class. `(k - 1) / k` is the
+leader's own share staying resident.
+
+On the M5 Max (18 threads, `max` QoS default, 2026-11-03, `hot`, mode `D`, rate from the slowest member at
+`k >= 4`):
+
+| bytes written by the leader | 384 KiB | 1 MiB | 4 MiB |
+| --- | --- | --- | --- |
+| k = 2 | 18.5 | 13.6 | 13.1 |
+| k = 4 | 7.1 | 6.7 | 5.8 |
+| k = 8 | 8.4 | 5.8 | 5.8 |
+
+ns/KiB of moved bytes. The row is `8 ns/KiB` (about 146 GB/s, the slowest `k >= 4` point rounded up), and the raw
+CSV is `thresholds-data/raw/resident-split-m5max-20261103.csv`. Where a class has no measurement the row is the
+slowest measured one, 41 ns/KiB (about 25 GB/s), so the term is never under-charged; a pool owner overrides it with
+`TransferRate::per_kib`.
+
+What the model is not:
+
+* **Not part of the pay decision.** `pays_at` keeps reading `D(k)` only. Otherwise a resident copy would make a
+  region parallel that does not pay, and the small-block regime would get worse: on the Xeon die a 392 KiB split
+  never beats the 9.2 us serial copy in wall (11.6 us at best), which is exactly what the term has to express. On the
+  M5 the same size does split (3.4 us at `k = 4` against 8.9 us serial), so the boundary is per class and comes from
+  the row, not from a constant.
+* **Not the dispatch cost.** Cross-socket dispatch (14 us at `k = 16`, 80 us at `k = 96` on the 9242) is already in
+  `D(k)` as the wide anchors of a row; it is not folded into the transfer.
+* **Not a bandwidth model.** It prices the drain that the split itself creates. DRAM saturation at 4 MiB and up
+  shows the same rate hot and cold and is out of scope.
+
+
 ## 4. Limits of this data
 
 * One host, rough, 6 threads only (widths 2 and 4 only for the dispatch cost), one process per mode

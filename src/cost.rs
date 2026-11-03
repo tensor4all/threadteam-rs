@@ -610,6 +610,214 @@ pub fn width_for_by(
     best
 }
 
+/// How far the shares of a parallel section have to reach for their input.
+///
+/// The width model [`width_for_by`] charges a section `D(k) + estimate / k`,
+/// where `estimate` is the serial time measured on data the calling thread can
+/// reach at its own speed. When the caller has just produced that data, the
+/// members of a team fork do not find it in their own caches: they pull it out
+/// of the caller's, and that transfer is not in `estimate / k`. `SplitCost`
+/// states how many bytes are in that state, so a width can charge it.
+///
+/// A region with `resident_bytes == 0` is exactly [`width_for_by`]: the term is
+/// zero at every width and [`width_for_split_by`] then returns the same width.
+///
+/// The evidence is `benches/resident_split.rs` (threadteam-rs#27): the members
+/// pull concurrently from one source, so the section pays **one** transfer of
+/// the moved bytes, at about the same rate with 2 and with 23 pullers, while
+/// their summed busy grows like `k - 1`. Charging one transfer per member would
+/// over-price wide sections by that factor.
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use threadteam::SplitCost;
+///
+/// let split = SplitCost {
+///     estimate: Duration::from_micros(120),
+///     sections: 1,
+///     resident_bytes: 1 << 20,
+/// };
+/// assert_eq!(split.with_resident_bytes(0).resident_bytes, 0);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SplitCost {
+    /// Serial time of the region on data resident in the caller's caches.
+    pub estimate: Duration,
+    /// The real number of dispatches the region performs (`pays_at`).
+    pub sections: u32,
+    /// Bytes the caller wrote just before the first section.
+    pub resident_bytes: u64,
+}
+
+impl SplitCost {
+    /// `self` with a different number of caller-resident bytes.
+    #[must_use]
+    pub const fn with_resident_bytes(self, resident_bytes: u64) -> Self {
+        SplitCost {
+            resident_bytes,
+            ..self
+        }
+    }
+}
+
+/// The aggregate rate at which the members of a team fork pull data out of the
+/// caller's caches, in integer nanoseconds per KiB.
+///
+/// One row per [`HostClass`], measured with `benches/resident_split.rs`: the
+/// moved bytes (`resident_bytes * (k - 1) / k`) over the busy time of the
+/// slowest member at `k >= 4` on one die keeps one rate per host while the
+/// source is resident. An unmeasured class takes the slowest measured row,
+/// [`per_kib(41)`](Self::per_kib) (about 25 GB/s aggregate), so the transfer is
+/// never under-charged on a host that has not been calibrated; a pool owner
+/// that measured its own host overrides it with [`per_kib`](Self::per_kib).
+///
+/// # Examples
+///
+/// ```
+/// use std::time::Duration;
+/// use threadteam::TransferRate;
+///
+/// let rate = TransferRate::per_kib(8);
+/// assert_eq!(rate.time(128 * 1024), Duration::from_nanos(1024));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TransferRate {
+    /// Nanoseconds to move one KiB, aggregate over the pullers.
+    ns_per_kib: u64,
+}
+
+impl TransferRate {
+    /// A row measured on one host, in nanoseconds per KiB of moved bytes.
+    ///
+    /// One KiB at 100 GB/s is 10.2 ns; at 25 GB/s, 41 ns.
+    pub const fn per_kib(ns_per_kib: u64) -> Self {
+        Self { ns_per_kib }
+    }
+
+    /// The row of a host class.
+    ///
+    /// * [`HostClass::Aarch64Apple`]: 8 ns/KiB, measured on an Apple M5 Max on
+    ///   2026-11-03 with `benches/resident_split.rs` (hot, mode `D`, widths 4
+    ///   and 8, 384 KiB to 4 MiB: 5.8 to 8.4 ns/KiB, the widest point of the
+    ///   smallest size being the slowest).
+    /// * [`HostClass::X86_64Avx512`]: 41 ns/KiB, from the same bench on a
+    ///   2 x Xeon Platinum 9242, one die, source hot at 392 KiB: the pullers
+    ///   drain the moved bytes at 20 to 26 GB/s whatever their number
+    ///   (threadteam-rs#27).
+    /// * Every other class: that 41 ns/KiB default, see [`Self`].
+    pub fn for_class(class: HostClass) -> Self {
+        match class {
+            HostClass::Aarch64Apple => Self::per_kib(8),
+            HostClass::X86_64Avx512
+            | HostClass::X86_64Avx2
+            | HostClass::X86_64Scalar
+            | HostClass::Aarch64
+            | HostClass::Generic => Self::per_kib(41),
+        }
+    }
+
+    /// The row of the host class this process runs on
+    /// (`for_class(HostClass::detect())`).
+    pub fn host_default() -> Self {
+        Self::for_class(HostClass::detect())
+    }
+
+    /// The nanoseconds to move one KiB.
+    pub const fn ns_per_kib(&self) -> u64 {
+        self.ns_per_kib
+    }
+
+    /// The time to move `bytes` at this rate, saturating at `u64::MAX`
+    /// nanoseconds.
+    pub fn time(&self, bytes: u64) -> Duration {
+        Duration::from_nanos(self.ns_of_bytes(bytes))
+    }
+
+    /// [`time`](Self::time) in nanoseconds.
+    #[inline]
+    pub(crate) fn ns_of_bytes(&self, bytes: u64) -> u64 {
+        let ns = u128::from(bytes) * u128::from(self.ns_per_kib) / 1024;
+        if ns > u64::MAX as u128 {
+            u64::MAX
+        } else {
+            ns as u64
+        }
+    }
+}
+
+/// The width in `1..=budget` that minimises
+/// `sections * D(k) + estimate / k + moved(k) / rate`, where `moved(k)` is
+/// `resident_bytes * (k - 1) / k` of the caller-resident source and `D` is
+/// `dispatch`; 1 when no width does. Ties go to the smaller width.
+/// Allocation-free.
+///
+/// The transfer is charged once per section, at one aggregate rate, and a width
+/// only counts when the region [`pays_at`] that section: the transfer is *not*
+/// part of the pay decision, so a region that does not pay stays serial instead
+/// of being made parallel by work the split itself creates. At `k = 1` the term
+/// is zero (there is no member to move anything to), and
+/// `resident_bytes == 0` makes this function identical to [`width_for_by`].
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::time::Duration;
+/// use threadteam::{width_for_by, width_for_split_by, SplitCost, TransferRate};
+///
+/// let budget = NonZeroUsize::new(6).unwrap();
+/// let dispatch = |_| Duration::from_micros(2);
+/// let est = Duration::from_millis(1);
+/// // 1 GiB the caller has just written: at 41 ns/KiB the transfer alone is
+/// // 42 ms, so no width pays for itself.
+/// let split = SplitCost { estimate: est, sections: 1, resident_bytes: 1 << 30 };
+/// assert_eq!(width_for_split_by(split, budget, dispatch, TransferRate::per_kib(41)).get(), 1);
+/// // The same region from cold data has nothing to move.
+/// assert_eq!(
+///     width_for_split_by(split.with_resident_bytes(0), budget, dispatch, TransferRate::per_kib(41)),
+///     width_for_by(est, 1, budget, dispatch),
+/// );
+/// ```
+pub fn width_for_split_by(
+    split: SplitCost,
+    budget: NonZeroUsize,
+    dispatch: impl Fn(NonZeroUsize) -> Duration,
+    rate: TransferRate,
+) -> NonZeroUsize {
+    let est_ns = to_ns(split.estimate);
+    let est = est_ns as f64;
+    let mut best = NonZeroUsize::MIN;
+    let mut best_obj = est;
+    for k in 2..=budget.get() {
+        let Some(width) = NonZeroUsize::new(k) else {
+            continue;
+        };
+        let d = dispatch(width);
+        if d == Duration::MAX {
+            continue;
+        }
+        let d_ns = to_ns(d);
+        if split.sections != 0 && !pays_ns(est_ns, split.sections, d_ns) {
+            continue;
+        }
+        let moved = u128::from(split.resident_bytes) * (k as u128 - 1) / k as u128;
+        let moved = if moved > u128::from(u64::MAX) {
+            u64::MAX
+        } else {
+            moved as u64
+        };
+        let transfer = rate.ns_of_bytes(moved) as f64;
+        let obj = f64::from(split.sections) * d_ns as f64 + est / k as f64 + transfer;
+        if obj < best_obj {
+            best = width;
+            best_obj = obj;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1004,5 +1212,115 @@ mod tests {
         let c = WidthCosts::from_anchors(&[(2, ns(4)), (5, ns(0))]).unwrap();
         assert_eq!(c.at(nz(3)), ns(3));
         assert_eq!(c.at(nz(4)), ns(2));
+    }
+
+    #[test]
+    fn a_transfer_charge_is_one_drain_at_the_row_rate() {
+        let rate = TransferRate::per_kib(41);
+        // 1 MiB at 41 ns/KiB is 41 * 1024 ns.
+        assert_eq!(rate.time(1 << 20), Duration::from_nanos(41 * 1024));
+        assert_eq!(rate.ns_of_bytes(0), 0);
+        // Saturation, not wrap.
+        assert_eq!(
+            TransferRate::per_kib(u64::MAX).time(u64::MAX),
+            Duration::from_nanos(u64::MAX)
+        );
+        // The measured rows: the M5 is charged less per KiB than a die of the
+        // measured Xeon, and an unmeasured class takes the slowest of them.
+        assert!(TransferRate::for_class(HostClass::Aarch64Apple).ns_per_kib() < 41);
+        assert_eq!(
+            TransferRate::for_class(HostClass::Generic),
+            TransferRate::per_kib(41)
+        );
+    }
+
+    #[test]
+    fn zero_resident_bytes_is_exactly_the_width_model() {
+        let rate = TransferRate::per_kib(41);
+        let costs = DispatchCosts::for_class(HostClass::Aarch64Apple);
+        for est_us in [1u64, 7, 40, 1_000, 20_000] {
+            let est = us(est_us);
+            for sections in [1u32, 4] {
+                let split = SplitCost {
+                    estimate: est,
+                    sections,
+                    resident_bytes: 0,
+                };
+                assert_eq!(
+                    width_for_split_by(split, nz(6), |k| costs.cost(DispatchKind::Team, k), rate),
+                    width_for_by(est, sections, nz(6), |k| costs.cost(DispatchKind::Team, k)),
+                    "estimate {est_us} us, {sections} sections"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_resident_source_makes_a_region_stay_serial() {
+        // A 2 ms region over 64 MiB it has just written: the drain is 2.6 ms at
+        // the default row, more than the region costs on one thread.
+        let rate = TransferRate::per_kib(41);
+        let est = Duration::from_millis(2);
+        let cold = width_for_by(est, 1, nz(32), |_| Duration::ZERO);
+        let hot = width_for_split_by(
+            SplitCost {
+                estimate: est,
+                sections: 1,
+                resident_bytes: 64 << 20,
+            },
+            nz(32),
+            |_| Duration::ZERO,
+            rate,
+        );
+        assert_eq!(cold.get(), 32);
+        assert_eq!(hot.get(), 1);
+    }
+
+    #[test]
+    fn the_measured_m5_widths_at_1_mib() {
+        // 1 MiB hot copy on the M5 Max (`benches/resident_split.rs`,
+        // 2026-11-03): 15.4 us serial, 5.96 us at k = 4, 6.29 us at k = 8. The
+        // model keeps the region parallel and lands on its widest width.
+        let costs = DispatchCosts::for_class(HostClass::Aarch64Apple);
+        let split = SplitCost {
+            estimate: Duration::from_nanos(15_375),
+            sections: 1,
+            resident_bytes: 1 << 20,
+        };
+        let w = width_for_split_by(
+            split,
+            nz(6),
+            |k| costs.cost(DispatchKind::Team, k),
+            TransferRate::for_class(HostClass::Aarch64Apple),
+        );
+        assert_eq!(w.get(), 6);
+        // The transfer is 6 us of the 15.4 us region at this width, and it does
+        // not change the choice the plain model makes: the term refines the
+        // width where the drain is comparable to the work, it does not veto a
+        // section that plainly pays.
+        assert_eq!(
+            w,
+            width_for_by(split.estimate, 1, nz(6), |k| costs
+                .cost(DispatchKind::Team, k))
+        );
+    }
+
+    #[test]
+    fn the_measured_die_split_at_392_kib_stays_serial() {
+        // threadteam-rs#27: on one die of the measured Xeon, 392 KiB splits
+        // never beat the 9.2 us serial copy at k = 2 (11.6 us at best).
+        let costs = DispatchCosts::for_class(HostClass::X86_64Avx512);
+        let split = SplitCost {
+            estimate: Duration::from_nanos(9_200),
+            sections: 1,
+            resident_bytes: 392 << 10,
+        };
+        let w = width_for_split_by(
+            split,
+            nz(24),
+            |k| costs.cost(DispatchKind::Team, k),
+            TransferRate::for_class(HostClass::X86_64Avx512),
+        );
+        assert_eq!(w.get(), 1);
     }
 }

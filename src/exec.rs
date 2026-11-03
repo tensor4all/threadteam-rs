@@ -3,7 +3,9 @@
 use crate::awake::Awake;
 #[cfg(feature = "parallel")]
 use crate::awake::LendGuard;
-use crate::cost::{pays_at, width_for_by, DispatchKind};
+use crate::cost::{
+    pays_at, width_for_by, width_for_split_by, DispatchKind, SplitCost, TransferRate,
+};
 use crate::error::{Error, Refused};
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
@@ -269,6 +271,38 @@ impl<'p> Exec<'p> {
     /// ```
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
         width_for_by(estimate, sections, self.budget, |k| self.dispatch_cost(k))
+    }
+
+    /// [`width_for`](Self::width_for) with the transfer term of a section whose
+    /// shares read data this thread has just produced: the width in
+    /// `1..=budget` that minimises
+    /// `sections * D(k) + estimate / k + moved(k) / rate`, where `rate` is
+    /// [`TransferRate::host_default`] (see [`width_for_split_by`]).
+    ///
+    /// Use it where the caller knows the bytes it wrote just before the region.
+    /// A region whose input is not caller-resident passes
+    /// `resident_bytes: 0` and gets [`width_for`](Self::width_for) exactly.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use threadteam::{Exec, SplitCost};
+    ///
+    /// let split = SplitCost {
+    ///     estimate: Duration::from_secs(1),
+    ///     sections: 1,
+    ///     resident_bytes: 1 << 20,
+    /// };
+    /// assert_eq!(Exec::serial().width_for_split(split).get(), 1);
+    /// ```
+    pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
+        width_for_split_by(
+            split,
+            self.budget,
+            |k| self.dispatch_cost(k),
+            TransferRate::host_default(),
+        )
     }
 
     /// Whether no parallelism is possible: the budget is one slot.

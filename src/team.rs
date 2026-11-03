@@ -1,7 +1,9 @@
 //! Reserved awake members: the scoped authority [`TeamExec`].
 
 use crate::awake::{Awake, Geometry, JoinGuard, Section};
-use crate::cost::{pays_at, width_for_by, DispatchCosts, DispatchKind};
+use crate::cost::{
+    pays_at, width_for_by, width_for_split_by, DispatchCosts, DispatchKind, SplitCost, TransferRate,
+};
 use crate::error::Error;
 use crate::policy::{WaitOverride, WaitPolicy};
 use crate::split;
@@ -287,6 +289,16 @@ impl<'team> TeamExec<'team> {
     /// [`Exec::width_for`](crate::Exec::width_for) for this team.
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
         width_for_by(estimate, sections, self.size(), |k| self.dispatch_cost(k))
+    }
+
+    /// [`Exec::width_for_split`](crate::Exec::width_for_split) for this team.
+    pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
+        width_for_split_by(
+            split,
+            self.size(),
+            |k| self.dispatch_cost(k),
+            TransferRate::host_default(),
+        )
     }
 
     /// The effective waiting policy of this scope.

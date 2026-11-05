@@ -4,15 +4,19 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is placed, not pinned.** Immediately before every section it
-//!   dispatches, a leader that is not on `S[0]` moves itself there and gives
-//!   itself the whole of `S` back at once ([`nudge_to`], called by
-//!   `Awake::place_leader`), so each section opens with the leader on the one
-//!   CPU no member takes, while its mask stays `S`. A
+//! * **The leader is placed, not pinned.** Immediately before every section
+//!   dispatched under the placement, a leader that is not on `S[0]` moves
+//!   itself there and gives itself the whole of `S` back at once ([`nudge_to`],
+//!   called by `Awake::place_leader`), so each section opens with the leader on
+//!   the one CPU no member takes, while its mask stays `S`. A
 //!   vendor library creates its thread team from the thread that calls it, and a
 //!   team created from a one-CPU thread silently confines the whole library team
 //!   to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread keeps
-//!   its CPU set.
+//!   its CPU set. The home `S[0]` lives with the members' pins, on the
+//!   authority over them (the scope's `TeamExec`, or the persistent `Team` for
+//!   every token minted from it), never on the pool; a lend
+//!   (`Exec::external`) removes pins and keeps the home (see the design
+//!   record).
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
@@ -42,7 +46,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{current_cpu, nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{contains, current_cpu, nth, read_here, set_here, set_here_to, CpuMask};
 
 /// Number of CPUs a root team scope may spread its participants over.
 ///
@@ -91,9 +95,11 @@ pub(crate) fn pin_to(set: &CpuMask, k: usize) {
 /// Moves the calling thread onto `home` and gives it back the mask it had, so
 /// it runs on `home` without being confined to it. `true` when it moved.
 ///
-/// Used by [`crate::awake::Awake::place_leader`] before every section of a
-/// placed root scope. A thread whose mask is a single CPU (a pinned member
-/// leading a child section) is left alone: `false`. Best effort: a refused move
+/// Used by [`crate::awake::Awake::place_leader`] before every section
+/// dispatched under a placement. A thread whose mask is a single CPU (a pinned
+/// member leading a child section) is left alone: `false`. So is a thread whose
+/// mask does not contain `home` (a team token used from a thread with another
+/// CPU set): moving it there would take it out of its own set. Best effort: a refused move
 /// leaves the thread where it was. The restore of the mask can be refused only
 /// when the cpuset shrank between the two calls, and then the thread stays on
 /// `home` for the rest of the scope: `sched_getaffinity` then reports the
@@ -104,7 +110,7 @@ pub(crate) fn nudge_to(home: usize) -> bool {
     let Some(mask) = read_here() else {
         return false;
     };
-    if count(&mask) < 2 {
+    if count(&mask) < 2 || !contains(&mask, home) {
         return false;
     }
     if !set_here_to(home) {
@@ -247,6 +253,13 @@ mod sys {
         usize::try_from(cpu).ok()
     }
 
+    /// Whether `cpu` is in the set.
+    pub(crate) fn contains(mask: &CpuMask, cpu: usize) -> bool {
+        // SAFETY: reads one bit of a valid set; `cpu < SETSIZE` keeps the
+        // index inside it.
+        cpu < SETSIZE && unsafe { libc::CPU_ISSET(cpu, &mask.set) }
+    }
+
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -296,6 +309,10 @@ mod sys {
 
     pub(crate) fn current_cpu() -> Option<usize> {
         None
+    }
+
+    pub(crate) fn contains(_mask: &CpuMask, _cpu: usize) -> bool {
+        false
     }
 
     pub(crate) fn count(_mask: &CpuMask) -> usize {

@@ -65,6 +65,7 @@ fn a_section_carries_the_oversubscription_flag_it_was_built_with() {
         size: 1,
         over,
         pin: false,
+        home: usize::MAX,
     };
     let quiet = Section::new(
         call,
@@ -226,4 +227,93 @@ fn a_root_scope_chooses_the_throttled_spin_budget_when_oversubscribed() {
         })
         .expect("an idle pool");
     });
+}
+
+/// The leader's home lives on the `Team` for as long as its members are
+/// placed: a root scope's pin section sets it, every later token carries it
+/// (outside a root scope too), an unpin section clears it, and a scope on an
+/// unrelated token of the same pool has a home of its own.
+#[test]
+fn a_teams_home_outlives_its_root_scope_and_is_not_the_pools() {
+    // The home a token of `team` carries, read through a reborrow so that no
+    // root scope opens (which would place the team anew).
+    fn home_of(team: &crate::Team) -> usize {
+        let mut exec = team.exec(2);
+        let home = exec.reborrow().team(|t| t.home).expect("a carried team");
+        home
+    }
+    let all = own_cpus();
+    if all.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let pool = pool(4);
+    let team = pool.into_team(2).expect("an idle pool");
+    // `into_team` acknowledges in a placed root scope; the home stays after it.
+    assert_eq!(home_of(&team), all[0]);
+    let mut exec = team.exec(2);
+    assert_eq!(exec.team(|t| t.home).unwrap(), all[0]);
+    exec.reborrow().fork(1, |_, mut child| {
+        assert_eq!(child.team(|t| t.home).unwrap(), all[0], "a fork child");
+    });
+    drop(exec);
+
+    // An unrelated token of the same pool, entered from a two-CPU caller with
+    // three participants: its scope is skipped and has no home, and the
+    // team's home is untouched.
+    if !set_own_cpus(&all[1..3]) {
+        eprintln!("skipped: cannot restrict the calling thread to two CPUs");
+        return;
+    }
+    let mut other = Exec::new(team.pool(), 3).unwrap();
+    let home = other.team(|t| t.home).expect("idle workers");
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(home, usize::MAX, "a skipped scope has no home");
+    assert_eq!(home_of(&team), all[0]);
+
+    // A root scope of the team that cannot be placed unpins the members and
+    // clears the home with them.
+    if !set_own_cpus(&all[..1]) {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    }
+    team.exec(2)
+        .team(|_| {})
+        .expect("a team token opens its scope");
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(home_of(&team), usize::MAX);
+    assert_eq!(team.pool().pin_skips(), 2);
+}
+
+/// A root scope of a team token narrower than the team changes neither the
+/// placement nor the home: the home describes every reserved member.
+#[test]
+fn a_narrower_root_scope_leaves_the_teams_home() {
+    fn home_of(team: &crate::Team) -> usize {
+        let mut exec = team.exec(3);
+        let home = exec.reborrow().team(|t| t.home).expect("a carried team");
+        home
+    }
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let team = pool(3).into_team(3).expect("an idle pool");
+    assert_eq!(home_of(&team), all[0]);
+    // Cannot be placed (one CPU for two participants): no unpin, no skip.
+    assert!(set_own_cpus(&all[..1]), "restricting to one CPU");
+    let inside = team.exec(2).team(|t| t.home).unwrap();
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(
+        inside, all[0],
+        "the narrower scope runs under the team's home"
+    );
+    assert_eq!(home_of(&team), all[0]);
+    assert_eq!(team.pool().pin_skips(), 0);
+    // Could be placed on another set: still no re-placement.
+    assert!(set_own_cpus(&all[2..4]), "restricting to two other CPUs");
+    team.exec(2).team(|_| {}).unwrap();
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(home_of(&team), all[0]);
 }

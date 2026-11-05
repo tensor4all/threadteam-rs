@@ -571,15 +571,17 @@ How it works:
   sub-team) — the leader reads **its own** mask `S` with
   `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
   section machinery (it also serves as the rendezvous, replacing
-  `acknowledge`). `S[0]` becomes the scope's *home* CPU for the leader, and
-  immediately before every section the leader dispatches in the scope (the
-  pin section first) it places itself there: when `sched_getcpu()` does not
+  `acknowledge`). `S[0]` becomes the *home* CPU of the leader while the
+  members are placed on `S[1..]` (see "Where the leader's home lives" for the
+  one exception, lending), and immediately before every section dispatched
+  under that placement (the pin section first) the leader places itself there: when `sched_getcpu()` does not
   report `S[0]` it moves with `sched_setaffinity(0, {S[0]})` and gives itself
   `S` back with a second call at once. In steady state the check is the whole
   cost; a section is only dispatched once the caller's cost rule admitted the
   region, so the placement adds no threshold of its own. A thread whose mask is
-  one CPU (a pinned member leading a child section) is never moved. The home
-  is cleared when the scope ends. Member `k` (participant `k >= 1`)
+  one CPU (a pinned member leading a child section), or whose mask does not
+  contain the home (a team token used from a thread with another CPU set), is
+  never moved. Member `k` (participant `k >= 1`)
   pins itself with `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`,
   so the members take `S` minus `S[0]`. A team of one is left alone.
 * **Nothing wraps.** When `|S|` is smaller than the number of participants the
@@ -638,9 +640,69 @@ How it works:
   own CPU set with `taskset -c`; there is no CPU allocator in this crate and none
   is planned for this fix. Overlapping teams and pools of one process stay
   caller-managed.
-* Only the members of a team are placed. A token of a `Team` that never opens a
+* Only the members of a team are pinned. A token of a `Team` that never opens a
   team scope (`exec.for_ranges(...)` directly) is not re-pinned; its members
-  keep the placement of the last root scope, or of `Pool::into_team`.
+  keep the placement of the last root scope, or of `Pool::into_team`, and its
+  leader is placed on that placement's home before every section it
+  dispatches, exactly as inside the scope.
+
+#### Where the leader's home lives
+
+The home lives where the members' pins are owned and is set and cleared by the
+same sections that pin and unpin them (tensor4all/threadteam-rs#33). It
+describes every member under that authority at once, which gives the rules
+below; lending is the one case where the two lifetimes differ.
+
+* **Scoped acquisition** (`Exec::team` on a plain token): the members are
+  reserved, and pinned, for the scope only; they restore their masks when the
+  reservation ends. The home is a field of the scope's `TeamExec`, copied into
+  its reborrows, splits, `fork` children and sections, and ends with it.
+* **Persistent `Team`** (`Pool::into_team`): the members stay reserved, and
+  pinned, from the pin section of a root scope (the first one is the
+  acknowledgement scope of `into_team`) until an unpin section or the end of
+  the `Team`. The home is an atomic on the `Team`; every token minted from it
+  carries a reference, and `fork`, `fork_sized`, `for_ranges`, `broadcast` and
+  the carried `team` read it when they dispatch, inside a root scope or not. A
+  pin section stores the new `S[0]`; an unpin section stores "none"; a scope
+  that runs neither (pinning off, an unreadable mask) leaves it, because it
+  leaves the pins too.
+* **Only a root scope over the whole team changes the placement.** The home is
+  one value for every reserved member, while a root token from
+  `Team::exec(budget)` with a smaller budget (or narrowed by `limit`) carries
+  only the first `budget - 1` members. Letting it pin or unpin that prefix
+  would leave the home describing members it did not touch: an unpin from a
+  one-CPU caller would clear the home while the suffix stays pinned (the
+  #33 defect again for full-width sections), and a pin from another mask
+  could make the home a CPU an untouched member holds (every full-width
+  section would then nudge the leader onto that member). So a narrower root
+  scope runs no pin or unpin section, is not counted in `pin_skips`, and
+  dispatches under the team's current placement and home like any plain team
+  token; its oversubscription and the members' spin budget are still decided
+  from its caller's mask. A team that wants a new placement opens a root scope
+  with its whole budget.
+* **Lending is the exception.** `Exec::external` lends the token's members to
+  the pool for the call; each restores its own mask before it serves Rayon
+  work and is re-pinned only at the next pin section, that is at the next
+  whole-team root scope. The home is kept meanwhile. For a team used only
+  through plain tokens after an `external` call, the lent members therefore
+  stay unpinned while the leader is still placed on `S[0]` before each
+  section: `S[0]` is still a CPU no *pinned* member holds, but an unpinned
+  member may run there too. Lending is not changed here. Only the root scope of the token that holds the team's
+  gate writes it, so the gate orders it between leaders, and a member that
+  leads a `fork` child reads it after the section that handed it the child.
+* The pool has no home. In 0.4.0 the home was one pool-wide atomic, set at
+  root-scope entry and cleared at its exit; a `Team` whose sections ran through
+  plain tokens therefore had pinned members and no home, so its leader was left
+  to the scheduler and could share a member's CPU (#33: at width 96 on a
+  two-socket Xeon, about 40 % of processes at ~11 ms per call instead of
+  ~5.8 ms). Keeping that atomic set past the scope instead would have nudged
+  the caller of any other token of the pool, or of a second scope on it, onto
+  the team's CPU; a home carried by the authority over the placed members
+  cannot reach a token that has none.
+
+`Pool::leader_moves` counts every move made by `place_leader`, whichever
+token's section made it, and `Pool::pin_skips` counts every root scope that
+could not be placed, as before.
 
 ### Waiting policy
 

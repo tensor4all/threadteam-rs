@@ -144,13 +144,10 @@ pub(crate) struct Awake {
     /// Root scopes of a pinning pool that placed nobody because the caller's
     /// set had fewer CPUs than the team had participants (`Pool::pin_skips`).
     pub(crate) pin_skips: AtomicU64,
-    /// The CPU the leader of the open, placed root scope keeps for itself
-    /// (`S[0]`), or `usize::MAX` when no placed root scope is open. Written by
-    /// the leader at root-scope entry and exit; read before every section
-    /// dispatch ([`Awake::place_leader`]).
-    pub(crate) leader_home: AtomicUsize,
     /// Sections before which the leader was off its home CPU and moved back
-    /// (each costs two `sched_setaffinity` calls), and the time they took.
+    /// (each costs two `sched_setaffinity` calls), and the time they took. The
+    /// home itself belongs to the placement, not to the pool: it travels with
+    /// the authority over the placed members (`Geometry::home`).
     pub(crate) leader_moves: AtomicU64,
     pub(crate) leader_move_ns: AtomicU64,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
@@ -183,7 +180,6 @@ impl Awake {
             costs,
             pin,
             pin_skips: AtomicU64::new(0),
-            leader_home: AtomicUsize::new(usize::MAX),
             leader_moves: AtomicU64::new(0),
             leader_move_ns: AtomicU64::new(0),
             acquire_timeout,
@@ -200,28 +196,29 @@ impl Awake {
             .count()
     }
 
-    /// Places the leader of a placed root scope on its home CPU just before a
-    /// section is published, leaving its mask whole.
+    /// Places the leader of a section of a placed team on `home` just before
+    /// the section is published, leaving its mask whole. `home` is the
+    /// section's `Geometry::home`; `usize::MAX` (no placement) does nothing.
     ///
-    /// The members of a placed scope sit on `S[1..]`, one CPU each, for the
-    /// whole scope; the leader keeps all of `S` so that a vendor library it
-    /// calls can spread. Between sections the leader runs serial work, and
-    /// the scheduler may move it onto a member's CPU; a member cannot move
-    /// away, so every barrier and join of the next section would wait for the
-    /// two to take turns on one CPU (evo2, LU f64 4096 at 8 threads: 4.1 s per
-    /// call instead of 0.106 s when only the scope's first section placed the
-    /// leader). So the leader is placed again at the moment it matters, the
-    /// dispatch of a section.
+    /// The members of a placed team sit on `S[1..]`, one CPU each, until an
+    /// unpin section or the end of their reservation; the leader keeps all of
+    /// `S` so that a vendor library it calls can spread. Between sections the
+    /// leader runs serial work, and the scheduler may move it onto a member's
+    /// CPU; a member cannot move away, so every barrier and join of the next
+    /// section would wait for the two to take turns on one CPU (evo2, LU f64
+    /// 4096 at 8 threads: 4.1 s per call instead of 0.106 s when only the
+    /// scope's first section placed the leader). So the leader is placed again
+    /// at the moment it matters, the dispatch of a section.
     ///
     /// Cost: one `sched_getcpu` when the leader is already home, which is the
     /// steady state; two `sched_setaffinity` calls (a migration onto the home
     /// CPU and the whole mask back) only when it is not. A section is only
     /// dispatched when the caller's cost rule admitted the region, so the
     /// check rides on that gate and adds no threshold of its own. A thread
-    /// whose mask is one CPU (a pinned member that leads a child section) is
-    /// never moved.
-    pub(crate) fn place_leader(&self) {
-        let home = self.leader_home.load(Ordering::Relaxed);
+    /// whose mask is one CPU (a pinned member that leads a child section), or
+    /// whose mask does not contain `home` (a team token used from a thread with
+    /// another CPU set), is never moved.
+    pub(crate) fn place_leader(&self, home: usize) {
         if home == usize::MAX || crate::pin::current_cpu() == Some(home) {
             return;
         }
@@ -731,6 +728,11 @@ pub(crate) struct Geometry {
     pub(crate) over: bool,
     /// This is the pin section of a root scope (see `Section::pin`).
     pub(crate) pin: bool,
+    /// The CPU the leader is placed on before the section is published
+    /// ([`Awake::place_leader`]): `S[0]` of the placement the members are
+    /// under, or `usize::MAX` when they are not placed. Read by the leader
+    /// only; the section does not keep it.
+    pub(crate) home: usize,
 }
 
 impl Section {
@@ -747,6 +749,7 @@ impl Section {
             size,
             over,
             pin,
+            home: _,
         } = geometry;
         Section {
             call,

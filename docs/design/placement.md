@@ -70,7 +70,7 @@ impl PoolBuilder {
     pub fn thread_name(self, f: impl Fn(usize) -> String + 'static) -> Self;
     pub fn stack_size(self, bytes: usize) -> Self;   // default sized for LU recursion
     pub fn on_start(self, f: impl Fn(usize) + Send + Sync + 'static) -> Self; // e.g. pinning
-    pub fn pin_participants(self, on: bool) -> Self;  // opt-in, Linux; off by default
+    pub fn pin_participants(self, on: bool) -> Self;  // Linux; on by default
     pub fn build(self) -> Result<Pool>;
 }
 
@@ -487,11 +487,12 @@ pool's waits. The earlier design (PAUSE-only spin with a wall-time park delay
 for members and no sleep at all in joins and barriers) is in the history of
 this file.
 
-### Participant placement (opt-in)
+### Participant placement (on by default)
 
-`PoolBuilder::pin_participants(bool)` (default off; `Pool::pin_participants()`
-reads it back) makes a root team scope place its members. It exists because
-of the measurement in tensor4all/faer#107: `qr_factor` f64 512 at 16 threads on
+`PoolBuilder::pin_participants(bool)` (default **on**; `Pool::pin_participants()`
+reads it back, `Pool::pin_skips()` counts the scopes it could not place) makes a
+root team scope place its participants. It exists because of the measurement in
+tensor4all/faer#107: `qr_factor` f64 512 at 16 threads on
 16 allowed CPUs, 20 processes on broccoli (EPYC 7702P, boost 0, governor
 `performance`), 20 repetitions each.
 
@@ -509,9 +510,47 @@ participant 0 only.
 work not overlapping: they are alive, unparked and receiving the same shares,
 but queued on one CPU. A spare CPU does not stop the scheduler from stacking the
 pair; deterministic placement does. That is why placement is the load-bearing
-part of the change and parking is not, and why placement stays **opt-in**: all
-four compared runtimes leave threads unpinned by default, and pinning takes CPUs
-away from the rest of the process and fights the caller's `taskset`.
+part of the change and parking is not.
+
+The second measurement is evo2 (Ryzen AI MAX+ 395, two 8-core L3 domains, SMT
+on, boost on; tensor4all `lu-chol-opt` campaign, LU f64 column major, faer fork
+at 8, 11 and 14 threads, one CPU per physical core, n = 128-1024, four processes
+per cell):
+
+| arm | stalled cells | leader on a member's CPU (8 threads) |
+| --- | --- | --- |
+| A, unpinned | stalls at 11 and 14 threads (3 ms scheduler slices, one per wake of a parked member on a busy CPU) | n/a |
+| B, every participant pinned, the leader to `S[0]` | 0 of 12 | n/a |
+| C, members pinned to `S[k]`, leader left where it was (0.3.0's rule) | catastrophic at 8 threads: LU 512 in 231 ms against 0.9 ms | 74-94 % of samples |
+| C3, as C plus the leader nudged onto `S[0]` at scope entry, its mask left whole | **0 of 12, equal to B** | **1.5 %** |
+
+0.3.0 pinned only the members and left the leader free: the scheduler then put
+the leader on a pinned member's CPU most of the time, and the two shared it for
+whole slices. C3 is what this crate does since: the leader starts the scope on
+the one CPU of `S` no member takes, and keeps all of `S` for the vendor teams it
+creates.
+
+#### Why it is on by default
+
+Placement used to be opt-in, for three reasons. Two do not hold for this rule
+and one holds with a bound:
+
+* *It fights the caller's `taskset`.* It does not: every participant is placed
+  inside the calling thread's own mask `S`, never outside it, and the leader's
+  mask is `S` again as soon as the scope has opened.
+* *It confines a vendor thread team a member creates.* That is the
+  `Exec::external` path, which restores a member's own mask before the vendor
+  call; and the leader, the thread engines call vendor libraries from, is never
+  narrowed.
+* *It takes CPUs away from other users of the process.* It can: a placed member
+  owns its CPU of `S` while the scope runs. It never takes a CPU outside `S`,
+  and a set too small for the team places nobody (below). A pool that shares
+  its CPUs with other work on purpose passes `pin_participants(false)`.
+
+An unpinned team is not a configuration the tensor4all stack ships, so a default
+of off only gave the stalling configuration to every caller who did not know
+about the switch. All four compared runtimes (libgomp, libomp, OpenBLAS, faer)
+leave threads unpinned unless asked; this crate differs on purpose.
 
 How it works:
 
@@ -521,11 +560,23 @@ How it works:
   sub-team) — the leader reads **its own** mask `S` with
   `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
   section machinery (it also serves as the rendezvous, replacing
-  `acknowledge`). Member `k` (participant `k >= 1`) pins itself with
-  `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`, wrapping modulo
-  `|S|` when the team is wider than the set. A team of one is left alone.
-* **The leader is never pinned**, and its mask is never changed, not even for
-  the scope. `S[0]` is left to it without enforcing it. A vendor library (an
+  `acknowledge`). Before that section the leader **nudges** itself: it moves
+  onto `S[0]` with `sched_setaffinity(0, {S[0]})` and gives itself `S` back with
+  a second call at once (skipped when `sched_getcpu()` already reports `S[0]`,
+  the steady state of a persistent team). Member `k` (participant `k >= 1`)
+  pins itself with `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`,
+  so the members take `S` minus `S[0]`. A team of one is left alone.
+* **Nothing wraps.** When `|S|` is smaller than the number of participants the
+  scope places nobody: it runs one *unpin* section instead (the same
+  rendezvous), in which every member restores the mask it saved before an
+  earlier pin section of the reservation (a no-op for a member that is not
+  pinned), and `Pool::pin_skips()` counts the scope. Wrapping would put two
+  members on one CPU, the arrangement the placement exists to prevent; such a
+  team runs with the scheduler's placement, and the counter makes that visible
+  instead of silent. Such a scope is exactly an *oversubscribed* one, so its
+  waits are already throttled.
+* **The leader is never pinned**: after the nudge its mask is what it was. A
+  vendor library (an
   OpenMP or OpenBLAS runtime, a LAPACK provider) builds its thread team from the
   thread that calls it, and a team built from a one-CPU thread silently confines
   the whole provider team to that CPU (`tenferro-rs` `PERFORMANCE_TIPS.md`: 3-20x
@@ -533,8 +584,8 @@ How it works:
   coordinating thread, so that thread keeps its CPU set. Consequently a **pinned
   member must not build a foreign thread team directly inside a share**: it
   would confine that library to its one CPU. Route the call through
-  `Exec::external`, which restores the member's own mask first, or keep pinning
-  off — it is off by default.
+  `Exec::external`, which restores the member's own mask first, or turn pinning
+  off for that pool.
 * **Every affinity change is made by the thread itself.** A member
   saves its previous mask in its own slot (an `UnsafeCell<cpu_set_t>` plus a
   flag that only the member thread of that slot touches) the first time it is
@@ -549,7 +600,10 @@ How it works:
   leader.
 * **Best effort.** A refused syscall (a kernel mask larger than `cpu_set_t`, a
   cpuset that changed under us) leaves that thread as it was; an empty mask pins
-  nobody; a failed pin or restore never fails the scope.
+  nobody; a failed pin or restore never fails the scope. If the kernel accepts
+  the leader's move onto `S[0]` but refuses `S` back (only possible when the
+  cpuset shrank between the two calls), the leader takes whatever mask the
+  kernel then reports, so the nudge never leaves it on one CPU.
 * **Linux only.** Other targets accept the option and do nothing. No libc type
   appears in the public API; the masks are stack `cpu_set_t` values and the
   `k`-th set CPU is found by scanning one, so the path allocates nothing
@@ -598,7 +652,7 @@ on a pool worker grants no reservation.
 Reproducible reductions are left to numerical kernels (fixed logical chunks,
 chunk-owned partials, fixed merge order): the crate gives no stealing within a
 team, so a section's shares are exactly the participants. Cache-domain layout is
-not handled, and placement is opt-in and per team (see below): there is no CPU
+not handled, and placement is per team (on by default, see above): there is no CPU
 allocator, so two teams whose leaders see the same CPU set would place onto the
 same CPUs.
 

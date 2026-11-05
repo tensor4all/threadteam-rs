@@ -931,9 +931,10 @@ impl<'p> Exec<'p> {
             track: self.track.alias(),
             over: oversubscribed,
         };
-        // The pin section is also the acknowledgement; without pinning the
-        // participants acknowledge as before. The leader is never pinned, so
-        // there is nothing to restore when the scope ends or unwinds.
+        // The pin (or unpin) section is also the acknowledgement; without
+        // pinning the participants acknowledge as before. The leader is never
+        // pinned (the nudge gives it its whole mask back before the section),
+        // so there is nothing to restore when the scope ends or unwinds.
         let pinned = team.size().get() > 1 && pin_scope(&mut team);
         if !pinned {
             team.acknowledge();

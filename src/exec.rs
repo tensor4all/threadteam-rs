@@ -820,8 +820,10 @@ impl<'p> Exec<'p> {
     /// This call opens a **root team scope**: it reads the calling thread's
     /// affinity mask, which decides two things. With
     /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants) on
-    /// it places every member on its own CPU of that mask for the scope (the
-    /// leader is never pinned).
+    /// (the default) it places every member on its own CPU of that mask for the
+    /// scope, after moving the leader onto the first CPU of the mask without
+    /// narrowing the leader's mask; a mask with fewer CPUs than participants
+    /// places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
     /// Whether or not pinning is on, it records whether the scope is
     /// *oversubscribed* (more participants than CPUs in the mask), which decides
     /// how the members park and how a joining leader waits. See the design
@@ -962,21 +964,37 @@ impl<'p> Exec<'p> {
     }
 }
 
-/// Runs the pin section of a root team scope: every member places itself on its
-/// own CPU of the calling thread's set. The leader is never pinned.
+/// Places a root team scope on the calling thread's CPU set `S`: the leader is
+/// nudged onto `S[0]` and keeps all of `S`, member `k` pins itself onto `S[k]`.
 ///
-/// `false` when member pinning is off for this pool, when the platform has no
-/// CPU set (off Linux), or when the calling thread's mask could not be read:
-/// then nothing ran and the caller acknowledges as usual.
+/// When `S` has fewer CPUs than the team has participants nothing is pinned:
+/// the skip is counted (`Pool::pin_skips`) and the members restore their own
+/// masks, in case an earlier scope of a persistent team pinned them. Wrapping
+/// members around `S` would put two of them on one CPU, which measured worse
+/// than the scheduler's placement (LU f64 512 at 8 threads: 231 ms against
+/// 0.9 ms on evo2), so a team that cannot be placed is not placed.
+///
+/// `false` when participant pinning is off for this pool, when the platform has
+/// no CPU set (off Linux), or when the calling thread's mask could not be read:
+/// then nothing ran and the caller acknowledges as usual. `true` when a section
+/// ran (pin or unpin), which also served as the acknowledgement.
 fn pin_scope(team: &mut TeamExec<'_>) -> bool {
-    if !team.awake.is_some_and(|awake| awake.pin) {
+    let Some(awake) = team.awake.filter(|awake| awake.pin) else {
         return false;
-    }
-    // The leader reads its own mask, and never changes it: that set is where
-    // the members are placed.
+    };
+    // The leader reads its own mask: that set is where the team is placed, and
+    // the leader's mask is that set again once the scope has opened.
     let Some(set) = crate::pin::read_here() else {
         return false;
     };
+    if crate::pin::count(&set) < team.size().get() {
+        awake
+            .pin_skips
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        team.unpin_section();
+        return true;
+    }
+    crate::pin::nudge(&set);
     team.pin_section(&set);
     true
 }

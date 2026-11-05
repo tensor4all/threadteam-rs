@@ -1,6 +1,8 @@
-//! Opt-in member placement (Linux only): every member pins itself onto one CPU
-//! of the calling thread's set for a root team scope and restores its own mask
-//! afterwards, while the leader (the calling thread) is never moved.
+//! Participant placement (Linux only, on by default): every member pins itself
+//! onto one CPU of the calling thread's set for a root team scope and restores
+//! its own mask afterwards; the leader (the calling thread) is nudged onto the
+//! set's first CPU but its mask is never narrowed; a set with fewer CPUs than
+//! participants places nobody and counts the skip.
 #![cfg(all(feature = "parallel", target_os = "linux"))]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -94,6 +96,16 @@ impl Origin {
         let row = table.iter().find(|(i, _)| *i == worker);
         assert!(row.is_some(), "no mask recorded for worker {worker}");
         row.unwrap().1.clone()
+    }
+
+    /// `mask` itself when some worker started with it, otherwise an empty mask
+    /// (which then fails the comparison it is used in).
+    fn of_any_with(&self, mask: &[usize]) -> Vec<usize> {
+        if self.all().iter().any(|m| m == mask) {
+            mask.to_vec()
+        } else {
+            Vec::new()
+        }
     }
 
     fn all(&self) -> Vec<Vec<usize>> {
@@ -256,12 +268,62 @@ fn a_persistent_team_pins_every_root_scope_and_never_moves_the_leader() {
 }
 
 #[test]
-fn pinning_off_is_the_default_and_leaves_every_mask_alone() {
+fn pinning_is_on_by_default() {
+    let pool = Pool::builder().threads(1).build().unwrap();
+    assert!(pool.pin_participants(), "on by default");
+    assert_eq!(pool.pin_skips(), 0);
+}
+
+#[test]
+fn the_leader_ends_the_nudge_with_its_whole_mask() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: the process has fewer than 2 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let pool = builder(width, true).build().unwrap();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let before = own_cpus();
+    // Whether the leader is on `S[0]` once the scope is open is the
+    // scheduler's to keep, so it is sampled, not asserted on one scope: over
+    // a few scopes at least one starts there (the nudge put it there, and an
+    // idle scheduler leaves it). The mask is asserted every time.
+    let mut on_first = 0;
+    for round in 0..20 {
+        let mut exec = team.exec(width);
+        exec.team(|_| {
+            // SAFETY: no arguments; -1 on failure, which never equals a CPU.
+            let cpu = unsafe { libc::sched_getcpu() };
+            if usize::try_from(cpu).ok() == Some(set[0]) {
+                on_first += 1;
+            }
+            assert_eq!(
+                own_cpus(),
+                before,
+                "round {round}: the leader's mask inside the scope"
+            );
+        })
+        .expect("a team token opens its scope");
+    }
+    assert_eq!(own_cpus(), before, "the leader's mask after the scopes");
+    assert!(
+        on_first > 0,
+        "the leader never started a scope on S[0] = {}",
+        set[0]
+    );
+    assert_eq!(team.pool().pin_skips(), 0);
+}
+
+#[test]
+fn pinning_off_leaves_every_mask_alone() {
     let _w = watchdog();
     let set = own_cpus();
     let width = set.len().min(3);
     let (pool, origin) = origin_pool(width, false);
-    assert!(!pool.pin_participants(), "off by default");
+    assert!(!pool.pin_participants(), "turned off for this pool");
     let before = own_cpus();
     let seen = Seen::default();
     let mut exec = Exec::new(&pool, width).unwrap();
@@ -332,7 +394,7 @@ fn a_lent_member_restores_its_mask_before_it_serves_rayon() {
 }
 
 #[test]
-fn a_team_wider_than_the_callers_set_wraps_around_it() {
+fn a_team_wider_than_the_callers_set_is_not_pinned_and_the_skip_is_counted() {
     let _w = watchdog();
     let all = own_cpus();
     if all.len() < 3 {
@@ -345,7 +407,7 @@ fn a_team_wider_than_the_callers_set_wraps_around_it() {
         return;
     };
     let width = 4;
-    let pool = builder(width, true).build().unwrap();
+    let (pool, origin) = origin_pool(width, true);
     let before = own_cpus();
     assert_eq!(before, cpus);
     let seen = Seen::default();
@@ -357,16 +419,64 @@ fn a_team_wider_than_the_callers_set_wraps_around_it() {
     .expect("an idle pool");
     let masks = seen.take();
     assert_eq!(masks.len(), width);
-    // The leader keeps the whole set; member k wraps onto S[k % 2].
+    // Nobody is placed: no member wraps onto a CPU another one has, every
+    // participant keeps the mask it had.
     assert_eq!(masks[0].1, before, "the leader was moved");
     for (index, mask) in &masks[1..] {
         assert_eq!(
             mask,
-            &vec![cpus[index % cpus.len()]],
-            "participant {index} of {width} on the caller's set {cpus:?}"
+            &origin.of_any_with(mask),
+            "participant {index} of {width} was placed on {mask:?}"
+        );
+        assert!(mask.len() > 1, "participant {index} was pinned to {mask:?}");
+    }
+    assert_eq!(pool.pin_skips(), 1, "the skip is counted");
+    assert_eq!(own_cpus(), before, "the leader's mask after the scope");
+}
+
+#[test]
+fn a_persistent_team_pinned_on_a_wide_set_unpins_when_a_scope_cannot_be_placed() {
+    let _w = watchdog();
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let width = 4;
+    let (pool, origin) = origin_pool(width, true);
+    let team = pool.into_team(width).expect("an idle pool");
+    // First scope from the whole set: the members are pinned.
+    let pinned = Seen::default();
+    team.exec(width)
+        .team(|mut t| t.reborrow().run_with(|p| pinned.record(p.index())))
+        .expect("a team token opens its scope");
+    for (index, mask) in &pinned.take()[1..] {
+        assert_eq!(
+            mask,
+            &vec![all[*index]],
+            "participant {index} on the wide set"
         );
     }
-    assert_eq!(own_cpus(), before, "the leader's mask after the scope");
+    // Second scope from a two-CPU caller: nobody can be placed, so the members
+    // pinned by the first scope restore their own masks for this one.
+    let cpus = vec![all[0], all[1]];
+    let Some(restore) = Restrict::to(&cpus) else {
+        eprintln!("skipped: cannot restrict the calling thread to {cpus:?}");
+        return;
+    };
+    let narrow = Seen::default();
+    team.exec(width)
+        .team(|mut t| t.reborrow().run_with(|p| narrow.record(p.index())))
+        .expect("a team token opens its scope");
+    drop(restore);
+    for (index, mask) in &narrow.take()[1..] {
+        assert!(mask.len() > 1, "participant {index} kept a pin: {mask:?}");
+        assert!(
+            origin.all().contains(mask),
+            "participant {index} on {mask:?}"
+        );
+    }
+    assert_eq!(team.pool().pin_skips(), 1);
 }
 
 #[test]

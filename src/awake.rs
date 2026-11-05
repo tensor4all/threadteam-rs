@@ -139,8 +139,11 @@ pub(crate) struct Awake {
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
     pub(crate) costs: crate::cost::DispatchCosts,
-    /// Opt-in participant pinning (`PoolBuilder::pin_participants`).
+    /// Participant pinning (`PoolBuilder::pin_participants`, on by default).
     pub(crate) pin: bool,
+    /// Root scopes of a pinning pool that placed nobody because the caller's
+    /// set had fewer CPUs than the team had participants (`Pool::pin_skips`).
+    pub(crate) pin_skips: AtomicU64,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
     #[cfg(feature = "trace")]
@@ -170,6 +173,7 @@ impl Awake {
             defaults,
             costs,
             pin,
+            pin_skips: AtomicU64::new(0),
             acquire_timeout,
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),

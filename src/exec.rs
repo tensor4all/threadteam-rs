@@ -524,9 +524,110 @@ impl<'p> Exec<'p> {
         Ok(())
     }
 
+    /// [`fork_sized`](Exec::fork_sized) where child `i` also gets exclusive
+    /// `&mut` access to `slots[i]`, its own state (a cursor, scratch, an error
+    /// slot), with no lock.
+    ///
+    /// `slots` stays exclusively borrowed by the call; each child derives its
+    /// own `&mut slots[i]` from its index right before calling `f`, and
+    /// `fork_sized` runs each index exactly once, so no two children ever
+    /// hold the same slot. The borrow of `slots` ends when every child has
+    /// joined: while the call runs, neither a sibling nor the caller can reach
+    /// slot `i`, and the reference a child receives cannot outlive its call
+    /// (see `docs/design/placement.md`). Splitting,
+    /// placement, join, panic propagation and the share checks are those of
+    /// `fork_sized`, which this call goes through.
+    ///
+    /// # Errors
+    ///
+    /// Nothing runs, no slot is touched and the token is consumed when
+    ///
+    /// * `shares.len() != slots.len()`: [`Error::SlotsMismatch`], naming both
+    ///   counts (no slot is silently left out);
+    /// * otherwise, as [`fork_sized`](Exec::fork_sized): a zero share is
+    ///   [`Error::ZeroBudget`], shares summing past the budget are
+    ///   [`Error::SharesExceedBudget`].
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic from any child after every child has finished, as
+    /// `fork_sized` does. By then the borrow of `slots` has ended, so a caller
+    /// that catches the panic can use every slot again. Each slot holds a valid
+    /// `S`: a child's slot holds what the child last wrote, which after a panic
+    /// in child `i` may be the middle of an update to slot `i` that the child
+    /// did not finish (nothing is rolled back; validity, not consistency, is
+    /// what unwinding guarantees, hence the `AssertUnwindSafe` a catching
+    /// caller writes).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{Error, Exec, Pool};
+    ///
+    /// let pool = Pool::builder().threads(4).acquire_timeout(std::time::Duration::from_secs(10)).build()?;
+    /// let exec = Exec::new(&pool, 4)?;
+    /// let shares: &[usize] = if exec.budget().get() == 4 { &[3, 1] } else { &[1] };
+    /// // One cursor per child, advanced without a lock.
+    /// let mut cursors = vec![0usize; shares.len()];
+    /// exec.fork_sized_slots(shares, &mut cursors, |i, cursor, child| {
+    ///     *cursor += 10 * (i + 1) + child.budget().get();
+    /// })?;
+    /// assert_eq!(cursors[0], 10 + shares[0]);
+    ///
+    /// let err = Exec::serial().fork_sized_slots(&[1], &mut cursors[..0], |_, _, _| {});
+    /// assert_eq!(err.unwrap_err(), Error::SlotsMismatch { shares: 1, slots: 0 });
+    /// # Ok::<(), Error>(())
+    /// ```
+    ///
+    /// A slot reference cannot escape its child:
+    ///
+    /// ```compile_fail
+    /// use std::sync::Mutex;
+    /// let mut slots = [0u32];
+    /// let kept: Mutex<Option<&mut u32>> = Mutex::new(None);
+    /// threadteam::Exec::serial()
+    ///     .fork_sized_slots(&[1], &mut slots, |_, slot, _| *kept.lock().unwrap() = Some(slot))
+    ///     .unwrap();
+    /// ```
+    pub fn fork_sized_slots<S, F>(
+        self,
+        shares: &[usize],
+        slots: &mut [S],
+        f: F,
+    ) -> Result<(), Error>
+    where
+        S: Send,
+        F: Fn(usize, &mut S, Exec<'_>) + Sync,
+    {
+        if shares.len() != slots.len() {
+            return Err(Error::SlotsMismatch {
+                shares: shares.len(),
+                slots: slots.len(),
+            });
+        }
+        let base = SlotBase(slots.as_mut_ptr());
+        self.fork_sized(shares, |i, child| {
+            // SAFETY: the slice is not pre-split; this child derives its own
+            // element from its index here, right before `f`. Exclusivity rests
+            // on `fork_sized` dispatching each `i in 0..shares.len()` exactly
+            // once (`fork_plan` with as many jobs as tasks, no shared counter)
+            // and on `shares.len() == slots.len()`: `i` is in bounds and no two
+            // live references name the same element.
+            // `slots` stays exclusively borrowed by this call, and
+            // `fork_sized` returns or unwinds only after every child has
+            // finished, so the pointee outlives every reference made here; the
+            // reference is handed to `f` for one call and its higher-ranked
+            // lifetime keeps it from escaping. Safe callers reach this only
+            // through the checks above.
+            let slot = unsafe { &mut *base.at(i) };
+            f(i, slot, child);
+        })
+    }
+
     /// The one splitter of `fork` and `fork_sized`: task `k` of `plan` gets a
     /// child token of `plan.child(k).1` slots. More `jobs` than tasks pull job
-    /// indices from a shared counter; otherwise job `k` runs on task `k`.
+    /// indices from a shared counter; otherwise job `k` runs on task `k`,
+    /// exactly once (`fork_sized_slots` relies on this for disjoint slots).
     fn fork_plan<F>(self, plan: &Plan<'_>, jobs: usize, f: F)
     where
         F: Fn(usize, Exec<'_>) + Sync,
@@ -1002,6 +1103,23 @@ impl<'p> Exec<'p> {
     #[cfg(feature = "ledger")]
     pub fn ledger_root(&self) -> Option<u64> {
         self.track.root_id()
+    }
+}
+
+/// The base of the slots of a [`Exec::fork_sized_slots`] call, shared by
+/// its children; each child derives only its own element.
+struct SlotBase<S>(*mut S);
+
+// SAFETY: children on other threads each obtain a `&mut S` to a distinct
+// element through the shared base (see `fork_sized_slots`), which is sending
+// that `S` to the child's thread; `S: Send` makes that sound.
+unsafe impl<S: Send> Sync for SlotBase<S> {}
+
+impl<S> SlotBase<S> {
+    /// Element `i`; a method so that closures capture the whole `Sync` base,
+    /// not its raw-pointer field.
+    fn at(&self, i: usize) -> *mut S {
+        self.0.wrapping_add(i)
     }
 }
 

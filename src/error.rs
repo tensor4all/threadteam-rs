@@ -40,6 +40,16 @@ pub enum Error {
         /// The sum of the requested shares (saturated at `usize::MAX`).
         sum: usize,
     },
+    /// [`Exec::fork_sized_slots`](crate::Exec::fork_sized_slots) was given a
+    /// different number of shares and state slots. Nothing ran; no slot is
+    /// ignored and no share is dropped.
+    #[error("{shares} fork shares but {slots} state slots; there must be one slot per share")]
+    SlotsMismatch {
+        /// The number of requested shares.
+        shares: usize,
+        /// The number of state slots.
+        slots: usize,
+    },
 }
 
 /// A [`broadcast`](crate::Exec::broadcast) that cannot guarantee co-scheduling.

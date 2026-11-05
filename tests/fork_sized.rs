@@ -1,5 +1,5 @@
 //! `Exec::fork_sized`: explicit shares, their validation, leftover slots,
-//! concurrency per child and panic propagation.
+//! concurrency per child and panic propagation; `fork_sized_slots`.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use threadteam::{Error, Exec};
@@ -59,8 +59,45 @@ fn single_and_empty_shares_run_inline() {
     assert_eq!(calls.into_inner(), 1);
 }
 
+/// `fork_sized_slots` refuses a slot count that differs from the share
+/// count, and the share checks of `fork_sized`, before any child runs or any
+/// slot is touched.
+#[test]
+fn slot_forks_reject_mismatched_counts_and_bad_shares() {
+    let mut slots = [7u32; 2];
+    let calls = AtomicUsize::new(0);
+    let f = |_: usize, s: &mut u32, _: Exec<'_>| {
+        *s = 0;
+        calls.fetch_add(1, Ordering::Relaxed);
+    };
+    assert_eq!(
+        Exec::serial()
+            .fork_sized_slots(&[1], &mut slots, f)
+            .unwrap_err(),
+        Error::SlotsMismatch {
+            shares: 1,
+            slots: 2
+        }
+    );
+    assert_eq!(
+        Exec::serial()
+            .fork_sized_slots(&[1, 1], &mut slots, f)
+            .unwrap_err(),
+        Error::SharesExceedBudget { budget: 1, sum: 2 }
+    );
+    assert_eq!(
+        Exec::serial()
+            .fork_sized_slots(&[0, 1], &mut slots, f)
+            .unwrap_err(),
+        Error::ZeroBudget
+    );
+    assert_eq!(calls.into_inner(), 0);
+    assert_eq!(slots, [7, 7]);
+}
+
 #[cfg(feature = "parallel")]
 mod parallel {
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -233,6 +270,61 @@ mod parallel {
         let payload = caught.expect_err("the child's panic propagates");
         assert_eq!(payload.downcast_ref::<&str>(), Some(&"child 1"));
         assert_eq!(done.into_inner(), 2, "the siblings were joined first");
+    }
+
+    /// A panic in child 1 propagates after the join; then the caller owns
+    /// every slot again: each holds what its child wrote (child 1's write
+    /// before the panic included) and can be used.
+    fn slots_usable_after_panic(exec: Exec<'_>) {
+        let siblings = Barrier::new(2);
+        let mut slots = vec![Vec::<usize>::new(); 3];
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            exec.fork_sized_slots(&[1, 1, 1], &mut slots, |i, slot, _| {
+                slot.push(i);
+                if i == 1 {
+                    panic!("child 1");
+                }
+                siblings.wait();
+            })
+        }));
+        let payload = caught.expect_err("the child's panic propagates");
+        assert_eq!(payload.downcast_ref::<&str>(), Some(&"child 1"));
+        assert_eq!(slots, [vec![0], vec![1], vec![2]]);
+        for slot in &mut slots {
+            slot.push(9);
+        }
+        assert_eq!(slots, [vec![0, 9], vec![1, 9], vec![2, 9]]);
+    }
+
+    #[test]
+    fn a_slot_fork_panic_leaves_every_slot_usable() {
+        let _w = watchdog();
+        let plain = pool(3);
+        slots_usable_after_panic(Exec::new(&plain, 3).unwrap());
+        let team = pool(3).into_team(3).unwrap();
+        slots_usable_after_panic(team.exec(3));
+    }
+
+    /// Child `i` sees exactly slot `i` with its share, exactly once, on plain
+    /// and team tokens; the slots are `Send` but not `Sync`.
+    #[test]
+    fn slot_forks_hand_child_i_slot_i() {
+        let _w = watchdog();
+        let plain = pool(4);
+        let team = pool(4).into_team(4).unwrap();
+        for exec in [Exec::new(&plain, 4).unwrap(), team.exec(4)] {
+            // (index, share, visits).
+            let mut slots: [Cell<(usize, usize, usize)>; 3] = Default::default();
+            exec.fork_sized_slots(&[2, 1, 1], &mut slots, |i, slot, child| {
+                let visits = slot.get().2;
+                slot.set((i, child.budget().get(), visits + 1));
+            })
+            .unwrap();
+            assert_eq!(
+                slots.map(Cell::into_inner),
+                [(0, 2, 1), (1, 1, 1), (2, 1, 1)]
+            );
+        }
     }
 
     #[test]

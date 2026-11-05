@@ -97,6 +97,9 @@ impl<'p> Exec<'p> {
     /// One child per share, child i gets exactly shares[i] slots; the shares
     /// sum to at most the budget (never clamped). `fork` is its even case.
     pub fn fork_sized(self, shares: &[usize], f: impl Fn(usize, Exec<'_>) + Sync) -> Result<(), Error>;
+    /// `fork_sized` where child i also gets exclusive `&mut slots[i]`;
+    /// `slots.len() != shares.len()` is an error.
+    pub fn fork_sized_slots<S: Send>(self, shares: &[usize], slots: &mut [S], f: impl Fn(usize, &mut S, Exec<'_>) + Sync) -> Result<(), Error>;
     /// Data-parallel loop over 0..len, ranges of at least `grain`, at most `budget` tasks.
     pub fn for_ranges(self, len: usize, grain: NonZeroUsize, f: impl Fn(Range<usize>) + Sync);
     /// The only place a bare width exists: enter the pool, hand the budget to
@@ -133,6 +136,34 @@ construction:
   call and are the parent's again after the join. Both entries go through one
   splitter over the same `Plan` that `TeamExec::split` uses, so join, panic
   propagation and job-to-task placement are one code path.
+  `fork_sized_slots` is `fork_sized` plus one caller-owned state slot per
+  child: it checks `slots.len() == shares.len()` (`Error::SlotsMismatch`
+  otherwise, so no slot is silently left out), then calls `fork_sized`, whose
+  child `i` runs exactly once and derives `&mut slots[i]` from the base
+  pointer of the exclusively borrowed slice. Distinct children get distinct
+  elements, the reference lives for one call of `f`, and the borrow of
+  `slots` ends after the join (also when a child's panic is re-raised), so
+  per-child state needs no lock and the call allocates nothing.
+
+  *Safety argument.* The slice is not split before dispatch. One private
+  `SlotBase<S>` wraps `slots.as_mut_ptr()` (`unsafe impl<S: Send> Sync`), and
+  each child computes `&mut *base.at(i)` from its own index right before its
+  callback. Exclusivity rests on one internal invariant: `fork_sized` calls
+  `fork_plan` with as many jobs as tasks, so there is no shared counter and
+  each `i in 0..shares.len()` is dispatched exactly once on every path (the
+  single inline child, the disjoint `lo..hi` halves of the `rayon::join`
+  tree, the team section's leader and distinct published participants).
+  With `shares.len() == slots.len()` every `i` is in bounds. The caller
+  cannot touch `slots` while the call holds it, the callback's slot lifetime
+  is higher-ranked so the reference cannot escape (a compile-fail doctest),
+  and `fork_sized` returns or unwinds only after every child has finished
+  (`rayon::join` joins both halves before propagating; the team section's
+  `JoinGuard` waits on unwind), so no derived reference outlives the
+  borrow. `S: Send` suffices because a child receives exclusive `&mut S`,
+  never shared access. A safe alternative was rejected: `split_at_mut`
+  recursion fits the join tree but not the team section's shared
+  `Fn + Sync` callback, and per-slot `Mutex` extraction allocates (a native
+  lock is boxed lazily on macOS).
 - **No other spawner.** Only `threadteam` depends on Rayon among tensor4all
   crates (`cargo deny` with `wrappers`), so nothing else can start a task on
   the pool.
@@ -415,6 +446,7 @@ On a token with team authority the `Exec` methods dispatch through the same
 | --- | --- |
 | `fork(jobs, f)` | `tasks = min(jobs, budget)`; task `k` runs on the first member of its index range of the same even plan as `split`, with the share of `split::share`; the child token carries that range's sub-team; more jobs than tasks pull from the shared counter as before |
 | `fork_sized(shares, f)` | the plan of `split(shares)`: child `k` leads its index range of `shares[k]` participants and carries that sub-team; members past the sum stay parked |
+| `fork_sized_slots(shares, slots, f)` | as `fork_sized`; child `k` also gets `&mut slots[k]` |
 | `for_ranges` | the leader and the first `tasks - 1` members run the chunks; no Rayon entry |
 | `broadcast` | every participant of the budget at once on the reserved members; never refused (a `fork` child owns its members too), `can_broadcast` is true |
 | `team(f)` / `team_with` | hands out the carried (sub)team at once, no acquisition |

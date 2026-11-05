@@ -35,6 +35,13 @@ fn entries(pool: &Pool) {
     Exec::new(pool, 3).unwrap().for_ranges(100, grain, |r| {
         sink.fetch_add(r.len(), Ordering::Relaxed);
     });
+    // Per-child state on the stack, no lock: nothing to allocate.
+    let mut cursors = [0usize; 3];
+    Exec::new(pool, 3)
+        .unwrap()
+        .fork_sized_slots(&[1, 1, 1], &mut cursors, |i, c, _| *c += i + 1)
+        .unwrap();
+    sink.fetch_add(cursors.iter().sum(), Ordering::Relaxed);
     let w = Exec::new(pool, 3).unwrap().external(|w| w.get());
     assert_eq!(w, 3);
     assert!(sink.load(Ordering::Relaxed) > 0);
@@ -62,7 +69,7 @@ fn measure(rounds: usize, f: impl Fn()) -> usize {
 
 // One test: the counter is process-global.
 #[test]
-fn fork_for_ranges_external_do_not_allocate() {
+fn fork_for_ranges_slots_external_do_not_allocate() {
     let pool = Pool::builder().threads(3).build().unwrap();
     let plain = measure(10, || entries(&pool));
     assert_eq!(plain, 0, "plain-thread entries allocated");

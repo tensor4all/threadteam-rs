@@ -336,6 +336,7 @@ impl Team {
             policy: self.policy,
             over: oversubscribed,
             home: &self.home,
+            reserved: self.reservation.ids.len(),
         };
         Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
     }

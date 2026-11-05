@@ -12,9 +12,11 @@
 //!   vendor library creates its thread team from the thread that calls it, and a
 //!   team created from a one-CPU thread silently confines the whole library team
 //!   to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread keeps
-//!   its CPU set. The home `S[0]` lives as long as the members' pins, on the
+//!   its CPU set. The home `S[0]` lives with the members' pins, on the
 //!   authority over them (the scope's `TeamExec`, or the persistent `Team` for
-//!   every token minted from it), never on the pool.
+//!   every token minted from it), never on the pool; a lend
+//!   (`Exec::external`) removes pins and keeps the home (see the design
+//!   record).
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.

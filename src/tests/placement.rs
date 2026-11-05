@@ -284,3 +284,36 @@ fn a_teams_home_outlives_its_root_scope_and_is_not_the_pools() {
     assert_eq!(home_of(&team), usize::MAX);
     assert_eq!(team.pool().pin_skips(), 2);
 }
+
+/// A root scope of a team token narrower than the team changes neither the
+/// placement nor the home: the home describes every reserved member.
+#[test]
+fn a_narrower_root_scope_leaves_the_teams_home() {
+    fn home_of(team: &crate::Team) -> usize {
+        let mut exec = team.exec(3);
+        let home = exec.reborrow().team(|t| t.home).expect("a carried team");
+        home
+    }
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let team = pool(3).into_team(3).expect("an idle pool");
+    assert_eq!(home_of(&team), all[0]);
+    // Cannot be placed (one CPU for two participants): no unpin, no skip.
+    assert!(set_own_cpus(&all[..1]), "restricting to one CPU");
+    let inside = team.exec(2).team(|t| t.home).unwrap();
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(
+        inside, all[0],
+        "the narrower scope runs under the team's home"
+    );
+    assert_eq!(home_of(&team), all[0]);
+    assert_eq!(team.pool().pin_skips(), 0);
+    // Could be placed on another set: still no re-placement.
+    assert!(set_own_cpus(&all[2..4]), "restricting to two other CPUs");
+    team.exec(2).team(|_| {}).unwrap();
+    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+    assert_eq!(home_of(&team), all[0]);
+}

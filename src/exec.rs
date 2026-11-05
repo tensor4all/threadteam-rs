@@ -104,12 +104,17 @@ pub(crate) struct TeamAuth<'p> {
     pub(crate) over: bool,
     /// The [`Team`](crate::Team)'s home for its leader: `S[0]` of the
     /// placement its members are under, or `usize::MAX` when they are not
-    /// placed. It lives on the `Team`, not on the pool, and as long as the
-    /// placement does: the pin section of a root scope sets it, an unpin
-    /// section clears it, and the `Team` (with its reservation) ends it. Every
-    /// section a token of the team dispatches places its leader there first,
-    /// inside a root scope or not.
+    /// placed. It lives on the `Team`, not on the pool: the pin section of a
+    /// whole-team root scope sets it, an unpin section of one clears it, and
+    /// the `Team` (with its reservation) ends it. Every section a token of the
+    /// team dispatches places its leader there first, inside a root scope or
+    /// not. A lend (`Exec::external`) unpins the lent members and keeps the
+    /// home: it then outlives their pins until the next whole-team root scope.
     pub(crate) home: &'p AtomicUsize,
+    /// Number of members the `Team` reserved, all of which `home` describes.
+    /// A root token whose `ids` are fewer (`Team::exec` with a smaller budget,
+    /// or `limit`) does not change the placement (see `team_with`).
+    pub(crate) reserved: usize,
 }
 
 impl Exec<'static> {
@@ -835,10 +840,12 @@ impl<'p> Exec<'p> {
     /// moving the leader onto the first CPU of the mask without narrowing the
     /// leader's mask, and moves the leader there again before every later
     /// section under that placement. A scoped acquisition is placed for the
-    /// scope; a root token of a [`Team`](crate::Team) places the team's members
-    /// until a later root scope re-places or unpins them or the `Team` ends, and
-    /// every token of the team homes its leader meanwhile, inside a scope or
-    /// not. A mask with fewer CPUs than participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
+    /// scope; a root token of a [`Team`](crate::Team) with the whole team's
+    /// budget places the team's members until a later such scope re-places or
+    /// unpins them or the `Team` ends, and every token of the team homes its
+    /// leader meanwhile, inside a scope or not. A root token of a `Team` with a
+    /// smaller budget changes no placement and runs under the team's current
+    /// one. A mask with fewer CPUs than participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
     /// Whether or not pinning is on, it records whether the scope is
     /// *oversubscribed* (more participants than CPUs in the mask), which decides
     /// how the members park and how a joining leader waits. See the design
@@ -913,9 +920,17 @@ impl<'p> Exec<'p> {
                 // The placement outlives the scope: the members stay pinned
                 // until an unpin section or the end of the reservation, and so
                 // does the leader's home, which the `Team` keeps for every
-                // later token. A scope that ran no section (pinning off, no CPU
-                // set) leaves the placement as it was.
-                if team.size().get() > 1 && pin_scope(&mut team) {
+                // later token. The home is one value for every reserved member,
+                // so only a scope over all of them may change the placement: a
+                // token narrower than the team would pin or unpin a prefix and
+                // leave the rest where the home no longer describes them (a
+                // home cleared while a suffix is pinned, or set to a CPU a
+                // suffix member holds). A narrower root scope therefore runs
+                // no pin or unpin section and dispatches under the team's
+                // current placement and home, as a plain team token does. A
+                // scope that ran no section (pinning off, no CPU set) leaves
+                // the placement as it was.
+                if t.ids.len() == t.reserved && team.size().get() > 1 && pin_scope(&mut team) {
                     t.home.store(team.home, Ordering::Relaxed);
                 }
             }

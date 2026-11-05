@@ -571,8 +571,9 @@ How it works:
   sub-team) — the leader reads **its own** mask `S` with
   `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
   section machinery (it also serves as the rendezvous, replacing
-  `acknowledge`). `S[0]` becomes the *home* CPU of the leader for as long as
-  the members stay on `S[1..]`, and immediately before every section dispatched
+  `acknowledge`). `S[0]` becomes the *home* CPU of the leader while the
+  members are placed on `S[1..]` (see "Where the leader's home lives" for the
+  one exception, lending), and immediately before every section dispatched
   under that placement (the pin section first) the leader places itself there: when `sched_getcpu()` does not
   report `S[0]` it moves with `sched_setaffinity(0, {S[0]})` and gives itself
   `S` back with a second call at once. In steady state the check is the whole
@@ -647,8 +648,10 @@ How it works:
 
 #### Where the leader's home lives
 
-The home has the lifetime of the members' pins, and it lives where they are
-owned (tensor4all/threadteam-rs#33):
+The home lives where the members' pins are owned and is set and cleared by the
+same sections that pin and unpin them (tensor4all/threadteam-rs#33). It
+describes every member under that authority at once, which gives the rules
+below; lending is the one case where the two lifetimes differ.
 
 * **Scoped acquisition** (`Exec::team` on a plain token): the members are
   reserved, and pinned, for the scope only; they restore their masks when the
@@ -662,7 +665,29 @@ owned (tensor4all/threadteam-rs#33):
   the carried `team` read it when they dispatch, inside a root scope or not. A
   pin section stores the new `S[0]`; an unpin section stores "none"; a scope
   that runs neither (pinning off, an unreadable mask) leaves it, because it
-  leaves the pins too. Only the root scope of the token that holds the team's
+  leaves the pins too.
+* **Only a root scope over the whole team changes the placement.** The home is
+  one value for every reserved member, while a root token from
+  `Team::exec(budget)` with a smaller budget (or narrowed by `limit`) carries
+  only the first `budget - 1` members. Letting it pin or unpin that prefix
+  would leave the home describing members it did not touch: an unpin from a
+  one-CPU caller would clear the home while the suffix stays pinned (the
+  #33 defect again for full-width sections), and a pin from another mask
+  could make the home a CPU an untouched member holds (every full-width
+  section would then nudge the leader onto that member). So a narrower root
+  scope runs no pin or unpin section, is not counted in `pin_skips`, and
+  dispatches under the team's current placement and home like any plain team
+  token; its oversubscription and the members' spin budget are still decided
+  from its caller's mask. A team that wants a new placement opens a root scope
+  with its whole budget.
+* **Lending is the exception.** `Exec::external` lends the token's members to
+  the pool for the call; each restores its own mask before it serves Rayon
+  work and is re-pinned only at the next pin section, that is at the next
+  whole-team root scope. The home is kept meanwhile. For a team used only
+  through plain tokens after an `external` call, the lent members therefore
+  stay unpinned while the leader is still placed on `S[0]` before each
+  section: `S[0]` is still a CPU no *pinned* member holds, but an unpinned
+  member may run there too. Lending is not changed here. Only the root scope of the token that holds the team's
   gate writes it, so the gate orders it between leaders, and a member that
   leads a `fork` child reads it after the section that handed it the child.
 * The pool has no home. In 0.4.0 the home was one pool-wide atomic, set at

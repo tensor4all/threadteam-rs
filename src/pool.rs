@@ -751,9 +751,16 @@ impl PoolBuilder {
     ///   (`exec.for_ranges(...)` directly) is not re-pinned; its members keep
     ///   the placement of the last root scope (or of `Pool::into_team`), and
     ///   its leader is moved onto that placement's `S[0]` before each section
-    ///   as inside the scope. The leader's home belongs to the `Team` and lasts
-    ///   as long as the members' pins: until a root scope that cannot be
-    ///   placed unpins them, or the `Team` ends. A token that is not part of a
+    ///   as inside the scope. The leader's home belongs to the `Team` and is
+    ///   changed only by a root scope of a token with the whole team's budget:
+    ///   it lasts until such a scope re-places the members, or cannot place
+    ///   them and unpins them, or the `Team` ends. A root scope of a narrower
+    ///   token runs under the team's current placement and home and changes
+    ///   neither. One exception: members lent by
+    ///   [`Exec::external`](crate::Exec::external) restore their own masks and
+    ///   are not re-pinned until the next whole-team root scope, while the home
+    ///   is kept, so in between the leader is still placed on `S[0]` but an
+    ///   unpinned member may run there too. A token that is not part of a
     ///   placed team (a plain token of the same pool) never moves its caller
     ///   outside its own team scope.
     ///

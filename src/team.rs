@@ -88,9 +88,8 @@ impl Participant<'_> {
 ///   a few times, then sleep until woken. Members run no unrelated Rayon job and
 ///   do not leave on a timeout, also between sections and during a long serial
 ///   phase of the leader; they are returned when the scope ends. In a root scope
-///   with more participants than CPUs in the caller's affinity mask, or in a
-///   pool whose waiters were recently descheduled, the spin is throttled to 100
-///   polls, so waiters free their CPUs quickly.
+///   with more participants than CPUs in the caller's affinity mask the spin is
+///   throttled to 100 polls, so waiters free their CPUs quickly.
 /// * If the pool pins members
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of

@@ -692,7 +692,10 @@ impl PoolBuilder {
     /// badly.
     ///
     /// **The leader is never pinned.** Its mask is the same after each placement as
-    /// before it: it keeps all of `S` while the members work. A vendor library
+    /// before it: it keeps all of `S` while the members work, so between
+    /// sections it may run anywhere in `S`. Only its *position* is set: it is
+    /// moved onto `S[0]` immediately before each section it dispatches, and is
+    /// not held there for the life of the scope. A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
@@ -782,10 +785,9 @@ impl PoolBuilder {
     /// and then sleeps until woken (`docs/design/waiting.md`; the shape of
     /// libgomp's `GOMP_SPINCOUNT`). A count, so a waiter that is descheduled
     /// does not spend it while it waits for its CPU. Zero sleeps after the
-    /// yields. An oversubscribed scope, or a pool whose waiters were recently
-    /// descheduled, uses at most 100 polls. It also bounds how long an idle
-    /// member released by a team keeps polling before it returns to Rayon,
-    /// together with [`idle_spin`](Self::idle_spin).
+    /// yields. An oversubscribed scope uses at most 100 polls. It also bounds how
+    /// long an idle member released by a team keeps polling before it returns to
+    /// Rayon, together with [`idle_spin`](Self::idle_spin).
     ///
     /// # Examples
     ///

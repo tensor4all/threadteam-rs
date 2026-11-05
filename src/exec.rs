@@ -971,9 +971,10 @@ impl<'p> Exec<'p> {
 /// When `S` has fewer CPUs than the team has participants nothing is pinned:
 /// the skip is counted (`Pool::pin_skips`) and the members restore their own
 /// masks, in case an earlier scope of a persistent team pinned them. Wrapping
-/// members around `S` would put two of them on one CPU, which measured worse
-/// than the scheduler's placement (LU f64 512 at 8 threads: 231 ms against
-/// 0.9 ms on evo2), so a team that cannot be placed is not placed.
+/// members around `S` puts two of them on one CPU, which measured worse than
+/// the scheduler's placement and worse than one thread (evo2, LU f64 512 with
+/// 8 participants wrapped onto one CPU: 3.1 ms against 0.89 ms unpinned and
+/// 1.7 ms on one thread), so a team that cannot be placed is not placed.
 ///
 /// `false` when participant pinning is off for this pool, when the platform has
 /// no CPU set (off Linux), or when the calling thread's mask could not be read:

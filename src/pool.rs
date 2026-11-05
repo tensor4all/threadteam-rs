@@ -237,7 +237,7 @@ impl Pool {
     ///
     /// Such a scope runs with the scheduler's placement, as with
     /// [`PoolBuilder::pin_participants`] off; members never wrap around the set
-    /// (two members on one CPU measured far worse than leaving them free). A
+    /// (participants stacked on one CPU measured slower than one thread). A
     /// non-zero count means the caller asked for a wider team than its mask
     /// allows, which is the case to fix on the caller's side (a wider
     /// `taskset`, or a narrower team). Always zero for a pool with pinning off
@@ -668,10 +668,12 @@ impl PoolBuilder {
     /// **Nothing wraps.** When `S` has fewer CPUs than the team has
     /// participants, nobody is placed: the scope runs with the scheduler's
     /// placement, members that an earlier scope of a persistent team pinned
-    /// restore their own masks, and [`Pool::pin_skips`] counts the scope. Two
-    /// members on one CPU measured 260x slower than the scheduler's placement
-    /// (LU f64 512, 8 participants on evo2), so a team that cannot be placed is
-    /// not placed badly.
+    /// restore their own masks, and [`Pool::pin_skips`] counts the scope.
+    /// Participants stacked on one CPU measured slower than the scheduler's
+    /// placement and slower than one thread (evo2, LU f64 512 with 8
+    /// participants wrapped onto one CPU: 3.1 ms against 0.89 ms unpinned and
+    /// 1.7 ms on one thread), so a team that cannot be placed is not placed
+    /// badly.
     ///
     /// **The leader is never pinned.** Its mask is the same after the nudge as
     /// before it: it keeps all of `S` while the members work. A vendor library

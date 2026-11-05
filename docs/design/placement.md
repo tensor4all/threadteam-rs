@@ -571,7 +571,9 @@ How it works:
   rendezvous), in which every member restores the mask it saved before an
   earlier pin section of the reservation (a no-op for a member that is not
   pinned), and `Pool::pin_skips()` counts the scope. Wrapping would put two
-  members on one CPU, the arrangement the placement exists to prevent; such a
+  members on one CPU, the arrangement the placement exists to prevent (evo2: 8
+  participants wrapped onto one CPU ran LU f64 512 in 3.1 ms against 0.89 ms
+  unpinned and 1.7 ms on one thread, n = 1024 in 14.3 ms against 3.4); such a
   team runs with the scheduler's placement, and the counter makes that visible
   instead of silent. Such a scope is exactly an *oversubscribed* one, so its
   waits are already throttled.

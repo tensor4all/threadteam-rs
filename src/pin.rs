@@ -77,8 +77,11 @@ pub(crate) fn oversubscribed(participants: usize) -> bool {
 /// Called by a member for itself (`k >= 1`); the leader never calls it. Never
 /// wraps: `k >= |set|` leaves the thread where it was (the root scope does not
 /// pin at all in that case, see `exec::pin_scope`, so this is only a second
-/// line of defence). Best effort: an empty set, a refused syscall, or the
-/// calling thread already being outside `set` leaves the thread where it was.
+/// line of defence). It does not look at the current mask first: it asks the
+/// kernel for the single CPU `set[k]` wherever the thread happens to be, so a
+/// thread that was outside `set` is moved into it. Best effort: an empty set,
+/// or a refused syscall (the CPU is not in the caller's permitted cpuset),
+/// leaves the thread where it was.
 pub(crate) fn pin_to(set: &CpuMask, k: usize) {
     if let Some(cpu) = nth(set, k) {
         set_here_to(cpu);
@@ -91,10 +94,12 @@ pub(crate) fn pin_to(set: &CpuMask, k: usize) {
 /// Used by [`crate::awake::Awake::place_leader`] before every section of a
 /// placed root scope. A thread whose mask is a single CPU (a pinned member
 /// leading a child section) is left alone: `false`. Best effort: a refused move
-/// leaves the thread where it was, and a refused restore of the mask (only
-/// possible when the cpuset shrank between the two calls) falls back to
-/// whatever mask the kernel then reports, so the thread is never left on one
-/// CPU because of this.
+/// leaves the thread where it was. The restore of the mask can be refused only
+/// when the cpuset shrank between the two calls, and then the thread stays on
+/// `home` for the rest of the scope: `sched_getaffinity` then reports the
+/// single-CPU mask the move installed, and no syscall used here reveals a wider
+/// permitted set, so the fallback confirms that mask instead of widening it.
+/// `Pool::leader_moves` counts the move either way.
 pub(crate) fn nudge_to(home: usize) -> bool {
     let Some(mask) = read_here() else {
         return false;
@@ -106,6 +111,9 @@ pub(crate) fn nudge_to(home: usize) -> bool {
         return false;
     }
     if !set_here(&mask) {
+        // Re-applying the mask the kernel reports confirms what the thread now
+        // has; it cannot widen it, because that mask is the one-CPU mask the
+        // move above installed. The doc comment above states this limit.
         if let Some(now) = read_here() {
             let _ = set_here(&now);
         }

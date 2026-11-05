@@ -68,9 +68,14 @@ impl Drop for LeaderGuard<'_> {
 /// A `Team` **owns** its [`Pool`] and has no lifetime: an engine stores a `Team`
 /// (or a plain `Pool` when it wants no team). `Pool` is not `Clone`, no method
 /// hands out a second handle, and [`pool`](Team::pool) only borrows. Dropping
-/// the `Team` releases the members and then drops the pool, which joins the
-/// workers; [`into_pool`](Team::into_pool) releases the members and gives the
-/// pool back instead. Tokens borrow the `Team`, so none outlives it.
+/// the `Team` releases the members and then drops the pool, which ends its team
+/// members: a pool with the default thread settings hands its idle workers to a
+/// process-wide cache keyed by width, which the next default pool of that width
+/// takes instead of starting threads, while a pool with
+/// [`thread_name`](crate::PoolBuilder::thread_name), an `on_start` hook, a
+/// `stack_size` or a `qos` of its own has dedicated workers and does join them;
+/// [`into_pool`](Team::into_pool) releases the members and gives the pool back
+/// instead. Tokens borrow the `Team`, so none outlives it.
 ///
 /// # Examples
 ///

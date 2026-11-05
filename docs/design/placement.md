@@ -208,9 +208,9 @@ thread run one of its children, which is one of the tasks already counted.
   registry is never touched.
 - **Already in the target pool**: spawn into the current scope, no install
   (cheap re-entry).
-- **Cross-pool or plain thread**: enter the pool once with `in_place_scope` and
-  wait. No thread-local state exists, so nothing is inherited by work that runs
-  on the waiting thread.
+- **Cross-pool or plain thread**: enter the pool once with `ThreadPool::install`
+  and wait. No thread-local state exists, so nothing is inherited by work that
+  runs on the waiting thread.
 - **External width**: `external` hands over the budget unchanged. A library
   that rounds or splits it does so itself (t4a-faer's `join_raw` splits a width
   into halves that add up to it).
@@ -395,8 +395,12 @@ per-call acquisition with `Exec::team` applies). The `Team` holds the `Pool` by
 value and has no lifetime and no `Arc` around the pool. When the members cannot
 all be reserved, `IntoTeamError` returns the pool together with the `Refused`
 reason and the caller falls back to plain tokens. Dropping the `Team` releases the
-members (zero idle spin, woken) and then drops the pool, which joins the
-workers; `into_pool` releases the members and returns the pool instead. The
+members (zero idle spin, woken) and then drops the pool, which ends its team
+members: a pool with the default thread settings leaves its idle workers in a
+process-wide cache keyed by width, which the next default pool of that width
+takes instead of starting threads, and only a pool with dedicated workers
+(`thread_name`, `on_start`, `stack_size`, `qos`) joins them; `into_pool` releases
+the members and returns the pool instead. The
 only internal sharing is an `Arc` of the awake-member state that claim jobs
 hold; it is not a pool handle. `exec(budget)` mints a
 root token, `budget` clamped to `1..=size`, that carries `TeamAuth`: the token's
@@ -482,10 +486,10 @@ with a zero idle spin and broadcasts, so the members return to Rayon at once.
 
 Replaced by [`waiting.md`](waiting.md): every team wait spins for the pool's
 spin budget in polls, yields a few times, then sleeps; the leader's join and
-the barriers sleep on a pool-wide parker; a descheduled waiter throttles the
-pool's waits. The earlier design (PAUSE-only spin with a wall-time park delay
-for members and no sleep at all in joins and barriers) is in the history of
-this file.
+the barriers sleep on a pool-wide parker; an oversubscribed root scope throttles
+its waits to 100 polls, and no wait reads a clock or detects descheduling. The
+earlier design (PAUSE-only spin with a wall-time park delay for members and no
+sleep at all in joins and barriers) is in the history of this file.
 
 ### Participant placement (on by default)
 
@@ -533,8 +537,9 @@ them) the leader drifted back onto a member's CPU after the first serial gap:
 the leader on `S[0]`, and the calls ran 5-38x slower than unpinned. The crate
 therefore places the leader on `S[0]` immediately before **every section**,
 not once per scope: measured 106.3 ms against 107.1 unpinned and 107.1 with the
-leader pinned for the whole scope. The leader still keeps all of `S` between
-sections, for the vendor teams it creates.
+leader pinned for the whole scope. The leader still keeps all of `S` as its
+mask between sections, for the vendor teams it creates; the mask is what it
+keeps, and the position is what is set, at each dispatch and free in between.
 
 #### Why it is on by default
 
@@ -588,7 +593,10 @@ How it works:
   team runs with the scheduler's placement, and the counter makes that visible
   instead of silent. Such a scope is exactly an *oversubscribed* one, so its
   waits are already throttled.
-* **The leader is never pinned**: after each placement its mask is what it was. A
+* **The leader is never pinned**: after each placement its mask is what it was,
+  and only its *position* was set, onto `S[0]`, immediately before the section
+  about to be dispatched. Between sections it runs anywhere in `S`; the mask is
+  what a vendor team inherits, and the mask is what is kept. A
   vendor library (an
   OpenMP or OpenBLAS runtime, a LAPACK provider) builds its thread team from the
   thread that calls it, and a team built from a one-CPU thread silently confines
@@ -615,8 +623,11 @@ How it works:
   cpuset that changed under us) leaves that thread as it was; an empty mask pins
   nobody; a failed pin or restore never fails the scope. If the kernel accepts
   the leader's move onto `S[0]` but refuses `S` back (only possible when the
-  cpuset shrank between the two calls), the leader takes whatever mask the
-  kernel then reports, so a placement never leaves it on one CPU.
+  cpuset shrank between the two calls), the leader stays on `S[0]`: the mask a
+  refused restore leaves is the single CPU the move installed,
+  `sched_getaffinity` reports that same mask, and nothing here can discover the
+  wider permitted set, so the leader is left on one CPU until the scope ends.
+  That is a limit of the syscalls used, not a promise this code keeps.
 * **Linux only.** Other targets accept the option and do nothing. No libc type
   appears in the public API; the masks are stack `cpu_set_t` values and the
   `k`-th set CPU is found by scanning one, so the path allocates nothing

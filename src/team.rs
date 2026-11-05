@@ -198,6 +198,11 @@ pub struct TeamExec<'team> {
     /// every [`Section`] so that nested sections of an oversubscribed root
     /// know it too.
     pub(crate) over: bool,
+    /// The CPU the leader is placed on before each section (`S[0]` of the
+    /// placement the members are under), or `usize::MAX` when they are not
+    /// placed. Set by the pin (or unpin) section of a root scope and inherited
+    /// like `over`.
+    pub(crate) home: usize,
 }
 
 /// How the members of a split are divided.
@@ -347,6 +352,7 @@ impl<'team> TeamExec<'team> {
             policy: self.policy,
             track: self.track.alias(),
             over: self.over,
+            home: self.home,
         }
     }
 
@@ -416,6 +422,7 @@ impl<'team> TeamExec<'team> {
             size: ids.len() + 1,
             over: self.over,
             pin,
+            home: self.home,
         };
         section(self.awake, &|pos| ids[pos], &body, geometry);
     }
@@ -552,8 +559,9 @@ impl<'team> TeamExec<'team> {
     {
         let track = &self.track;
         let _released = track.release();
-        let (awake, ids, policy, over) = (self.awake, self.ids, self.policy, self.over);
-        split_raw(awake, ids, plan, over, |c, child_ids| {
+        let (awake, ids, policy, over, home) =
+            (self.awake, self.ids, self.policy, self.over, self.home);
+        split_raw(awake, ids, plan, over, home, |c, child_ids| {
             let _live = track.task();
             let child = TeamExec {
                 awake,
@@ -561,6 +569,7 @@ impl<'team> TeamExec<'team> {
                 policy,
                 track: track.child(),
                 over,
+                home,
             };
             f(c, child);
         });
@@ -611,7 +620,7 @@ where
     let dispatched = geometry.dispatched;
     if dispatched > 0 {
         if let Some(awake) = awake {
-            awake.place_leader();
+            awake.place_leader(geometry.home);
         }
     }
     let guard = JoinGuard(&sec);
@@ -633,8 +642,14 @@ where
 
 /// Runs `f(c, child_ids)` for every child of `plan` at once: child 0 on the
 /// calling thread, child `c` on the first member of its index range.
-pub(crate) fn split_raw<F>(awake: Option<&Awake>, ids: &[usize], plan: &Plan<'_>, over: bool, f: F)
-where
+pub(crate) fn split_raw<F>(
+    awake: Option<&Awake>,
+    ids: &[usize],
+    plan: &Plan<'_>,
+    over: bool,
+    home: usize,
+    f: F,
+) where
     F: Fn(usize, &[usize]) + Sync,
 {
     let body = |p: &Participant<'_>| {
@@ -648,6 +663,7 @@ where
         size: ids.len() + 1,
         over,
         pin: false,
+        home,
     };
     section(
         awake,
@@ -663,6 +679,7 @@ pub(crate) fn spread_raw<F>(
     ids: &[usize],
     participants: usize,
     over: bool,
+    home: usize,
     f: F,
 ) where
     F: Fn(usize) + Sync,
@@ -673,6 +690,7 @@ pub(crate) fn spread_raw<F>(
         size: participants,
         over,
         pin: false,
+        home,
     };
     section(awake, &|pos| ids[pos], &body, geometry);
 }

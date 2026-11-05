@@ -274,11 +274,12 @@ impl Pool {
         }
     }
 
-    /// Sections of placed root scopes before which the leader was off its home
-    /// CPU and was moved back (two `sched_setaffinity` calls each), and the
-    /// total time those moves took: a diagnostic for the placement cost. A
-    /// section whose leader was already home costs one `sched_getcpu` and is
-    /// not counted.
+    /// Sections dispatched under a placement (a placed root scope, or any
+    /// token of a placed [`Team`](crate::Team), inside a root scope or not)
+    /// before which the leader was off its home CPU and was moved back (two
+    /// `sched_setaffinity` calls each), and the total time those moves took: a
+    /// diagnostic for the placement cost. A section whose leader was already
+    /// home costs one `sched_getcpu` and is not counted.
     #[doc(hidden)]
     pub fn leader_moves(&self) -> (u64, Duration) {
         use core::sync::atomic::Ordering::Relaxed;
@@ -745,10 +746,16 @@ impl PoolBuilder {
     ///   team to one CPU. Call it through
     ///   [`Exec::external`](crate::Exec::external), which restores the member's
     ///   mask first, or turn this option off.
-    /// * Only the members of a team are placed. A token of a
+    /// * Only the members of a team are pinned. A token of a
     ///   [`Team`](crate::Team) that never opens a team scope
     ///   (`exec.for_ranges(...)` directly) is not re-pinned; its members keep
-    ///   the placement of the last root scope (or of `Pool::into_team`).
+    ///   the placement of the last root scope (or of `Pool::into_team`), and
+    ///   its leader is moved onto that placement's `S[0]` before each section
+    ///   as inside the scope. The leader's home belongs to the `Team` and lasts
+    ///   as long as the members' pins: until a root scope that cannot be
+    ///   placed unpins them, or the `Team` ends. A token that is not part of a
+    ///   placed team (a plain token of the same pool) never moves its caller
+    ///   outside its own team scope.
     ///
     /// # Why it is on by default
     ///

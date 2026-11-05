@@ -426,7 +426,7 @@ impl<'team> TeamExec<'team> {
     /// that `set` has a CPU for every participant; nothing wraps. The leader,
     /// participant 0, is **never pinned**: it keeps its own mask, `set`, so a
     /// vendor team it creates inherits the caller's CPU set instead of one CPU
-    /// (see [`PoolBuilder::pin_participants`]); the root scope has nudged it
+    /// (see [`PoolBuilder::pin_participants`]); `section` has placed it
     /// onto `set[0]`, the CPU no member takes, just before.
     ///
     /// One section of the existing machinery, so all participants are on their
@@ -610,6 +610,11 @@ where
         awake.map(|a| &a.waits),
     );
     let dispatched = geometry.dispatched;
+    if dispatched > 0 {
+        if let Some(awake) = awake {
+            awake.place_leader();
+        }
+    }
     let guard = JoinGuard(&sec);
     if dispatched > 0 {
         if let Some(awake) = awake {

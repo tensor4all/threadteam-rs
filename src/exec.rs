@@ -894,8 +894,9 @@ impl<'p> Exec<'p> {
                 if let Some(auth) = self.team.as_mut() {
                     auth.over = oversubscribed;
                 }
-                if team.size().get() > 1 {
-                    pin_scope(&mut team);
+                if team.size().get() > 1 && pin_scope(&mut team) {
+                    let _home = HomeGuard(team.awake);
+                    return Ok(f(team));
                 }
             }
             return Ok(f(team));
@@ -933,12 +934,13 @@ impl<'p> Exec<'p> {
         };
         // The pin (or unpin) section is also the acknowledgement; without
         // pinning the participants acknowledge as before. The leader is never
-        // pinned (the nudge gives it its whole mask back before the section),
+        // pinned (each placement gives it its whole mask back at once),
         // so there is nothing to restore when the scope ends or unwinds.
         let pinned = team.size().get() > 1 && pin_scope(&mut team);
         if !pinned {
             team.acknowledge();
         }
+        let _home = HomeGuard(pinned.then_some(&pool.awake));
         Ok(f(team))
     }
 
@@ -966,7 +968,8 @@ impl<'p> Exec<'p> {
 }
 
 /// Places a root team scope on the calling thread's CPU set `S`: the leader is
-/// nudged onto `S[0]` and keeps all of `S`, member `k` pins itself onto `S[k]`.
+/// homed on `S[0]` (placed there before every section, see
+/// `Awake::place_leader`) and keeps all of `S`, member `k` pins itself onto `S[k]`.
 ///
 /// When `S` has fewer CPUs than the team has participants nothing is pinned:
 /// the skip is counted (`Pool::pin_skips`) and the members restore their own
@@ -993,12 +996,36 @@ fn pin_scope(team: &mut TeamExec<'_>) -> bool {
         awake
             .pin_skips
             .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        awake
+            .leader_home
+            .store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
         team.unpin_section();
         return true;
     }
-    crate::pin::nudge(&set);
+    // The leader's home is `S[0]`, the CPU no member takes. Every section of
+    // the scope places the leader there first (`Awake::place_leader`), the pin
+    // section included, so the scope opens with the leader home too.
+    if let Some(home) = crate::pin::nth(&set, 0) {
+        awake
+            .leader_home
+            .store(home, core::sync::atomic::Ordering::Relaxed);
+    }
     team.pin_section(&set);
     true
+}
+
+/// Clears the leader's home CPU when a placed root scope ends (or unwinds), so
+/// no section outside the scope moves its caller.
+struct HomeGuard<'a>(Option<&'a Awake>);
+
+impl Drop for HomeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(awake) = self.0 {
+            awake
+                .leader_home
+                .store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl fmt::Debug for Exec<'_> {

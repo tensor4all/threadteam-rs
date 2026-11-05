@@ -274,6 +274,20 @@ impl Pool {
         }
     }
 
+    /// Sections of placed root scopes before which the leader was off its home
+    /// CPU and was moved back (two `sched_setaffinity` calls each), and the
+    /// total time those moves took: a diagnostic for the placement cost. A
+    /// section whose leader was already home costs one `sched_getcpu` and is
+    /// not counted.
+    #[doc(hidden)]
+    pub fn leader_moves(&self) -> (u64, Duration) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            self.awake.leader_moves.load(Relaxed),
+            Duration::from_nanos(self.awake.leader_move_ns.load(Relaxed)),
+        )
+    }
+
     /// Number of workers currently kept awake as team members, reserved or
     /// idle. Zero once idle members returned to Rayon. A diagnostic: the value
     /// can change at any moment.
@@ -658,9 +672,11 @@ impl PoolBuilder {
     /// [`Team`](crate::Team)) reads **its own** affinity mask `S` with
     /// `sched_getaffinity`, then:
     ///
-    /// * moves itself onto `S[0]` and gives itself all of `S` back at once (a
-    ///   *nudge*, skipped when it already runs on `S[0]`), so the scope starts
-    ///   with the leader on the CPU no member takes;
+    /// * immediately before **every section** it dispatches in that scope, the
+    ///   leader moves itself onto `S[0]` and gives itself all of `S` back at
+    ///   once, skipped (one `sched_getcpu`) when it already runs there; so each
+    ///   section opens with the leader on the CPU no member takes, and between
+    ///   sections the leader is free on its whole mask;
     /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`:
     ///   member `k` (participant `k`, counting the leader as 0) onto the `k`-th
     ///   set CPU of `S`. The members take `S` minus `S[0]`.
@@ -675,7 +691,7 @@ impl PoolBuilder {
     /// 1.7 ms on one thread), so a team that cannot be placed is not placed
     /// badly.
     ///
-    /// **The leader is never pinned.** Its mask is the same after the nudge as
+    /// **The leader is never pinned.** Its mask is the same after each placement as
     /// before it: it keeps all of `S` while the members work. A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
@@ -701,8 +717,11 @@ impl PoolBuilder {
     /// slow). On evo2 (two L3 domains, LU f64 at 11 and 14 threads) unpinned
     /// teams stalled by 3 ms scheduler slices; pinning only the members and
     /// leaving the leader wherever it was put the leader on a member's CPU in
-    /// 74-94 % of the samples at 8 threads, which the nudge to `S[0]` brings to
-    /// 1.5 %, with times equal to pinning every participant, leader included.
+    /// 74-94 % of the samples at 8 threads. Placing the leader on `S[0]` only
+    /// when the scope opened was not enough: in a long scope with serial leader
+    /// work between sections (LU f64 4096) the leader drifted back onto a
+    /// member's CPU in 90 % of the samples and the call ran 38x slower. Placing
+    /// it before every section measured equal to pinning every participant.
     ///
     /// # Assumptions and limits
     ///

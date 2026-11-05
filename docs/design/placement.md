@@ -522,13 +522,19 @@ per cell):
 | A, unpinned | stalls at 11 and 14 threads (3 ms scheduler slices, one per wake of a parked member on a busy CPU) | n/a |
 | B, every participant pinned, the leader to `S[0]` | 0 of 12 | n/a |
 | C, members pinned to `S[k]`, leader left where it was (0.3.0's rule) | catastrophic at 8 threads: LU 512 in 231 ms against 0.9 ms | 74-94 % of samples |
-| C3, as C plus the leader nudged onto `S[0]` at scope entry, its mask left whole | **0 of 12, equal to B** | **1.5 %** |
+| C3, as C plus the leader nudged onto `S[0]` at scope entry, its mask left whole (n <= 1024 only) | **0 of 12, equal to B** | **1.5 %** |
 
 0.3.0 pinned only the members and left the leader free: the scheduler then put
 the leader on a pinned member's CPU most of the time, and the two shared it for
-whole slices. C3 is what this crate does since: the leader starts the scope on
-the one CPU of `S` no member takes, and keeps all of `S` for the vendor teams it
-creates.
+whole slices. C3 fixed that for short scopes only. At n = 4096 (LU f64, T = 4-8,
+one root scope over many calls with about 50 ms of serial leader work between
+them) the leader drifted back onto a member's CPU after the first serial gap:
+90 % of the samples showed leader and member runnable on one CPU, only 1 % had
+the leader on `S[0]`, and the calls ran 5-38x slower than unpinned. The crate
+therefore places the leader on `S[0]` immediately before **every section**,
+not once per scope: measured 106.3 ms against 107.1 unpinned and 107.1 with the
+leader pinned for the whole scope. The leader still keeps all of `S` between
+sections, for the vendor teams it creates.
 
 #### Why it is on by default
 
@@ -560,10 +566,15 @@ How it works:
   sub-team) — the leader reads **its own** mask `S` with
   `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
   section machinery (it also serves as the rendezvous, replacing
-  `acknowledge`). Before that section the leader **nudges** itself: it moves
-  onto `S[0]` with `sched_setaffinity(0, {S[0]})` and gives itself `S` back with
-  a second call at once (skipped when `sched_getcpu()` already reports `S[0]`,
-  the steady state of a persistent team). Member `k` (participant `k >= 1`)
+  `acknowledge`). `S[0]` becomes the scope's *home* CPU for the leader, and
+  immediately before every section the leader dispatches in the scope (the
+  pin section first) it places itself there: when `sched_getcpu()` does not
+  report `S[0]` it moves with `sched_setaffinity(0, {S[0]})` and gives itself
+  `S` back with a second call at once. In steady state the check is the whole
+  cost; a section is only dispatched once the caller's cost rule admitted the
+  region, so the placement adds no threshold of its own. A thread whose mask is
+  one CPU (a pinned member leading a child section) is never moved. The home
+  is cleared when the scope ends. Member `k` (participant `k >= 1`)
   pins itself with `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`,
   so the members take `S` minus `S[0]`. A team of one is left alone.
 * **Nothing wraps.** When `|S|` is smaller than the number of participants the
@@ -577,7 +588,7 @@ How it works:
   team runs with the scheduler's placement, and the counter makes that visible
   instead of silent. Such a scope is exactly an *oversubscribed* one, so its
   waits are already throttled.
-* **The leader is never pinned**: after the nudge its mask is what it was. A
+* **The leader is never pinned**: after each placement its mask is what it was. A
   vendor library (an
   OpenMP or OpenBLAS runtime, a LAPACK provider) builds its thread team from the
   thread that calls it, and a team built from a one-CPU thread silently confines
@@ -605,7 +616,7 @@ How it works:
   nobody; a failed pin or restore never fails the scope. If the kernel accepts
   the leader's move onto `S[0]` but refuses `S` back (only possible when the
   cpuset shrank between the two calls), the leader takes whatever mask the
-  kernel then reports, so the nudge never leaves it on one CPU.
+  kernel then reports, so a placement never leaves it on one CPU.
 * **Linux only.** Other targets accept the option and do nothing. No libc type
   appears in the public API; the masks are stack `cpu_set_t` values and the
   `k`-th set CPU is found by scanning one, so the path allocates nothing

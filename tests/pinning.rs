@@ -5,6 +5,7 @@
 //! participants places nobody and counts the skip.
 #![cfg(all(feature = "parallel", target_os = "linux"))]
 
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -275,11 +276,11 @@ fn pinning_is_on_by_default() {
 }
 
 #[test]
-fn the_leader_ends_the_nudge_with_its_whole_mask() {
+fn the_leader_is_placed_on_its_home_cpu_before_every_section_and_keeps_its_mask() {
     let _w = watchdog();
     let set = own_cpus();
-    if set.len() < 2 {
-        eprintln!("skipped: the process has fewer than 2 allowed CPUs");
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
         return;
     }
     let width = set.len().min(4);
@@ -287,34 +288,76 @@ fn the_leader_ends_the_nudge_with_its_whole_mask() {
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
     let before = own_cpus();
-    // Whether the leader is on `S[0]` once the scope is open is the
-    // scheduler's to keep, so it is sampled, not asserted on one scope: over
-    // a few scopes at least one starts there (the nudge put it there, and an
-    // idle scheduler leaves it). The mask is asserted every time.
-    let mut on_first = 0;
-    for round in 0..20 {
-        let mut exec = team.exec(width);
-        exec.team(|_| {
-            // SAFETY: no arguments; -1 on failure, which never equals a CPU.
-            let cpu = unsafe { libc::sched_getcpu() };
-            if usize::try_from(cpu).ok() == Some(set[0]) {
-                on_first += 1;
+    let moves_before = team.pool().leader_moves().0;
+    // Inside one root scope, drag the leader onto a member's CPU (S[1]) between
+    // sections, as serial work in a long scope lets the scheduler do, then open
+    // a section: the leader must run its share on S[0] with its whole mask.
+    // Where the leader runs is the scheduler's to keep, so it is sampled over
+    // rounds; the mask is asserted every time.
+    let mut on_home = 0;
+    let rounds = 20;
+    team.exec(width)
+        .team(|mut t| {
+            for round in 0..rounds {
+                assert!(set_own_cpus(&[set[1]]), "moving the leader onto S[1]");
+                assert!(set_own_cpus(&before), "restoring the leader's mask");
+                let seen = Mutex::new(None);
+                t.reborrow().run_with(|p| {
+                    if p.index() == 0 {
+                        // SAFETY: no arguments; -1 on failure, never a CPU.
+                        let cpu = unsafe { libc::sched_getcpu() };
+                        *seen.lock().unwrap() = Some((usize::try_from(cpu).ok(), own_cpus()));
+                    }
+                });
+                let (cpu, mask) = seen.into_inner().unwrap().unwrap();
+                assert_eq!(
+                    mask, before,
+                    "round {round}: the leader's mask in its share"
+                );
+                if cpu == Some(set[0]) {
+                    on_home += 1;
+                }
             }
-            assert_eq!(
-                own_cpus(),
-                before,
-                "round {round}: the leader's mask inside the scope"
-            );
         })
         .expect("a team token opens its scope");
-    }
-    assert_eq!(own_cpus(), before, "the leader's mask after the scopes");
+    assert_eq!(own_cpus(), before, "the leader's mask after the scope");
     assert!(
-        on_first > 0,
-        "the leader never started a scope on S[0] = {}",
-        set[0]
+        on_home > rounds / 2,
+        "the leader ran its share on S[0] in {on_home} of {rounds} sections"
     );
+    let moves = team.pool().leader_moves().0 - moves_before;
+    assert!(moves > 0, "no placement was counted");
     assert_eq!(team.pool().pin_skips(), 0);
+}
+
+#[test]
+fn a_section_outside_a_placed_scope_never_moves_its_caller() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(3);
+    let pool = builder(width, true).build().unwrap();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    // Open and close a placed scope, so the pool has had a home CPU.
+    team.exec(width)
+        .team(|_| {})
+        .expect("a team token opens its scope");
+    let moves = team.pool().leader_moves().0;
+    // A token used without a team scope dispatches with no home: nothing moves
+    // the caller, wherever it runs.
+    assert!(set_own_cpus(&[set[2]]), "moving the caller onto S[2]");
+    assert!(set_own_cpus(&set), "restoring the caller's mask");
+    team.exec(width)
+        .for_ranges(64, NonZeroUsize::new(16).unwrap(), |_| {});
+    assert_eq!(
+        team.pool().leader_moves().0,
+        moves,
+        "a caller outside the scope was moved"
+    );
 }
 
 #[test]

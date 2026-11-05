@@ -4,9 +4,11 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is nudged, not pinned.** It moves itself onto `S[0]` and gives
-//!   itself the whole of `S` back at once ([`nudge`]), so the scope starts with
-//!   the leader on the one CPU no member takes, while its mask stays `S`. A
+//! * **The leader is placed, not pinned.** Immediately before every section it
+//!   dispatches, a leader that is not on `S[0]` moves itself there and gives
+//!   itself the whole of `S` back at once ([`nudge_to`], called by
+//!   `Awake::place_leader`), so each section opens with the leader on the one
+//!   CPU no member takes, while its mask stays `S`. A
 //!   vendor library creates its thread team from the thread that calls it, and a
 //!   team created from a one-CPU thread silently confines the whole library team
 //!   to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread keeps
@@ -83,37 +85,32 @@ pub(crate) fn pin_to(set: &CpuMask, k: usize) {
     }
 }
 
-/// Moves the calling thread (the leader of a root scope) onto `set[0]` and gives
-/// it the whole of `set` back at once.
+/// Moves the calling thread onto `home` and gives it back the mask it had, so
+/// it runs on `home` without being confined to it. `true` when it moved.
 ///
-/// The members of the scope pin themselves onto `set[1..]`, so `set[0]` is the
-/// one CPU of the set no member takes. Measured on evo2 (Ryzen AI MAX+ 395, LU
-/// f64 at 8, 11 and 14 threads): a leader left wherever it was shared a CPU
-/// with a pinned member in 74-94 % of the samples at 8 threads, and the call
-/// ran up to 260x slower; nudged to `set[0]` it shared one in 1.5 %, and the
-/// times equalled pinning every participant, leader included. The leader keeps
-/// its whole mask, so a vendor team it creates is not confined to one CPU.
-///
-/// A no-op when the thread is already on `set[0]`, which is the steady state
-/// of a persistent team (one `sched_getcpu`, no syscall). Best effort: a
-/// refused move leaves the thread where it was, and a refused restore of `set`
-/// (only possible when the cpuset shrank between the two calls) is retried once
-/// from the mask the kernel reports.
-pub(crate) fn nudge(set: &CpuMask) {
-    let Some(first) = nth(set, 0) else {
-        return;
+/// Used by [`crate::awake::Awake::place_leader`] before every section of a
+/// placed root scope. A thread whose mask is a single CPU (a pinned member
+/// leading a child section) is left alone: `false`. Best effort: a refused move
+/// leaves the thread where it was, and a refused restore of the mask (only
+/// possible when the cpuset shrank between the two calls) falls back to
+/// whatever mask the kernel then reports, so the thread is never left on one
+/// CPU because of this.
+pub(crate) fn nudge_to(home: usize) -> bool {
+    let Some(mask) = read_here() else {
+        return false;
     };
-    if current_cpu() == Some(first) {
-        return;
+    if count(&mask) < 2 {
+        return false;
     }
-    if set_here_to(first) && !set_here(set) {
-        // The kernel refused `set` after accepting `set[0]`: the cpuset
-        // changed under us. Never leave the leader on one CPU because of the
-        // nudge: give it back whatever set the kernel will take.
+    if !set_here_to(home) {
+        return false;
+    }
+    if !set_here(&mask) {
         if let Some(now) = read_here() {
             let _ = set_here(&now);
         }
     }
+    true
 }
 
 /// The mask a member saved before it pinned itself, and whether it is pinned.

@@ -21,15 +21,36 @@ const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 
 /// Whether a pool pins the members of a root team scope by default.
 ///
-/// The one switch for the default of [`PoolBuilder::pin_participants`]: off, as
-/// in every compared runtime (libgomp, libomp, OpenBLAS, faer) and as measured
-/// on broccoli, where the slow mode of tensor4all/faer#107 disappears only with
-/// member placement (arm C: 0 of 20 processes slow, 0 % stacked samples) while it
-/// persists with a free CPU (arm B: 7 of 20). Turning it on by default would take
-/// CPUs away from other users of the process, fight the caller's `taskset`, and
-/// confine any vendor thread team a member creates, so the decision stays per
-/// pool.
-const PIN_PARTICIPANTS_DEFAULT: bool = false;
+/// The one switch for the default of [`PoolBuilder::pin_participants`]: **on**.
+///
+/// An unpinned team is not a configuration the tensor4all stack ships: left to
+/// the scheduler, members of a team stack on one CPU and the call runs at the
+/// one-thread time or worse. Measured twice: broccoli (EPYC 7702P, `qr_factor`
+/// 512 at 16 threads, tensor4all/faer#107) had 11 of 20 processes slow unpinned
+/// and 0 of 20 with the participants placed; evo2 (Ryzen AI MAX+ 395, two L3
+/// domains, LU f64 at 11 and 14 threads) stalled by 3 ms scheduler slices in a
+/// fraction of the processes unpinned and in none with placement. A default of
+/// off only guaranteed that every caller who did not know about the switch got
+/// the stalling configuration. The reasons it used to be off, and why they no
+/// longer hold:
+///
+/// * *It fights the caller's `taskset`.* It does not: the team is placed inside
+///   the calling thread's own mask `S` and never outside it, and the leader's
+///   mask is `S` again as soon as the scope has opened.
+/// * *It confines a vendor thread team a member creates.* That is the
+///   [`Exec::external`](crate::Exec::external) path, which restores the
+///   member's own mask before the vendor call, and the leader (the thread
+///   engines call vendor libraries from) is never narrowed.
+/// * *It takes CPUs away from other users of the process.* It still can: a
+///   placed member owns its CPU of `S` while the scope runs. That is bounded by
+///   `S` (nothing outside the caller's mask is ever used) and by the rule that a
+///   set too small for the team places nobody (counted by
+///   [`Pool::pin_skips`]); a pool that shares its CPUs with other work on
+///   purpose turns it off with `pin_participants(false)`.
+///
+/// libgomp, libomp, OpenBLAS and faer leave threads unpinned unless asked; this
+/// crate differs on purpose, for the measurements above.
+const PIN_PARTICIPANTS_DEFAULT: bool = true;
 
 /// Default spin budget of a wait, in polls (one PAUSE, or YIELD on aarch64,
 /// per poll); see `docs/design/waiting.md`. 300000 on x86-64, libgomp's default
@@ -195,18 +216,43 @@ impl Pool {
         self.awake.costs
     }
 
-    /// Whether the pool pins the **members** of a root team scope (see
-    /// [`PoolBuilder::pin_participants`]); the leader is never pinned.
+    /// Whether the pool places the participants of a root team scope (see
+    /// [`PoolBuilder::pin_participants`]); the leader is never narrowed.
     ///
     /// # Examples
     ///
     /// ```
     /// let pool = threadteam::Pool::builder().threads(1).build()?;
-    /// assert!(!pool.pin_participants()); // off by default
+    /// assert!(pool.pin_participants()); // on by default
+    /// let pool = threadteam::Pool::builder().threads(1).pin_participants(false).build()?;
+    /// assert!(!pool.pin_participants());
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn pin_participants(&self) -> bool {
         self.awake.pin
+    }
+
+    /// Root team scopes of this pool that placed nobody because the calling
+    /// thread's CPU set had fewer CPUs than the team had participants.
+    ///
+    /// Such a scope runs with the scheduler's placement, as with
+    /// [`PoolBuilder::pin_participants`] off; members never wrap around the set
+    /// (participants stacked on one CPU measured slower than one thread). A
+    /// non-zero count means the caller asked for a wider team than its mask
+    /// allows, which is the case to fix on the caller's side (a wider
+    /// `taskset`, or a narrower team). Always zero for a pool with pinning off
+    /// and off Linux. Counts since the pool was built; a [`Team`](crate::Team)
+    /// reads it through [`Team::pool`](crate::Team::pool).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(1).build()?;
+    /// assert_eq!(pool.pin_skips(), 0);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn pin_skips(&self) -> u64 {
+        self.awake.pin_skips.load(Ordering::Relaxed)
     }
 
     /// The spin budget of this pool's team waits, in polls
@@ -226,6 +272,20 @@ impl Pool {
             barrier_sleeps: w.barrier_sleeps.load(Relaxed),
             member_parks: w.member_parks.load(Relaxed),
         }
+    }
+
+    /// Sections of placed root scopes before which the leader was off its home
+    /// CPU and was moved back (two `sched_setaffinity` calls each), and the
+    /// total time those moves took: a diagnostic for the placement cost. A
+    /// section whose leader was already home costs one `sched_getcpu` and is
+    /// not counted.
+    #[doc(hidden)]
+    pub fn leader_moves(&self) -> (u64, Duration) {
+        use core::sync::atomic::Ordering::Relaxed;
+        (
+            self.awake.leader_moves.load(Relaxed),
+            Duration::from_nanos(self.awake.leader_move_ns.load(Relaxed)),
+        )
     }
 
     /// Number of workers currently kept awake as team members, reserved or
@@ -603,20 +663,36 @@ impl PoolBuilder {
         self
     }
 
-    /// Pins the **members** of a root team scope onto the calling thread's CPU
-    /// set. Off by default; Linux only, where it does something.
+    /// Places the participants of a root team scope on the calling thread's CPU
+    /// set. **On by default** (see the reasons below); `false` turns it off for
+    /// this pool. Linux only, where it does something.
     ///
     /// With it on, the leader of a root team scope
     /// ([`Exec::team`](crate::Exec::team), or the root token of a
     /// [`Team`](crate::Team)) reads **its own** affinity mask `S` with
-    /// `sched_getaffinity`, and every member pins itself with
-    /// `sched_setaffinity` onto one CPU of `S`: member `k` (participant `k`,
-    /// counting the leader as 0) onto the `k`-th set CPU of `S`, wrapping modulo
-    /// `|S|` when the team is wider than the set. `S[0]` is thereby left to the
-    /// leader, without enforcing it.
+    /// `sched_getaffinity`, then:
     ///
-    /// **The leader is never pinned.** Its mask is never changed, not even for
-    /// the scope: it keeps all of `S` while the members work. A vendor library
+    /// * immediately before **every section** it dispatches in that scope, the
+    ///   leader moves itself onto `S[0]` and gives itself all of `S` back at
+    ///   once, skipped (one `sched_getcpu`) when it already runs there; so each
+    ///   section opens with the leader on the CPU no member takes, and between
+    ///   sections the leader is free on its whole mask;
+    /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`:
+    ///   member `k` (participant `k`, counting the leader as 0) onto the `k`-th
+    ///   set CPU of `S`. The members take `S` minus `S[0]`.
+    ///
+    /// **Nothing wraps.** When `S` has fewer CPUs than the team has
+    /// participants, nobody is placed: the scope runs with the scheduler's
+    /// placement, members that an earlier scope of a persistent team pinned
+    /// restore their own masks, and [`Pool::pin_skips`] counts the scope.
+    /// Participants stacked on one CPU measured slower than the scheduler's
+    /// placement and slower than one thread (evo2, LU f64 512 with 8
+    /// participants wrapped onto one CPU: 3.1 ms against 0.89 ms unpinned and
+    /// 1.7 ms on one thread), so a team that cannot be placed is not placed
+    /// badly.
+    ///
+    /// **The leader is never pinned.** Its mask is the same after each placement as
+    /// before it: it keeps all of `S` while the members work. A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
@@ -632,15 +708,20 @@ impl PoolBuilder {
     ///
     /// # What it is for
     ///
-    /// It keeps the members of a team apart. Measured on broccoli (16 threads on
+    /// It keeps the participants of a team apart. Measured on broccoli (16 threads on
     /// 16 allowed CPUs, 20 processes, tensor4all/faer#107): with the scheduler
     /// free to place the threads, 11 of 20 processes ran a `qr_factor` 512 at
     /// the one-thread time, with 92 % of the samples showing two runnable team
     /// threads on one CPU; with the participants pinned, 0 of 20 did, and no
     /// sample was stacked. Giving the team one spare CPU did not help (7 of 20
-    /// slow). That arm pinned every participant including the leader; this crate
-    /// leaves the leader on the caller's whole set, which is what the rule above
-    /// requires and only relaxes the placement of participant 0.
+    /// slow). On evo2 (two L3 domains, LU f64 at 11 and 14 threads) unpinned
+    /// teams stalled by 3 ms scheduler slices; pinning only the members and
+    /// leaving the leader wherever it was put the leader on a member's CPU in
+    /// 74-94 % of the samples at 8 threads. Placing the leader on `S[0]` only
+    /// when the scope opened was not enough: in a long scope with serial leader
+    /// work between sections (LU f64 4096) the leader drifted back onto a
+    /// member's CPU in 90 % of the samples and the call ran 38x slower. Placing
+    /// it before every section measured equal to pinning every participant.
     ///
     /// # Assumptions and limits
     ///
@@ -660,21 +741,33 @@ impl PoolBuilder {
     ///   the calling thread *directly inside a share* confines that library's
     ///   team to one CPU. Call it through
     ///   [`Exec::external`](crate::Exec::external), which restores the member's
-    ///   mask first, or keep this option off.
+    ///   mask first, or turn this option off.
     /// * Only the members of a team are placed. A token of a
     ///   [`Team`](crate::Team) that never opens a team scope
     ///   (`exec.for_ranges(...)` directly) is not re-pinned; its members keep
     ///   the placement of the last root scope (or of `Pool::into_team`).
     ///
-    /// Off by default, consistently with the rule above and with libgomp,
-    /// libomp, OpenBLAS and faer, which leave threads unpinned unless asked.
+    /// # Why it is on by default
+    ///
+    /// An unpinned team is the configuration that stalls, so a default of off
+    /// gave it to every caller who did not know about this switch. The reasons
+    /// it used to be off: it does not fight the caller's `taskset`, because it
+    /// never leaves the caller's own mask; it does not confine a vendor team,
+    /// because the leader keeps its whole mask and a member reaches vendor code
+    /// through [`Exec::external`](crate::Exec::external), which restores the
+    /// member's mask first; it does take CPUs of `S` from other users of the
+    /// process while a scope runs, bounded by `S` and by the no-wrap rule, so a
+    /// pool that shares its CPUs with other work on purpose passes `false`.
+    /// libgomp, libomp, OpenBLAS and faer leave threads unpinned unless asked;
+    /// this crate differs on purpose.
     ///
     /// # Examples
     ///
     /// ```
-    /// let pool = threadteam::Pool::builder().threads(2).pin_participants(true).build()?;
-    /// assert!(pool.pin_participants());
-    /// # let _ = pool;
+    /// let pool = threadteam::Pool::builder().threads(2).build()?;
+    /// assert!(pool.pin_participants()); // the default
+    /// let pool = threadteam::Pool::builder().threads(2).pin_participants(false).build()?;
+    /// assert!(!pool.pin_participants());
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     #[must_use]

@@ -820,8 +820,10 @@ impl<'p> Exec<'p> {
     /// This call opens a **root team scope**: it reads the calling thread's
     /// affinity mask, which decides two things. With
     /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants) on
-    /// it places every member on its own CPU of that mask for the scope (the
-    /// leader is never pinned).
+    /// (the default) it places every member on its own CPU of that mask for the
+    /// scope, after moving the leader onto the first CPU of the mask without
+    /// narrowing the leader's mask; a mask with fewer CPUs than participants
+    /// places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
     /// Whether or not pinning is on, it records whether the scope is
     /// *oversubscribed* (more participants than CPUs in the mask), which decides
     /// how the members park and how a joining leader waits. See the design
@@ -892,8 +894,9 @@ impl<'p> Exec<'p> {
                 if let Some(auth) = self.team.as_mut() {
                     auth.over = oversubscribed;
                 }
-                if team.size().get() > 1 {
-                    pin_scope(&mut team);
+                if team.size().get() > 1 && pin_scope(&mut team) {
+                    let _home = HomeGuard(team.awake);
+                    return Ok(f(team));
                 }
             }
             return Ok(f(team));
@@ -929,13 +932,15 @@ impl<'p> Exec<'p> {
             track: self.track.alias(),
             over: oversubscribed,
         };
-        // The pin section is also the acknowledgement; without pinning the
-        // participants acknowledge as before. The leader is never pinned, so
-        // there is nothing to restore when the scope ends or unwinds.
+        // The pin (or unpin) section is also the acknowledgement; without
+        // pinning the participants acknowledge as before. The leader is never
+        // pinned (each placement gives it its whole mask back at once),
+        // so there is nothing to restore when the scope ends or unwinds.
         let pinned = team.size().get() > 1 && pin_scope(&mut team);
         if !pinned {
             team.acknowledge();
         }
+        let _home = HomeGuard(pinned.then_some(&pool.awake));
         Ok(f(team))
     }
 
@@ -962,23 +967,65 @@ impl<'p> Exec<'p> {
     }
 }
 
-/// Runs the pin section of a root team scope: every member places itself on its
-/// own CPU of the calling thread's set. The leader is never pinned.
+/// Places a root team scope on the calling thread's CPU set `S`: the leader is
+/// homed on `S[0]` (placed there before every section, see
+/// `Awake::place_leader`) and keeps all of `S`, member `k` pins itself onto `S[k]`.
 ///
-/// `false` when member pinning is off for this pool, when the platform has no
-/// CPU set (off Linux), or when the calling thread's mask could not be read:
-/// then nothing ran and the caller acknowledges as usual.
+/// When `S` has fewer CPUs than the team has participants nothing is pinned:
+/// the skip is counted (`Pool::pin_skips`) and the members restore their own
+/// masks, in case an earlier scope of a persistent team pinned them. Wrapping
+/// members around `S` puts two of them on one CPU, which measured worse than
+/// the scheduler's placement and worse than one thread (evo2, LU f64 512 with
+/// 8 participants wrapped onto one CPU: 3.1 ms against 0.89 ms unpinned and
+/// 1.7 ms on one thread), so a team that cannot be placed is not placed.
+///
+/// `false` when participant pinning is off for this pool, when the platform has
+/// no CPU set (off Linux), or when the calling thread's mask could not be read:
+/// then nothing ran and the caller acknowledges as usual. `true` when a section
+/// ran (pin or unpin), which also served as the acknowledgement.
 fn pin_scope(team: &mut TeamExec<'_>) -> bool {
-    if !team.awake.is_some_and(|awake| awake.pin) {
+    let Some(awake) = team.awake.filter(|awake| awake.pin) else {
         return false;
-    }
-    // The leader reads its own mask, and never changes it: that set is where
-    // the members are placed.
+    };
+    // The leader reads its own mask: that set is where the team is placed, and
+    // the leader's mask is that set again once the scope has opened.
     let Some(set) = crate::pin::read_here() else {
         return false;
     };
+    if crate::pin::count(&set) < team.size().get() {
+        awake
+            .pin_skips
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        awake
+            .leader_home
+            .store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+        team.unpin_section();
+        return true;
+    }
+    // The leader's home is `S[0]`, the CPU no member takes. Every section of
+    // the scope places the leader there first (`Awake::place_leader`), the pin
+    // section included, so the scope opens with the leader home too.
+    if let Some(home) = crate::pin::nth(&set, 0) {
+        awake
+            .leader_home
+            .store(home, core::sync::atomic::Ordering::Relaxed);
+    }
     team.pin_section(&set);
     true
+}
+
+/// Clears the leader's home CPU when a placed root scope ends (or unwinds), so
+/// no section outside the scope moves its caller.
+struct HomeGuard<'a>(Option<&'a Awake>);
+
+impl Drop for HomeGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(awake) = self.0 {
+            awake
+                .leader_home
+                .store(usize::MAX, core::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 impl fmt::Debug for Exec<'_> {

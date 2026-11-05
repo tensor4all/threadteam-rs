@@ -1,16 +1,26 @@
-//! Opt-in participant placement on the calling thread's CPU set.
+//! Participant placement on the calling thread's CPU set (on by default).
 //!
 //! With [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)
-//! on, the leader of a root team scope reads its own affinity mask `S` and every
-//! **member** pins itself onto one CPU of `S`: participant `k >= 1` onto the
-//! `k`-th set CPU of `S`, wrapping modulo `|S|` when `k >= |S|`. The leader
-//! (participant 0, the calling thread) is **never pinned**: its mask is never
-//! changed, not even for the scope, and `S[0]` is left to it without enforcing
-//! it. A vendor library creates its thread team from the thread that calls it,
-//! and a team created from a one-CPU thread silently confines the whole library
-//! team to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread
-//! keeps its CPU set. A member saves its previous mask in its own slot and
-//! restores it itself before it stops being reserved.
+//! on (the default), the leader of a root team scope reads its own affinity mask
+//! `S` and places the team inside it, never outside it:
+//!
+//! * **The leader is placed, not pinned.** Immediately before every section it
+//!   dispatches, a leader that is not on `S[0]` moves itself there and gives
+//!   itself the whole of `S` back at once ([`nudge_to`], called by
+//!   `Awake::place_leader`), so each section opens with the leader on the one
+//!   CPU no member takes, while its mask stays `S`. A
+//!   vendor library creates its thread team from the thread that calls it, and a
+//!   team created from a one-CPU thread silently confines the whole library team
+//!   to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread keeps
+//!   its CPU set.
+//! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
+//!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
+//!   restores it itself before it stops being reserved.
+//! * **No wrapping.** When `S` has fewer CPUs than the team has participants
+//!   nothing is pinned (today's unpinned placement), the members of a persistent
+//!   team that an earlier scope pinned restore their own masks, and the skip is
+//!   counted ([`Pool::pin_skips`](crate::Pool::pin_skips)). Wrapping would stack
+//!   two members on one CPU, which is worse than leaving them to the scheduler.
 //!
 //! Every affinity change is made by the thread that is being moved, with
 //! `sched_setaffinity(0, ...)`, so no thread ever changes another thread's
@@ -22,7 +32,8 @@
 //! The same CPU set decides whether a root scope is *oversubscribed* (see
 //! [`available`]): a team of more participants than the caller's mask has CPUs
 //! parks its members early instead of spinning (see `awake.rs`), and
-//! [`oversubscribed`] is what the root-scope entries use.
+//! [`oversubscribed`] is what the root-scope entries use. An oversubscribed root
+//! scope is exactly one whose pin is skipped.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,7 +42,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{current_cpu, nth, read_here, set_here, set_here_to, CpuMask};
 
 /// Number of CPUs a root team scope may spread its participants over.
 ///
@@ -61,16 +72,45 @@ pub(crate) fn oversubscribed(participants: usize) -> bool {
     participants > available()
 }
 
-/// Pins the calling thread onto the `k`-th CPU of `set` (wrapping).
+/// Pins the calling thread onto the `k`-th CPU of `set`.
 ///
-/// Called by a member for itself (`k >= 1`); the leader never calls it. Best
-/// effort: an empty set (never produced by [`available`]), a refused syscall, or
-/// the calling thread already being outside `set` leaves the thread where it
-/// was.
+/// Called by a member for itself (`k >= 1`); the leader never calls it. Never
+/// wraps: `k >= |set|` leaves the thread where it was (the root scope does not
+/// pin at all in that case, see `exec::pin_scope`, so this is only a second
+/// line of defence). Best effort: an empty set, a refused syscall, or the
+/// calling thread already being outside `set` leaves the thread where it was.
 pub(crate) fn pin_to(set: &CpuMask, k: usize) {
     if let Some(cpu) = nth(set, k) {
         set_here_to(cpu);
     }
+}
+
+/// Moves the calling thread onto `home` and gives it back the mask it had, so
+/// it runs on `home` without being confined to it. `true` when it moved.
+///
+/// Used by [`crate::awake::Awake::place_leader`] before every section of a
+/// placed root scope. A thread whose mask is a single CPU (a pinned member
+/// leading a child section) is left alone: `false`. Best effort: a refused move
+/// leaves the thread where it was, and a refused restore of the mask (only
+/// possible when the cpuset shrank between the two calls) falls back to
+/// whatever mask the kernel then reports, so the thread is never left on one
+/// CPU because of this.
+pub(crate) fn nudge_to(home: usize) -> bool {
+    let Some(mask) = read_here() else {
+        return false;
+    };
+    if count(&mask) < 2 {
+        return false;
+    }
+    if !set_here_to(home) {
+        return false;
+    }
+    if !set_here(&mask) {
+        if let Some(now) = read_here() {
+            let _ = set_here(&now);
+        }
+    }
+    true
 }
 
 /// The mask a member saved before it pinned itself, and whether it is pinned.
@@ -191,6 +231,14 @@ mod sys {
         }
     }
 
+    /// The CPU the calling thread runs on right now, or `None` when the kernel
+    /// does not say. Only a hint: the thread may move right after.
+    pub(crate) fn current_cpu() -> Option<usize> {
+        // SAFETY: no arguments; returns -1 on failure.
+        let cpu = unsafe { libc::sched_getcpu() };
+        usize::try_from(cpu).ok()
+    }
+
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -198,14 +246,14 @@ mod sys {
         n.max(0) as usize
     }
 
-    /// Index of the `k`-th set CPU, wrapping modulo the set size; `None` for an
-    /// empty set (never pin to an empty mask).
+    /// Index of the `k`-th set CPU; `None` when the set has `k` or fewer CPUs
+    /// (never wrap: two participants on one CPU is the failure the placement
+    /// exists to prevent).
     pub(crate) fn nth(mask: &CpuMask, k: usize) -> Option<usize> {
-        let n = count(mask);
-        if n == 0 {
+        if k >= count(mask) {
             return None;
         }
-        let mut want = k % n;
+        let mut want = k;
         for cpu in 0..SETSIZE {
             // SAFETY: reads one bit of a valid set.
             if unsafe { libc::CPU_ISSET(cpu, &mask.set) } {
@@ -236,6 +284,10 @@ mod sys {
 
     pub(crate) fn set_here_to(_cpu: usize) -> bool {
         false
+    }
+
+    pub(crate) fn current_cpu() -> Option<usize> {
+        None
     }
 
     pub(crate) fn count(_mask: &CpuMask) -> usize {

@@ -422,11 +422,12 @@ impl<'team> TeamExec<'team> {
     }
 
     /// Places every member on its own CPU of `set`: member `k` (participant
-    /// `k >= 1`) pins itself onto the `k`-th set CPU, wrapping modulo `|set|`.
-    /// The leader, participant 0, is **never pinned**: it keeps its own mask,
-    /// `set`, so a vendor team it creates inherits the caller's CPU set instead
-    /// of one CPU (see [`PoolBuilder::pin_participants`]). `set[0]` is therefore
-    /// left to the leader, without enforcing it.
+    /// `k >= 1`) pins itself onto the `k`-th set CPU. The caller has checked
+    /// that `set` has a CPU for every participant; nothing wraps. The leader,
+    /// participant 0, is **never pinned**: it keeps its own mask, `set`, so a
+    /// vendor team it creates inherits the caller's CPU set instead of one CPU
+    /// (see [`PoolBuilder::pin_participants`]); `section` has placed it
+    /// onto `set[0]`, the CPU no member takes, just before.
     ///
     /// One section of the existing machinery, so all participants are on their
     /// own threads; it also serves as the rendezvous that precedes any user
@@ -443,6 +444,26 @@ impl<'team> TeamExec<'team> {
             },
             true,
         );
+    }
+
+    /// The section a root scope runs instead of the pin section when the caller's
+    /// set is too small to give every participant its own CPU: every member
+    /// restores the mask it saved before an earlier pin section of this
+    /// reservation (a no-op for a member that is not pinned), so a persistent
+    /// team does not keep a placement from a wider set. It also serves as the
+    /// rendezvous that precedes any user section, like the pin section.
+    pub(crate) fn unpin_section(&mut self) {
+        let awake = self.awake;
+        let ids = self.ids;
+        self.reborrow().run_with(|p| {
+            let _ = p.barrier();
+            // Participant `k >= 1` runs on the worker of slot `ids[k - 1]`
+            // (`Awake::publish`), which is the only thread allowed to restore
+            // that slot's saved mask.
+            if let (Some(awake), Some(k)) = (awake, p.index().checked_sub(1)) {
+                awake.unpin_member(ids[k]);
+            }
+        });
     }
 
     /// Divides the team into child reservations of the given sizes.
@@ -589,6 +610,11 @@ where
         awake.map(|a| &a.waits),
     );
     let dispatched = geometry.dispatched;
+    if dispatched > 0 {
+        if let Some(awake) = awake {
+            awake.place_leader();
+        }
+    }
     let guard = JoinGuard(&sec);
     if dispatched > 0 {
         if let Some(awake) = awake {

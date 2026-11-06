@@ -369,7 +369,7 @@ fn team_external_widens_the_leader_for_the_call_and_restores_the_pin() {
     .expect("a team token opens its scope");
     drop(exec);
     assert_eq!(own_cpus(), home, "the team still pins its leader");
-    let pool = team.into_pool();
+    drop(team);
     assert_eq!(own_cpus(), before, "the leader's mask after the team");
 }
 
@@ -448,7 +448,7 @@ fn a_team_pins_its_creating_thread_until_it_drops() {
         assert_eq!(own_cpus(), home, "round {round}: between tokens");
     }
     assert_eq!(team.pool().pin_skips(), 0);
-    let pool = team.into_pool();
+    drop(team);
     assert_eq!(own_cpus(), before, "the caller after the team");
 }
 

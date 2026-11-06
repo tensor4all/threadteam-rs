@@ -1,0 +1,71 @@
+# Changelog
+
+All notable changes to `threadteam` are recorded here. The format follows
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the crate follows
+[Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at
+0.5.0; earlier releases are not recorded here.
+
+## [0.5.0] - 2026-11-06
+
+The leader of a team is pinned, where 0.4.0 only moved it. Inside a placed team
+scope the leader's affinity mask is `{S[0]}`, the one CPU no member takes, for
+as long as the scope or the `Team` lives; it no longer keeps all of `S`.
+
+### Breaking
+
+The minor bump is for the surface below.
+
+- **`Pool::leader_moves()` is removed** (#45). It returned the count and total
+  time of the per-section leader moves, and the moves it counted are gone. It
+  was `#[doc(hidden)]`, so it never appeared in rustdoc or in
+  `cargo public-api`; a caller who used it can grep for `leader_moves`.
+- **The per-section leader nudge is removed** (#45). Internally this is
+  `Awake::place_leader`, `pin::nudge_to`, and the `leader_home`,
+  `leader_moves` and `leader_move_ns` counters of `Awake`. All of them were
+  `pub(crate)`; the only public trace was `Pool::leader_moves()`.
+- **The `Team`-lived leader home is removed** (#45): the `home` field of `Team`
+  and of `TeamAuth`, and the `home` argument of the internal `split_raw` and
+  `spread_raw`. There has never been a public `Team::home`, so consumer code
+  has nothing to fix; grep `home` only if you mirror this crate's internals.
+- **The leader's mask is one CPU while a team lives.** A vendor library called
+  by the leader directly now sees `{S[0]}` and builds a one-thread team.
+  `TeamExec::external` is the only call that widens it: the mask becomes `S`
+  for the call and `{S[0]}` again after it, two `sched_setaffinity` calls
+  (about 2.3 µs on broccoli) per call. `Exec::external` is unchanged.
+- **`Pool::into_team` pins the calling thread** (#46). The thread that calls it
+  stays on `{S[0]}` until the `Team` is dropped or turned into its pool with
+  `Team::into_pool`, also between tokens and on unwind: `pin::TeamPin`, a field
+  of the `Team`, holds the pin and gives `S` back. A `Team` driven by
+  `fork_sized`, `for_ranges` or `broadcast` without a team scope is therefore
+  placed for its whole life; in 0.4.0 the leader got `S` back at the end of the
+  acknowledgement scope and the team ran in the #33 slow mode. A token minted
+  on another thread has an unplaced leader, and a `Team` dropped on another
+  thread restores nothing there.
+
+### Added
+
+- `Exec::fork_sized_slots(&shares, &mut slots, f)` (#37): `fork_sized` where
+  child `i` also gets an exclusive `&mut slots[i]`, without a lock, allocating
+  nothing when warm. A slot count that differs from the share count is the new
+  `Error::SlotsMismatch`.
+- `TeamExec::external(f)` (#45): the widening call above.
+
+### Unchanged
+
+- A team of one (a serial token, budget one) still runs inline and touches no
+  pool.
+- A mask with fewer CPUs than participants still pins nobody, and
+  `Pool::pin_skips()` counts the scope; nothing wraps.
+- `PoolBuilder::pin_participants(false)` still pins nothing.
+
+### Notes
+
+- #43 (a leader home kept on the `Team` and a nudge onto it before every
+  section) **landed but was never measured**: the reporter's re-run is on the
+  commit before it, and the first nodes of the same model did not reproduce #33
+  on 0.4.0 either, so no run has measured #43 either way. #45 removed it in
+  favour of the scope- and team-held pin.
+- The runs, medians and probed fields for the scope- and team-held pin are in
+  [`docs/design/placement.md`](docs/design/placement.md).
+- Documentation only: #40 and #41 state what the placement and waiting code
+  does.

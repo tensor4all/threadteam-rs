@@ -125,6 +125,22 @@ Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
 a test binary that runs serial and pooled work and then checks that
 `rayon::ThreadPoolBuilder::new().build_global()` still succeeds.
 
+## Upgrading from 0.4
+
+0.5.0 pins the leader of a team onto `S[0]` for the life of the scope, and for a
+`Team` for the life of the team, where 0.4.0 left its mask whole. Three things
+to change:
+
+* a vendor call made by the leader goes through `TeamExec::external`, which
+  widens the mask to `S` for that call; a direct call now runs on one CPU;
+* `Pool::leader_moves()` is gone;
+* the thread that calls `Pool::into_team` stays on `{S[0]}` until the `Team`
+  drops or is turned into its pool, and a token minted on another thread has an
+  unplaced leader.
+
+[`CHANGELOG.md`](CHANGELOG.md) names every removed item, including the internal
+ones, and lists the behaviour that did not change.
+
 ## Upgrading from 0.1
 
 0.2 still runs entries on a private Rayon pool. The signatures are those of

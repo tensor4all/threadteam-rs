@@ -7,7 +7,6 @@ use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
 use core::fmt;
 use core::num::NonZeroUsize;
-use core::sync::atomic::AtomicUsize;
 use core::time::Duration;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::ThreadId;
@@ -98,10 +97,6 @@ impl Drop for LeaderGuard<'_> {
 pub struct Team {
     // Field order matters: the members are released before the pool is dropped.
     reservation: Reservation,
-    /// The leader's home CPU while the members are placed, `usize::MAX`
-    /// otherwise (see `TeamAuth::home`). Written only by the root scope of the
-    /// one token that leads, so the gate orders every write and read.
-    home: AtomicUsize,
     policy: WaitPolicy,
     gate: Gate,
     pool: Pool,
@@ -209,7 +204,6 @@ impl Pool {
             };
         let team = Team {
             reservation,
-            home: AtomicUsize::new(usize::MAX),
             policy,
             gate: Gate {
                 owner: Mutex::new(None),
@@ -335,7 +329,6 @@ impl Team {
             ids,
             policy: self.policy,
             over: oversubscribed,
-            home: &self.home,
             reserved: self.reservation.ids.len(),
         };
         Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))

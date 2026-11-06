@@ -94,7 +94,8 @@ impl Participant<'_> {
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
 ///   the calling thread's set, and restores its own mask afterwards. The leader
-///   is never pinned.
+///   is pinned to the first CPU of that set for the scope, and widened to the
+///   whole set for a vendor call by [`external`](Self::external).
 /// * A panic in any participant propagates to the leader after every
 ///   dispatched share has finished; the reservation is released.
 ///
@@ -198,11 +199,6 @@ pub struct TeamExec<'team> {
     /// every [`Section`] so that nested sections of an oversubscribed root
     /// know it too.
     pub(crate) over: bool,
-    /// The CPU the leader is placed on before each section (`S[0]` of the
-    /// placement the members are under), or `usize::MAX` when they are not
-    /// placed. Set by the pin (or unpin) section of a root scope and inherited
-    /// like `over`.
-    pub(crate) home: usize,
 }
 
 /// How the members of a split are divided.
@@ -352,8 +348,68 @@ impl<'team> TeamExec<'team> {
             policy: self.policy,
             track: self.track.alias(),
             over: self.over,
-            home: self.home,
         }
+    }
+
+    /// Runs `f` on the calling thread with its CPU mask widened to the whole
+    /// set `S` the root scope was placed on, for a vendor call that creates its
+    /// own thread team.
+    ///
+    /// This is the leader's half of the rule whose member half is
+    /// [`Exec::external`](crate::Exec::external). A placed root scope pins the
+    /// leader to `S[0]` for its whole life (see
+    /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
+    /// and a vendor library (OpenMP, OpenBLAS, a LAPACK provider) creates its
+    /// team from the calling thread, so a one-CPU caller would confine the whole
+    /// library team to that CPU. Here the leader's mask is set to `S` before
+    /// `f` and to `{S[0]}` after it, on return and on unwind.
+    ///
+    /// # Cost
+    ///
+    /// **Two `sched_setaffinity` calls per call, paid every time**, inside
+    /// whatever the caller is timing: a call does not remember that an earlier
+    /// one already widened, and the restore is never skipped. The default path,
+    /// a scope that makes no vendor call, pays nothing. Measured microseconds
+    /// are in `docs/design/placement.md`. Make one call around the whole vendor
+    /// region rather than one per vendor call.
+    ///
+    /// # Contract
+    ///
+    /// * The calling thread is the only one whose mask changes.
+    /// * A refused widening leaves the thread as it was, on `{S[0]}`; `f` still
+    ///   runs, and nothing is restored because nothing changed. A refused
+    ///   restore leaves the thread wide until the scope ends, when its mask is
+    ///   set back to `S` anyway.
+    /// * Takes `&mut self`, so `f` cannot reach this team: no section is
+    ///   dispatched while the leader is wide, and the leader needs no placement
+    ///   check before a section. That is how the rule is kept at no cost.
+    /// * The members stay reserved (spinning or parked per the team's
+    ///   [`WaitPolicy`]); they are **not** lent. Their CPUs are `S[1..]`, which
+    ///   the vendor team may also use: to give them to Rayon, use
+    ///   [`Exec::external`](crate::Exec::external) instead.
+    /// * Where nothing was placed (pinning off, a mask smaller than the team,
+    ///   a team of one, a thread that is not the leader of a root scope, a
+    ///   non-Linux target) this is a plain call to `f`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::Exec;
+    /// let got = Exec::serial().team(|mut team| team.external(|| 7)).unwrap();
+    /// assert_eq!(got, 7);
+    /// ```
+    ///
+    /// The closure cannot reach the team, so no section runs while the leader
+    /// is wide:
+    ///
+    /// ```compile_fail
+    /// use threadteam::Exec;
+    /// Exec::serial().team(|mut team| {
+    ///     team.external(|| team.reborrow().run(|_, _| {}));
+    /// }).unwrap();
+    /// ```
+    pub fn external<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        crate::pin::widened(f)
     }
 
     /// Runs `f(index, size)` on every participant at once and returns when
@@ -422,7 +478,6 @@ impl<'team> TeamExec<'team> {
             size: ids.len() + 1,
             over: self.over,
             pin,
-            home: self.home,
         };
         section(self.awake, &|pos| ids[pos], &body, geometry);
     }
@@ -430,10 +485,9 @@ impl<'team> TeamExec<'team> {
     /// Places every member on its own CPU of `set`: member `k` (participant
     /// `k >= 1`) pins itself onto the `k`-th set CPU. The caller has checked
     /// that `set` has a CPU for every participant; nothing wraps. The leader,
-    /// participant 0, is **never pinned**: it keeps its own mask, `set`, so a
-    /// vendor team it creates inherits the caller's CPU set instead of one CPU
-    /// (see [`PoolBuilder::pin_participants`]); `section` has placed it
-    /// onto `set[0]`, the CPU no member takes, just before.
+    /// participant 0, is not pinned here: `pin_scope` has already pinned it to
+    /// `set[0]`, the CPU no member takes, for the life of the scope (see
+    /// [`PoolBuilder::pin_participants`]).
     ///
     /// One section of the existing machinery, so all participants are on their
     /// own threads; it also serves as the rendezvous that precedes any user
@@ -559,9 +613,8 @@ impl<'team> TeamExec<'team> {
     {
         let track = &self.track;
         let _released = track.release();
-        let (awake, ids, policy, over, home) =
-            (self.awake, self.ids, self.policy, self.over, self.home);
-        split_raw(awake, ids, plan, over, home, |c, child_ids| {
+        let (awake, ids, policy, over) = (self.awake, self.ids, self.policy, self.over);
+        split_raw(awake, ids, plan, over, |c, child_ids| {
             let _live = track.task();
             let child = TeamExec {
                 awake,
@@ -569,7 +622,6 @@ impl<'team> TeamExec<'team> {
                 policy,
                 track: track.child(),
                 over,
-                home,
             };
             f(c, child);
         });
@@ -618,11 +670,6 @@ where
         awake.map(|a| &a.waits),
     );
     let dispatched = geometry.dispatched;
-    if dispatched > 0 {
-        if let Some(awake) = awake {
-            awake.place_leader(geometry.home);
-        }
-    }
     let guard = JoinGuard(&sec);
     if dispatched > 0 {
         if let Some(awake) = awake {
@@ -642,14 +689,8 @@ where
 
 /// Runs `f(c, child_ids)` for every child of `plan` at once: child 0 on the
 /// calling thread, child `c` on the first member of its index range.
-pub(crate) fn split_raw<F>(
-    awake: Option<&Awake>,
-    ids: &[usize],
-    plan: &Plan<'_>,
-    over: bool,
-    home: usize,
-    f: F,
-) where
+pub(crate) fn split_raw<F>(awake: Option<&Awake>, ids: &[usize], plan: &Plan<'_>, over: bool, f: F)
+where
     F: Fn(usize, &[usize]) + Sync,
 {
     let body = |p: &Participant<'_>| {
@@ -663,7 +704,6 @@ pub(crate) fn split_raw<F>(
         size: ids.len() + 1,
         over,
         pin: false,
-        home,
     };
     section(
         awake,
@@ -679,7 +719,6 @@ pub(crate) fn spread_raw<F>(
     ids: &[usize],
     participants: usize,
     over: bool,
-    home: usize,
     f: F,
 ) where
     F: Fn(usize) + Sync,
@@ -690,7 +729,6 @@ pub(crate) fn spread_raw<F>(
         size: participants,
         over,
         pin: false,
-        home,
     };
     section(awake, &|pos| ids[pos], &body, geometry);
 }

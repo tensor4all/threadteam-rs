@@ -36,11 +36,12 @@ const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_millis(2);
 ///
 /// * *It fights the caller's `taskset`.* It does not: the team is placed inside
 ///   the calling thread's own mask `S` and never outside it, and the leader's
-///   mask is `S` again as soon as the scope has opened.
+///   mask is `S` again when the scope has closed (it is `{S[0]}` while it is open).
 /// * *It confines a vendor thread team a member creates.* That is the
 ///   [`Exec::external`](crate::Exec::external) path, which restores the
 ///   member's own mask before the vendor call, and the leader (the thread
-///   engines call vendor libraries from) is never narrowed.
+///   engines call vendor libraries from) widens itself to `S` for the call with
+///   [`TeamExec::external`](crate::TeamExec::external).
 /// * *It takes CPUs away from other users of the process.* It still can: a
 ///   placed member owns its CPU of `S` while the scope runs. That is bounded by
 ///   `S` (nothing outside the caller's mask is ever used) and by the rule that a
@@ -217,7 +218,7 @@ impl Pool {
     }
 
     /// Whether the pool places the participants of a root team scope (see
-    /// [`PoolBuilder::pin_participants`]); the leader is never narrowed.
+    /// [`PoolBuilder::pin_participants`]); the leader is pinned to `S[0]` for the scope.
     ///
     /// # Examples
     ///
@@ -272,21 +273,6 @@ impl Pool {
             barrier_sleeps: w.barrier_sleeps.load(Relaxed),
             member_parks: w.member_parks.load(Relaxed),
         }
-    }
-
-    /// Sections dispatched under a placement (a placed root scope, or any
-    /// token of a placed [`Team`](crate::Team), inside a root scope or not)
-    /// before which the leader was off its home CPU and was moved back (two
-    /// `sched_setaffinity` calls each), and the total time those moves took: a
-    /// diagnostic for the placement cost. A section whose leader was already
-    /// home costs one `sched_getcpu` and is not counted.
-    #[doc(hidden)]
-    pub fn leader_moves(&self) -> (u64, Duration) {
-        use core::sync::atomic::Ordering::Relaxed;
-        (
-            self.awake.leader_moves.load(Relaxed),
-            Duration::from_nanos(self.awake.leader_move_ns.load(Relaxed)),
-        )
     }
 
     /// Number of workers currently kept awake as team members, reserved or
@@ -673,11 +659,10 @@ impl PoolBuilder {
     /// [`Team`](crate::Team)) reads **its own** affinity mask `S` with
     /// `sched_getaffinity`, then:
     ///
-    /// * immediately before **every section** it dispatches in that scope, the
-    ///   leader moves itself onto `S[0]` and gives itself all of `S` back at
-    ///   once, skipped (one `sched_getcpu`) when it already runs there; so each
-    ///   section opens with the leader on the CPU no member takes, and between
-    ///   sections the leader is free on its whole mask;
+    /// * the leader pins itself onto `S[0]` for the life of the scope: one
+    ///   `sched_setaffinity` at scope entry and one at scope exit (which also
+    ///   runs on unwind) giving it `S` back, and nothing in between: no check
+    ///   and no move before a section;
     /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`:
     ///   member `k` (participant `k`, counting the leader as 0) onto the `k`-th
     ///   set CPU of `S`. The members take `S` minus `S[0]`.
@@ -692,16 +677,17 @@ impl PoolBuilder {
     /// 1.7 ms on one thread), so a team that cannot be placed is not placed
     /// badly.
     ///
-    /// **The leader is never pinned.** Its mask is the same after each placement as
-    /// before it: it keeps all of `S` while the members work, so between
-    /// sections it may run anywhere in `S`. Only its *position* is set: it is
-    /// moved onto `S[0]` immediately before each section it dispatches, and is
-    /// not held there for the life of the scope. A vendor library
+    /// **The leader is pinned, and widened for vendor calls.** A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
-    /// dgemm and LU at 4 threads. Engines call such libraries from the
-    /// coordinating thread, so that thread must keep its CPU set.
+    /// dgemm and LU at 4 threads. So a leader that calls such a library does it
+    /// through [`TeamExec::external`](crate::TeamExec::external), which sets its
+    /// mask to `S` for that call and back to `{S[0]}` when it returns (two
+    /// `sched_setaffinity` calls per call, paid every time, inside the timed
+    /// region; a refused syscall leaves the thread as it was). A member that
+    /// makes such a call uses [`Exec::external`](crate::Exec::external), which
+    /// restores the member's own mask. A scope with no vendor call pays nothing.
     ///
     /// A member saves its previous mask in its own slot and restores it
     /// *itself* before it stops being reserved: before it returns to Rayon, and
@@ -722,10 +708,12 @@ impl PoolBuilder {
     /// teams stalled by 3 ms scheduler slices; pinning only the members and
     /// leaving the leader wherever it was put the leader on a member's CPU in
     /// 74-94 % of the samples at 8 threads. Placing the leader on `S[0]` only
-    /// when the scope opened was not enough: in a long scope with serial leader
-    /// work between sections (LU f64 4096) the leader drifted back onto a
-    /// member's CPU in 90 % of the samples and the call ran 38x slower. Placing
-    /// it before every section measured equal to pinning every participant.
+    /// when the scope opened, and leaving its mask whole, was not enough: in a
+    /// long scope with serial leader work between sections (LU f64 4096) the
+    /// leader drifted back onto a member's CPU in 90 % of the samples and the
+    /// call ran 38x slower. Pinning it to `S[0]` for the scope is the same as
+    /// pinning every participant, which measured equal to placing it before
+    /// every section; the simpler rule was chosen.
     ///
     /// # Assumptions and limits
     ///
@@ -746,23 +734,20 @@ impl PoolBuilder {
     ///   team to one CPU. Call it through
     ///   [`Exec::external`](crate::Exec::external), which restores the member's
     ///   mask first, or turn this option off.
-    /// * Only the members of a team are pinned. A token of a
-    ///   [`Team`](crate::Team) that never opens a team scope
-    ///   (`exec.for_ranges(...)` directly) is not re-pinned; its members keep
-    ///   the placement of the last root scope (or of `Pool::into_team`), and
-    ///   its leader is moved onto that placement's `S[0]` before each section
-    ///   as inside the scope. The leader's home belongs to the `Team` and is
-    ///   changed only by a root scope of a token with the whole team's budget:
-    ///   it lasts until such a scope re-places the members, or cannot place
-    ///   them and unpins them, or the `Team` ends. A root scope of a narrower
-    ///   token runs under the team's current placement and home and changes
-    ///   neither. One exception: members lent by
+    /// * The members' placement is the team's and outlives a scope; the
+    ///   leader's pin is the scope's. A token of a [`Team`](crate::Team) that
+    ///   never opens a team scope (`exec.for_ranges(...)` directly) is not
+    ///   re-pinned: its members keep the placement of the last whole-team root
+    ///   scope (or of `Pool::into_team`), and **its leader is not placed at
+    ///   all**, so between and during such sections it may run on a member's
+    ///   CPU. Open a team scope to get the leader on `S[0]`. The placement
+    ///   is changed only by a root scope of a token with the whole team's
+    ///   budget: it lasts until such a scope re-places the members, or cannot
+    ///   place them and unpins them, or the `Team` ends. A root scope of a
+    ///   narrower token runs under the team's current placement, changes
+    ///   nothing and pins no leader. One exception: members lent by
     ///   [`Exec::external`](crate::Exec::external) restore their own masks and
-    ///   are not re-pinned until the next whole-team root scope, while the home
-    ///   is kept, so in between the leader is still placed on `S[0]` but an
-    ///   unpinned member may run there too. A token that is not part of a
-    ///   placed team (a plain token of the same pool) never moves its caller
-    ///   outside its own team scope.
+    ///   are not re-pinned until the next whole-team root scope.
     ///
     /// # Why it is on by default
     ///
@@ -770,7 +755,9 @@ impl PoolBuilder {
     /// gave it to every caller who did not know about this switch. The reasons
     /// it used to be off: it does not fight the caller's `taskset`, because it
     /// never leaves the caller's own mask; it does not confine a vendor team,
-    /// because the leader keeps its whole mask and a member reaches vendor code
+    /// because the leader widens itself with
+    /// [`TeamExec::external`](crate::TeamExec::external) and a member reaches
+    /// vendor code
     /// through [`Exec::external`](crate::Exec::external), which restores the
     /// member's mask first; it does take CPUs of `S` from other users of the
     /// process while a scope runs, bounded by `S` and by the no-wrap rule, so a

@@ -369,7 +369,7 @@ fn team_external_widens_the_leader_for_the_call_and_restores_the_pin() {
     .expect("a team token opens its scope");
     drop(exec);
     assert_eq!(own_cpus(), home, "the team still pins its leader");
-    drop(team);
+    let pool = team.into_pool();
     assert_eq!(own_cpus(), before, "the leader's mask after the team");
 }
 
@@ -448,7 +448,7 @@ fn a_team_pins_its_creating_thread_until_it_drops() {
         assert_eq!(own_cpus(), home, "round {round}: between tokens");
     }
     assert_eq!(team.pool().pin_skips(), 0);
-    drop(team);
+    let pool = team.into_pool();
     assert_eq!(own_cpus(), before, "the caller after the team");
 }
 
@@ -1050,6 +1050,78 @@ fn a_panic_in_a_share_leaves_the_callers_affinity_alone() {
                 own_cpus(),
                 origin.of(worker),
                 "worker {worker} after the team"
+            );
+        })
+        .expect("a root token from a plain thread");
+}
+
+#[test]
+fn a_team_as_wide_as_the_mask_gives_every_participant_its_own_cpu() {
+    let _w = watchdog();
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: the process has fewer than 4 allowed CPUs");
+        return;
+    }
+    // The regression this covers (#33): a team whose width is the whole mask
+    // must still leave the leader a CPU no member takes. Member `k` takes
+    // `S[k]`, so width == count(S) leaves `S[0]` for the leader by construction;
+    // anything that wraps a member onto `S[0]` puts a spinning member under the
+    // leader's serial work, which one reporter measures as a whole timeslice per
+    // section on a 96-CPU host.
+    let width = all.len().min(8);
+    let set = all[..width].to_vec();
+    let Some(_restrict) = Restrict::to(&set) else {
+        eprintln!("skipped: the restriction was refused");
+        return;
+    };
+    let (pool, origin) = origin_pool(width, true);
+    let seen = Seen::default();
+    let team = pool.into_team(width).expect("an idle pool");
+    assert_eq!(team.size().get(), width, "a team as wide as the mask");
+    assert_eq!(
+        own_cpus(),
+        vec![set[0]],
+        "the creating thread leads the team pinned onto S[0]"
+    );
+    {
+        let mut exec = team.exec(width);
+        let seen = &seen;
+        exec.team(|mut t| t.reborrow().run_with(|p| seen.record(p.index())))
+            .expect("a team token opens a root scope");
+    }
+    let masks = seen.take();
+    assert_eq!(masks.len(), width, "every participant ran a share");
+    assert_eq!(
+        masks[0].1,
+        vec![set[0]],
+        "the leader's mask in its share: {:?}",
+        masks[0].1
+    );
+    for (index, mask) in &masks[1..] {
+        assert_eq!(
+            mask,
+            &vec![set[*index]],
+            "participant {index} of {width} on the caller's set {set:?}"
+        );
+    }
+    let distinct: std::collections::HashSet<_> = masks.iter().map(|(_, m)| m[0]).collect();
+    assert_eq!(
+        distinct.len(),
+        width,
+        "no two participants share a CPU: {masks:?}"
+    );
+    let pool = team.into_pool();
+    assert_eq!(own_cpus(), set, "the leader has S back when the team ends");
+    // And the members are back on the masks they started with.
+    pool.release_idle();
+    Exec::new(&pool, width)
+        .unwrap()
+        .broadcast(|worker| {
+            assert_eq!(
+                own_cpus(),
+                origin.of(worker),
+                "worker {worker} kept a pinned mask after the team"
             );
         })
         .expect("a root token from a plain thread");

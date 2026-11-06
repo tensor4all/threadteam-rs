@@ -154,26 +154,31 @@ fn a_team_scope_takes_the_oversubscription_from_the_thread_that_enters_it() {
     let pool = pool(width);
     let team = pool.into_team(width).expect("an idle pool");
     // Mint the root token on the full mask: four participants on four CPUs is
-    // not oversubscribed at mint.
+    // not oversubscribed at mint, and the team pinned this thread to `S[0]`.
     let mut exec = team.exec(width);
-    // Enter the scope from a thread whose mask holds one CPU (the token could
-    // just as well have travelled to another thread): the scope decides from
-    // that set, exactly as its pin section does.
-    if !set_own_cpus(&all[..1]) {
-        eprintln!("skipped: cannot restrict the calling thread to one CPU");
-        return;
-    }
-    let scoped = exec
-        .team(|mut team| {
-            let root = team.over;
-            let child = std::sync::atomic::AtomicBool::new(false);
-            team.reborrow().fork(2, |_, child_team| {
-                child.store(child_team.over, std::sync::atomic::Ordering::Relaxed);
-            });
-            (root, child.load(std::sync::atomic::Ordering::Relaxed))
+    // Enter the scope from another thread whose mask holds one CPU: the scope
+    // decides from that set, exactly as its pin section does.
+    let scoped = std::thread::scope(|s| {
+        s.spawn(|| {
+            if !set_own_cpus(&all[..1]) {
+                eprintln!("skipped: cannot restrict the calling thread to one CPU");
+                return None;
+            }
+            exec.team(|mut team| {
+                let root = team.over;
+                let child = std::sync::atomic::AtomicBool::new(false);
+                team.reborrow().fork(2, |_, child_team| {
+                    child.store(child_team.over, std::sync::atomic::Ordering::Relaxed);
+                });
+                (root, child.load(std::sync::atomic::Ordering::Relaxed))
+            })
+            .ok()
         })
-        .expect("a team token opens its scope");
-    assert!(set_own_cpus(&all), "restoring the calling thread's mask");
+        .join()
+        .unwrap()
+    });
+    drop(exec);
+    let Some(scoped) = scoped else { return };
     assert!(
         scoped.0,
         "four participants on a one-CPU scope mask is oversubscribed"

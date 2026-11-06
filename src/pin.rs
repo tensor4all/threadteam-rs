@@ -4,7 +4,9 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is pinned to `S[0]` for the life of the scope.** One
+//! * **The leader is pinned to `S[0]` for the life of the scope**, and the
+//!   thread that created a `Team` for the life of the team ([`TeamPin`]),
+//!   which is what places a team token that never opens a scope. One
 //!   `sched_setaffinity` at scope entry ([`LeaderPin::enter`]) and one at scope
 //!   exit (its drop, which also runs on unwind) restore `S`; there is no check
 //!   and no move before a section. The price is that a vendor library creates
@@ -132,6 +134,59 @@ impl Drop for LeaderPin {
         // thread on `S[0]`, the mask it already had.
         let _ = set_here(&self.wide);
         PLACED.with(|p| p.set(self.prev));
+    }
+}
+
+/// The thread that created a [`Team`](crate::Team) (`Pool::into_team*`), its
+/// leader, pinned to `S[0]` for the life of the team.
+///
+/// A root scope's pin ends with the scope, and `into_team` opens one only to
+/// acknowledge, so a team driven by tokens that never open a scope
+/// (`fork_sized`, `for_ranges`, `broadcast`) would dispatch with its members on
+/// `S[1..]` and its leader on its whole mask. The team holds this pin instead:
+/// one `sched_setaffinity` when the team is created, one when it is dropped or
+/// turned back into its pool, nothing per token or per section. A root scope
+/// opened on this thread runs under this pin and places the members in this
+/// `S` instead of reading the (now one-CPU) mask. `TeamExec::external` is the
+/// only call that widens it, for the duration of one call.
+///
+/// The pin belongs to the creating thread. A `Team` is `Send` and `Sync`: a
+/// token minted on another thread dispatches from a leader that is not placed,
+/// and a team dropped on another thread restores nothing (that thread was not
+/// moved), so the creating thread keeps `{S[0]}`.
+pub(crate) struct TeamPin {
+    pin: core::mem::ManuallyDrop<LeaderPin>,
+    thread: std::thread::ThreadId,
+}
+
+impl TeamPin {
+    /// Pins the calling thread onto `S[0]` of its own mask `S` when `S` has a
+    /// CPU for each of the `participants`; `None` (and nothing changed) when
+    /// it has not, off Linux, or when the kernel refuses.
+    pub(crate) fn enter(participants: usize) -> Option<TeamPin> {
+        let set = read_here()?;
+        if count(&set) < participants {
+            return None;
+        }
+        let pin = LeaderPin::enter(&set, nth(&set, 0)?)?;
+        Some(TeamPin {
+            pin: core::mem::ManuallyDrop::new(pin),
+            thread: std::thread::current().id(),
+        })
+    }
+
+    /// `S`, when the calling thread is the one this team pinned.
+    pub(crate) fn set_here(&self) -> Option<&CpuMask> {
+        (std::thread::current().id() == self.thread).then_some(&self.pin.wide)
+    }
+}
+
+impl Drop for TeamPin {
+    fn drop(&mut self) {
+        if std::thread::current().id() == self.thread {
+            // SAFETY: dropped once, here, and never used afterwards.
+            unsafe { core::mem::ManuallyDrop::drop(&mut self.pin) };
+        }
     }
 }
 

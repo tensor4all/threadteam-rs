@@ -569,7 +569,8 @@ its whole mask drifted back onto a member's CPU after the first serial gap: 90 %
 of the samples showed leader and member runnable on one CPU, only 1 % had the
 leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
 
-**The rule: the leader is pinned to `S[0]` for the life of the team scope.** One
+**The rule: the leader is pinned to `S[0]` for the life of the team scope**, and
+the leader of a `Team` for the life of the team (see "A `Team`'s leader" below). One
 `sched_setaffinity` at scope entry, one at scope exit (a guard, so also on
 unwind), and nothing in between: no per-section check, no move and restore
 around a dispatch. Members keep `S[k]`, `k >= 1`. Arm B above is this rule.
@@ -586,8 +587,8 @@ to run spread), and for short scopes B and C3 were equal. The nudge is removed
 because the pin is simpler, not because it was shown faster or slower; no
 measurement here favours it. It was not re-measured on evo2 for this change (a
 campaign is running there). The vendor-call half of the reason the nudge existed
-is answered by the widening call below; the drift half is answered only inside
-a scope (see "What this rule gives up" below).
+is answered by the widening call below; the drift half by the pin itself, held
+by the scope or, for a `Team`, by the team (see "A `Team`'s leader" below).
 
 #### Widening the leader for a vendor call: `TeamExec::external`
 
@@ -750,26 +751,63 @@ frame.
   work and is re-pinned only at the next pin section, that is at the next
   whole-team root scope.
 
-**What this rule gives up (tensor4all/threadteam-rs#33).** The earlier code
-kept a *home* for the leader on the `Team` and nudged the leader onto it before
-every section of every token of the team, scope or not. That is what fixed the
-reported path, `into_team` followed by plain tokens (`fork_sized` at width 96:
-leader sharing a member's CPU, about 40 % of processes at ~11 ms per call
-instead of ~5.8 ms). Entry points that are not a `TeamExec` (`Exec::fork`,
-`fork_sized`, `fork_sized_slots`, `for_ranges`, `broadcast` on a team token)
-have no scope in which to hold a leader pin, so under the simplified rule that
-path has no leader placement again. Measured on broccoli (64 CPUs, otherwise
-idle, `fork_sized` at width 64 on a team from `into_team`, 40 calls, one run
-each of five): with the caller dragged onto `S[1]` between calls to imitate
-serial leader work, the median call is 12-16 ms and the leader is on `S[0]`
-in 0 of 20 flat calls; the per-section nudge on the preceding commit, same test,
-had the leader on `S[0]` in 20 of 20 flat calls and a median of about 0.15 ms
-in three of five runs and about 4 ms in the other two. Without the drag the
-leader stays where it started (on `S[0]` in 20 of 20) and the median is 0.13
-ms. Those numbers describe a 64-CPU idle machine, not the reporter's
-two-socket host, and were not repeated beyond five runs. A caller that wants
-the leader held on those paths needs a scope; `TeamExec` offers none of
-`fork_sized`, so the reported path itself is not covered.
+**A `Team`'s leader (tensor4all/threadteam-rs#33, #45).** An engine that owns a
+`Team` (tenferro's `CpuEngine`) mints a token per operation with
+`Team::exec`/`try_exec` and dispatches on it with `fork_sized`, `for_ranges` or
+`broadcast`; it never opens a team scope. `into_team` opens one scope, to
+acknowledge, which places the members on `S[1..]` for the life of the
+reservation; with the leader's pin held by the scope, the leader got `S` back
+when that scope ended, before the first real dispatch, and nothing placed it
+again. That is the path reported in #33 (`fork_sized` at width 96 on a 96-CPU
+two-socket host: 7 of 16 processes at about 11 ms per call instead of about 5.8
+ms, leaders off `S[0]`).
+
+**The rule: the leader's pin belongs to the `Team`.** `into_team` pins the
+calling thread to `S[0]` before its acknowledgement scope (`pin::TeamPin`, a
+field of the `Team`) and the team gives `S` back when it is dropped or turned
+into its pool with `into_pool`: one `sched_setaffinity` at each end, nothing per
+token and nothing per section. The pin is hoisted to the `Team` rather than held
+by the scope because the scope's guard ends with the scope, and the
+acknowledgement scope ends at once. `TeamExec::external` is the only call that
+widens it, for one call. A team scope opened on that thread runs under the
+team's pin and places the members in the team's `S` (the thread's own mask is
+`{S[0]}` by then). A team of one, a mask with fewer CPUs than participants and
+pinning turned off pin nothing, as before. There is no home and no per-section
+check: the pin is cheaper than both.
+
+The pin belongs to the creating thread. A `Team` is `Send` and `Sync`: a token
+minted on another thread has an unplaced leader, and a team dropped on another
+thread restores nothing (that thread was not moved), so the creating thread keeps
+`{S[0]}`. Between tokens the creating thread stays on `{S[0]}`, so a vendor call
+it makes directly runs on one CPU; it goes through `TeamExec::external`, or
+through `Exec::external`, which runs on the pool. Before this rule the leader's
+pin was held by the scope, and a token used without a scope had the leader on its
+whole mask (`e59dbbc`, #45); this is a breaking change in where a `Team`'s caller
+runs.
+
+The earlier fix of #33, a home for the leader kept on the `Team` and a nudge onto
+it before every section (#43, `e4fe0f4`), **landed, not measured**: `01bb587d`,
+which the reporter re-ran, is the commit before that change, and the first nodes
+of the same model did not reproduce #33 on 0.4.0 either (null controls), so no
+run has measured #43 either way. It was removed in #45 for the scope-held pin.
+
+Measured on broccoli (64 CPUs, otherwise idle), `into_team(64)` and then a fresh
+`team.exec(64).fork_sized(&[1; 64], ..)` per call, about 2.8 ms of arithmetic per
+share, 40 timed calls per run. With the scope-held pin (`e59dbbc`): with a 20 ms
+sleep before each call, the leader was on `S[0]` in 17, 2 and 22 of 40 calls in
+three runs, medians 13.8, 15.7 and 10.5 ms against a minimum of 2.9 ms; three
+later runs had it on `S[0]` in 40 of 40 and medians of 2.9-3.0 ms, so that mode
+depends on where the scheduler wakes the leader. With the caller moved onto `S[1]`
+for one share's worth of work before each call, the leader was on `S[0]` in 0 of
+40 in all six runs, median 15.7 ms. With the team-held pin, alternating
+`fork_sized` and `for_ranges` on fresh tokens, three runs of each mode (no gap,
+sleep, move): the leader on `S[0]` (`sched_getcpu`) with mask `{S[0]}` in 40 of 40
+calls of every run, every member alone on its own pinned CPU in 40 of 40, medians
+3.1-3.2 ms (minimum 3.0 ms), and `TeamExec::external` widened to `S` and restored
+`{S[0]}`. The probe is not in the repository; the tests
+`a_team_pins_its_creating_thread_until_it_drops` and
+`the_reported_wide_fork_sized_path_keeps_every_participant_alone_on_its_cpu`
+assert the placement on this path.
 
 `Pool::pin_skips` counts every root scope that could not be placed, as before.
 The doc-hidden `Pool::leader_moves` counter belonged to the nudge and is gone.

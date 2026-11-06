@@ -388,8 +388,9 @@ impl<'team> TeamExec<'team> {
     ///   the vendor team may also use: to give them to Rayon, use
     ///   [`Exec::external`](crate::Exec::external) instead.
     /// * Where nothing was placed (pinning off, a mask smaller than the team,
-    ///   a team of one, a thread that is not the leader of a root scope, a
-    ///   non-Linux target) this is a plain call to `f`.
+    ///   a team of one, a thread that is not the leader of a root scope or the
+    ///   creator of a placed `Team`, a non-Linux target) this is a plain call
+    ///   to `f`.
     ///
     /// # Examples
     ///

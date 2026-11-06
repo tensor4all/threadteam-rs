@@ -189,21 +189,33 @@ fn the_scope_that_enters_decides_the_park_delay_not_the_mint() {
     let team = pool.into_team(3).expect("an idle pool");
     let width = team.size().get();
     let mut exec = team.exec(width);
-    // Enter the scope from a one-CPU mask: it is oversubscribed there, so its
-    // members must park after the short spin, not after 60 s.
-    let cpus = vec![all[0]];
-    if !set_own_cpus(&cpus) {
-        eprintln!("skipped: cannot restrict the calling thread to {cpus:?}");
+    // Enter the scope from another thread whose mask holds one CPU (the team
+    // pinned this thread to `S[0]`, and a scope on this thread uses the set
+    // the team was created on): oversubscribed there, so its members must park after the
+    // short spin, not after 60 s.
+    let sum = AtomicUsize::new(0);
+    let entered = std::thread::scope(|s| {
+        s.spawn(|| {
+            let cpus = vec![all[0]];
+            if !set_own_cpus(&cpus) {
+                eprintln!("skipped: cannot restrict the calling thread to {cpus:?}");
+                return false;
+            }
+            exec.team(|mut team| {
+                team.reborrow().run(|i, _| {
+                    sum.fetch_add(i + 1, Ordering::Relaxed);
+                });
+            })
+            .expect("a team token opens its scope");
+            true
+        })
+        .join()
+        .unwrap()
+    });
+    drop(exec);
+    if !entered {
         return;
     }
-    let _restore = Restrict(all);
-    let sum = AtomicUsize::new(0);
-    exec.team(|mut team| {
-        team.reborrow().run(|i, _| {
-            sum.fetch_add(i + 1, Ordering::Relaxed);
-        });
-    })
-    .expect("a team token opens its scope");
     assert_eq!(sum.load(Ordering::Relaxed), (1..=width).sum::<usize>());
     wait_until_members_parked(&team);
 }

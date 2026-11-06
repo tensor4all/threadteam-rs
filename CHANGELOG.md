@@ -5,6 +5,19 @@ All notable changes to `threadteam` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at
 0.5.0; earlier releases are not recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **A `Team`'s tokens are no longer marked oversubscribed on the leader it
+  pinned** (#33). 0.5.0 pins the thread that creates a `Team` to `{S[0]}`;
+  `Team::exec` then measured oversubscription against that one-CPU mask, so
+  every token minted on the leader thread throttled its members' spin budget
+  to `THROTTLED_POLLS`, and `fork_sized` / `for_ranges` / `broadcast` reached
+  without a team scope carried that flag. Oversubscription on a placed leader
+  is now measured against the `S` it was placed in. A `Team` whose `S` has
+  fewer CPUs than participants is still paced.
+
 ## [0.5.0] - 2026-11-06
 
 The leader of a team is pinned, where 0.4.0 only moved it. Inside a placed team

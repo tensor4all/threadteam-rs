@@ -274,6 +274,12 @@ impl Team {
         pool
     }
 
+    /// The reserved member slots (tests).
+    #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+    pub(crate) fn reservation_ids(&self) -> &[usize] {
+        &self.reservation.ids
+    }
+
     /// Number of participants: the leader plus the reserved members.
     pub fn size(&self) -> NonZeroUsize {
         NonZeroUsize::new(self.reservation.ids.len() + 1).unwrap_or(NonZeroUsize::MIN)
@@ -358,7 +364,19 @@ impl Team {
         // spin budget; otherwise the pool's. `Exec::team_with` on the minted token repeats
         // this on the thread that enters each scope, so a token that travels to
         // a thread with a different CPU set is paced by that set.
-        let oversubscribed = crate::pin::oversubscribed(budget);
+        //
+        // On the thread this team placed, the mask is `{S[0]}` now, so the
+        // team's `S` decides instead, as in `Exec::team_with`: a token minted
+        // by its placed leader is paced by the team's width, and `S` had a CPU
+        // for every participant when the team was created (`TeamPin::enter`).
+        // `pin::available` answers `|S|` on that thread as well; this guard
+        // does not rely on it.
+        let placed = self
+            .leader
+            .as_ref()
+            .and_then(crate::pin::TeamPin::set_here)
+            .is_some();
+        let oversubscribed = !placed && crate::pin::oversubscribed(budget);
         self.pool
             .awake
             .set_spin_budget(ids, self.pool.awake.spin_budget(oversubscribed));

@@ -744,8 +744,18 @@ frame.
   scope runs no pin or unpin section, pins no leader, is not counted in
   `pin_skips`, and dispatches under the team's current placement like any plain
   team token; its oversubscription and the members' spin budget are still
-  decided from its caller's mask. A team that wants a new placement opens a
+  decided from its caller's set. A team that wants a new placement opens a
   root scope with its whole budget.
+* **A placed leader is paced by `S`, not by its one-CPU mask.** Once the leader
+  is pinned to `{S[0]}`, "CPUs in the caller's mask" and "CPUs the caller's
+  team is spread over" differ, and oversubscription is the second question.
+  `pin::available` answers `|S|` on a thread this crate placed (it reads the
+  thread's `PLACED` record), and `Team::token` and `Exec::team_with` also skip
+  the check on the thread the team placed, since `S` had a CPU for every
+  participant when the team was created. 0.5.0 answered 1 there, so every token
+  a `Team` minted on its own leader thread was marked oversubscribed and its
+  members ran with `THROTTLED_POLLS` (threadteam-rs#33). A team whose `S` is
+  genuinely too small places no leader, so it is still paced by its mask.
 * **Lending is the exception.** `Exec::external` lends the token's members to
   the pool for the call; each restores its own mask before it serves Rayon
   work and is re-pinned only at the next pin section, that is at the next

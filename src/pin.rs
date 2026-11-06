@@ -33,10 +33,14 @@
 //! scanning one.
 //!
 //! The same CPU set decides whether a root scope is *oversubscribed* (see
-//! [`available`]): a team of more participants than the caller's mask has CPUs
+//! [`available`]): a team of more participants than the caller's set has CPUs
 //! parks its members early instead of spinning (see `awake.rs`), and
-//! [`oversubscribed`] is what the root-scope entries use. An oversubscribed root
-//! scope is exactly one whose pin is skipped.
+//! [`oversubscribed`] is what the root-scope entries use. On a leader this
+//! crate placed, the caller's set is the `S` it was placed in, not the one-CPU
+//! mask it now runs on. An oversubscribed root scope is one whose pin is
+//! skipped; the converse fails only for a root scope of another pool entered on
+//! a placed leader, which reads the one-CPU mask, places nobody, and is paced
+//! by `S`.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -47,12 +51,28 @@ pub(crate) use sys::count;
 pub(crate) use sys::count;
 pub(crate) use sys::{nth, read_here, set_here, set_here_to, CpuMask};
 
-/// Number of CPUs a root team scope may spread its participants over.
+/// Number of CPUs the calling thread's team is spread over: the CPUs a root
+/// team scope entered on this thread may place its participants on.
 ///
-/// On Linux the number of CPUs in the calling thread's affinity mask, i.e. the
-/// same set the pin section places participants on. Elsewhere
+/// This is *not* "CPUs in the calling thread's current affinity mask" once
+/// this crate has placed the thread. A placed leader (a [`LeaderPin`], which a
+/// [`TeamPin`] holds for the life of a `Team`) runs on the one CPU `{S[0]}`,
+/// but it still leads a team spread over `S`, so the answer is `|S|`, read
+/// from the placement this thread records. Answering 1 there marked every
+/// token a `Team` mints on its own leader thread as oversubscribed and
+/// throttled its members' waits (threadteam-rs#33).
+///
+/// On any other Linux thread it is the number of CPUs in its affinity mask,
+/// i.e. the same set the pin section places participants on. Elsewhere
 /// [`std::thread::available_parallelism`]. Zero is never returned.
 pub(crate) fn available() -> usize {
+    #[cfg(target_os = "linux")]
+    if let Some(placed) = PLACED.with(core::cell::Cell::get) {
+        let n = count(&placed.wide);
+        if n > 0 {
+            return n;
+        }
+    }
     #[cfg(target_os = "linux")]
     if let Some(set) = read_here() {
         let n = count(&set);
@@ -64,7 +84,8 @@ pub(crate) fn available() -> usize {
 }
 
 /// Whether a root scope with `participants` participants is oversubscribed: it
-/// has more participants than the calling thread's CPU set has CPUs.
+/// has more participants than the calling thread's team has CPUs
+/// ([`available`]: `|S|` on a placed leader, its mask elsewhere).
 ///
 /// Evaluated on the thread that enters the root scope, whether or not pinning
 /// is on. For a [`Team`](crate::Team) that is the thread that mints the root

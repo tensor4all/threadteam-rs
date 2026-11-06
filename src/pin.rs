@@ -4,19 +4,16 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is placed, not pinned.** Immediately before every section
-//!   dispatched under the placement, a leader that is not on `S[0]` moves
-//!   itself there and gives itself the whole of `S` back at once ([`nudge_to`],
-//!   called by `Awake::place_leader`), so each section opens with the leader on
-//!   the one CPU no member takes, while its mask stays `S`. A
-//!   vendor library creates its thread team from the thread that calls it, and a
-//!   team created from a one-CPU thread silently confines the whole library team
-//!   to that CPU (tenferro-rs `PERFORMANCE_TIPS.md`), so the calling thread keeps
-//!   its CPU set. The home `S[0]` lives with the members' pins, on the
-//!   authority over them (the scope's `TeamExec`, or the persistent `Team` for
-//!   every token minted from it), never on the pool; a lend
-//!   (`Exec::external`) removes pins and keeps the home (see the design
-//!   record).
+//! * **The leader is pinned to `S[0]` for the life of the scope.** One
+//!   `sched_setaffinity` at scope entry ([`LeaderPin::enter`]) and one at scope
+//!   exit (its drop, which also runs on unwind) restore `S`; there is no check
+//!   and no move before a section. The price is that a vendor library creates
+//!   its thread team from the thread that calls it, and a team created from a
+//!   one-CPU thread silently confines the whole library team to that CPU
+//!   (tenferro-rs `PERFORMANCE_TIPS.md`). The leader's half of that rule is
+//!   [`widened`], behind `TeamExec::external`: it sets the mask to `S` for the
+//!   duration of one call and puts `{S[0]}` back when the call returns or
+//!   unwinds.
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
@@ -46,7 +43,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{contains, current_cpu, nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{nth, read_here, set_here, set_here_to, CpuMask};
 
 /// Number of CPUs a root team scope may spread its participants over.
 ///
@@ -92,39 +89,71 @@ pub(crate) fn pin_to(set: &CpuMask, k: usize) {
     }
 }
 
-/// Moves the calling thread onto `home` and gives it back the mask it had, so
-/// it runs on `home` without being confined to it. `true` when it moved.
+/// What a placed root scope remembers about its leader thread: the whole set
+/// `S` it started with and the one CPU, `S[0]`, it is pinned to.
+#[derive(Clone, Copy)]
+struct Placed {
+    wide: CpuMask,
+    home: usize,
+}
+
+thread_local! {
+    /// The placement of the root scope the calling thread leads, if it is
+    /// placed. `const` initialised and `Copy`, so neither access allocates nor
+    /// registers a destructor.
+    static PLACED: core::cell::Cell<Option<Placed>> = const { core::cell::Cell::new(None) };
+}
+
+/// The calling thread, the leader of a placed root scope, pinned to `S[0]`.
 ///
-/// Used by [`crate::awake::Awake::place_leader`] before every section
-/// dispatched under a placement. A thread whose mask is a single CPU (a pinned
-/// member leading a child section) is left alone: `false`. So is a thread whose
-/// mask does not contain `home` (a team token used from a thread with another
-/// CPU set): moving it there would take it out of its own set. Best effort: a refused move
-/// leaves the thread where it was. The restore of the mask can be refused only
-/// when the cpuset shrank between the two calls, and then the thread stays on
-/// `home` for the rest of the scope: `sched_getaffinity` then reports the
-/// single-CPU mask the move installed, and no syscall used here reveals a wider
-/// permitted set, so the fallback confirms that mask instead of widening it.
-/// `Pool::leader_moves` counts the move either way.
-pub(crate) fn nudge_to(home: usize) -> bool {
-    let Some(mask) = read_here() else {
-        return false;
-    };
-    if count(&mask) < 2 || !contains(&mask, home) {
-        return false;
+/// Dropping it gives the thread `S` back, on the normal path and on unwind.
+/// Nested scopes on one thread stack: the previous placement is put back.
+pub(crate) struct LeaderPin {
+    wide: CpuMask,
+    prev: Option<Placed>,
+}
+
+impl LeaderPin {
+    /// Pins the calling thread onto `home = S[0]`, remembering `wide = S`.
+    /// `None` when the kernel refuses the pin: the thread keeps `S`, the scope
+    /// places its members anyway and nothing is restored at exit.
+    pub(crate) fn enter(wide: &CpuMask, home: usize) -> Option<LeaderPin> {
+        if !set_here_to(home) {
+            return None;
+        }
+        let prev = PLACED.with(|p| p.replace(Some(Placed { wide: *wide, home })));
+        Some(LeaderPin { wide: *wide, prev })
     }
-    if !set_here_to(home) {
-        return false;
+}
+
+impl Drop for LeaderPin {
+    fn drop(&mut self) {
+        // Best effort: a refused restore (a cpuset that shrank) leaves the
+        // thread on `S[0]`, the mask it already had.
+        let _ = set_here(&self.wide);
+        PLACED.with(|p| p.set(self.prev));
     }
-    if !set_here(&mask) {
-        // Re-applying the mask the kernel reports confirms what the thread now
-        // has; it cannot widen it, because that mask is the one-CPU mask the
-        // move above installed. The doc comment above states this limit.
-        if let Some(now) = read_here() {
-            let _ = set_here(&now);
+}
+
+/// Runs `f` with the calling thread's mask widened to `S` when it leads a
+/// placed root scope, and puts `{S[0]}` back when `f` returns or unwinds. On
+/// any other thread, or in a scope that placed nobody, it just calls `f`.
+///
+/// Two `sched_setaffinity` calls per call, paid every time: nothing caches
+/// "already wide" and nothing skips the restore. A refused widening leaves the
+/// thread as it was (on `{S[0]}`) and `f` still runs, then no restore is
+/// needed; a refused restore leaves the thread wide until the scope exits and
+/// [`LeaderPin`] gives `S` back.
+pub(crate) fn widened<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = set_here_to(self.0);
         }
     }
-    true
+    let placed = PLACED.with(|p| p.get());
+    let _restore = placed.and_then(|p| set_here(&p.wide).then_some(Restore(p.home)));
+    f()
 }
 
 /// The mask a member saved before it pinned itself, and whether it is pinned.
@@ -245,21 +274,6 @@ mod sys {
         }
     }
 
-    /// The CPU the calling thread runs on right now, or `None` when the kernel
-    /// does not say. Only a hint: the thread may move right after.
-    pub(crate) fn current_cpu() -> Option<usize> {
-        // SAFETY: no arguments; returns -1 on failure.
-        let cpu = unsafe { libc::sched_getcpu() };
-        usize::try_from(cpu).ok()
-    }
-
-    /// Whether `cpu` is in the set.
-    pub(crate) fn contains(mask: &CpuMask, cpu: usize) -> bool {
-        // SAFETY: reads one bit of a valid set; `cpu < SETSIZE` keeps the
-        // index inside it.
-        cpu < SETSIZE && unsafe { libc::CPU_ISSET(cpu, &mask.set) }
-    }
-
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -304,14 +318,6 @@ mod sys {
     }
 
     pub(crate) fn set_here_to(_cpu: usize) -> bool {
-        false
-    }
-
-    pub(crate) fn current_cpu() -> Option<usize> {
-        None
-    }
-
-    pub(crate) fn contains(_mask: &CpuMask, _cpu: usize) -> bool {
         false
     }
 

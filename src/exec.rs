@@ -102,16 +102,7 @@ pub(crate) struct TeamAuth<'p> {
     /// Fixed when the root token is minted and carried into `reborrow`,
     /// `limit`, `fork` children and every section.
     pub(crate) over: bool,
-    /// The [`Team`](crate::Team)'s home for its leader: `S[0]` of the
-    /// placement its members are under, or `usize::MAX` when they are not
-    /// placed. It lives on the `Team`, not on the pool: the pin section of a
-    /// whole-team root scope sets it, an unpin section of one clears it, and
-    /// the `Team` (with its reservation) ends it. Every section a token of the
-    /// team dispatches places its leader there first, inside a root scope or
-    /// not. A lend (`Exec::external`) unpins the lent members and keeps the
-    /// home: it then outlives their pins until the next whole-team root scope.
-    pub(crate) home: &'p AtomicUsize,
-    /// Number of members the `Team` reserved, all of which `home` describes.
+    /// Number of members the `Team` reserved, all of which the placement covers.
     /// A root token whose `ids` are fewer (`Team::exec` with a smaller budget,
     /// or `limit`) does not change the placement (see `team_with`).
     pub(crate) reserved: usize,
@@ -665,8 +656,7 @@ impl<'p> Exec<'p> {
         };
         match (self.team, self.pool) {
             (Some(t), _) if tasks > 1 => {
-                let home = t.home.load(Ordering::Relaxed);
-                split_raw(Some(t.awake), t.ids, plan, t.over, home, |k, ids| {
+                split_raw(Some(t.awake), t.ids, plan, t.over, |k, ids| {
                     body(k, Some(ids));
                 });
             }
@@ -721,8 +711,7 @@ impl<'p> Exec<'p> {
         };
         match (self.team, self.pool) {
             (Some(t), _) if tasks > 1 => {
-                let home = t.home.load(Ordering::Relaxed);
-                spread_raw(Some(t.awake), t.ids, tasks, t.over, home, body);
+                spread_raw(Some(t.awake), t.ids, tasks, t.over, body);
             }
             (None, Some(pool)) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
             _ => {
@@ -789,8 +778,7 @@ impl<'p> Exec<'p> {
             // runs at once, also for a child produced by `fork`.
             let _released = self.track.release();
             let track = &self.track;
-            let home = t.home.load(Ordering::Relaxed);
-            spread_raw(Some(t.awake), t.ids, self.budget.get(), t.over, home, |i| {
+            spread_raw(Some(t.awake), t.ids, self.budget.get(), t.over, |i| {
                 let _live = track.task();
                 f(i);
             });
@@ -937,16 +925,16 @@ impl<'p> Exec<'p> {
     /// This call opens a **root team scope**: it reads the calling thread's
     /// affinity mask, which decides two things. With
     /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants) on
-    /// (the default) it places every member on its own CPU of that mask, after
-    /// moving the leader onto the first CPU of the mask without narrowing the
-    /// leader's mask, and moves the leader there again before every later
-    /// section under that placement. A scoped acquisition is placed for the
-    /// scope; a root token of a [`Team`](crate::Team) with the whole team's
-    /// budget places the team's members until a later such scope re-places or
-    /// unpins them or the `Team` ends, and every token of the team homes its
-    /// leader meanwhile, inside a scope or not. A root token of a `Team` with a
-    /// smaller budget changes no placement and runs under the team's current
-    /// one. A mask with fewer CPUs than participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
+    /// (the default) it places every member on its own CPU of that mask and pins
+    /// the leader to the first CPU of the mask until the scope ends (a vendor
+    /// call from the leader goes through [`TeamExec::external`], which widens it
+    /// for that call). A scoped acquisition is placed for the scope; a root
+    /// token of a [`Team`](crate::Team) with the whole team's budget places the
+    /// team's members until a later such scope re-places or unpins them or the
+    /// `Team` ends, and pins its leader for the scope only. A root token of a
+    /// `Team` with a smaller budget changes no placement, pins no leader and
+    /// runs under the team's current placement. A mask with fewer CPUs than
+    /// participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
     /// Whether or not pinning is on, it records whether the scope is
     /// *oversubscribed* (more participants than CPUs in the mask), which decides
     /// how the members park and how a joining leader waits. See the design
@@ -1000,7 +988,6 @@ impl<'p> Exec<'p> {
                 policy: t.policy.with(over),
                 track: self.track.alias(),
                 over: t.over,
-                home: t.home.load(Ordering::Relaxed),
             };
             // Only the root token minted by a `Team` opens a root scope; a
             // child, a reborrow or a sub-team re-pins nothing of its own.
@@ -1018,22 +1005,23 @@ impl<'p> Exec<'p> {
                 if let Some(auth) = self.team.as_mut() {
                     auth.over = oversubscribed;
                 }
-                // The placement outlives the scope: the members stay pinned
-                // until an unpin section or the end of the reservation, and so
-                // does the leader's home, which the `Team` keeps for every
-                // later token. The home is one value for every reserved member,
-                // so only a scope over all of them may change the placement: a
-                // token narrower than the team would pin or unpin a prefix and
-                // leave the rest where the home no longer describes them (a
-                // home cleared while a suffix is pinned, or set to a CPU a
-                // suffix member holds). A narrower root scope therefore runs
-                // no pin or unpin section and dispatches under the team's
-                // current placement and home, as a plain team token does. A
-                // scope that ran no section (pinning off, no CPU set) leaves
-                // the placement as it was.
-                if t.ids.len() == t.reserved && team.size().get() > 1 && pin_scope(&mut team) {
-                    t.home.store(team.home, Ordering::Relaxed);
-                }
+                // The members' placement outlives the scope: they stay pinned
+                // until an unpin section or the end of the reservation. The
+                // leader's does not: it is pinned to `S[0]` for this scope and
+                // gets `S` back when it ends. The placement is one value for
+                // every reserved member, so only a scope over all of them may
+                // change it: a token narrower than the team would pin or unpin
+                // a prefix and leave the suffix as it was. A narrower root scope
+                // therefore runs no pin or unpin section, pins no leader, and
+                // dispatches under the team's current placement. A scope that
+                // ran no section (pinning off, no CPU set) leaves the placement
+                // as it was.
+                let _pin = if t.ids.len() == t.reserved && team.size().get() > 1 {
+                    pin_scope(&mut team)
+                } else {
+                    None
+                };
+                return Ok(f(team));
             }
             return Ok(f(team));
         }
@@ -1047,7 +1035,6 @@ impl<'p> Exec<'p> {
                     policy: policy.with(over),
                     track: self.track.alias(),
                     over: false,
-                    home: usize::MAX,
                 }));
             }
         };
@@ -1068,18 +1055,19 @@ impl<'p> Exec<'p> {
             policy,
             track: self.track.alias(),
             over: oversubscribed,
-            home: usize::MAX,
         };
         // The pin (or unpin) section is also the acknowledgement; without
-        // pinning the participants acknowledge as before. The leader is never
-        // pinned (each placement gives it its whole mask back at once),
-        // so there is nothing to restore when the scope ends or unwinds. The
-        // home lives in `team` and ends with the scope, as the reservation
-        // (and with it the members' pins) does.
-        let pinned = team.size().get() > 1 && pin_scope(&mut team);
-        if !pinned {
+        // pinning the participants acknowledge as before. The guard gives the
+        // leader its mask back when the scope ends or unwinds.
+        let pin = if team.size().get() > 1 {
+            pin_scope(&mut team)
+        } else {
+            None
+        };
+        if pin.is_none() {
             team.acknowledge();
         }
+        let _pin = pin;
         Ok(f(team))
     }
 
@@ -1123,9 +1111,14 @@ impl<S> SlotBase<S> {
     }
 }
 
+/// What a root team scope holds while it is open: the leader's pin to `S[0]`,
+/// if it was placed. Dropping it (scope end or unwind) gives `S` back.
+struct ScopePin(#[allow(dead_code)] Option<crate::pin::LeaderPin>);
+
 /// Places a root team scope on the calling thread's CPU set `S`: the leader is
-/// homed on `S[0]` (`team.home`; placed there before every section, see
-/// `Awake::place_leader`) and keeps all of `S`, member `k` pins itself onto `S[k]`.
+/// pinned to `S[0]` for the life of the scope (`pin::LeaderPin`, one
+/// `sched_setaffinity` now and one when the returned guard drops), member `k`
+/// pins itself onto `S[k]`.
 ///
 /// When `S` has fewer CPUs than the team has participants nothing is pinned:
 /// the skip is counted (`Pool::pin_skips`) and the members restore their own
@@ -1135,33 +1128,26 @@ impl<S> SlotBase<S> {
 /// 8 participants wrapped onto one CPU: 3.1 ms against 0.89 ms unpinned and
 /// 1.7 ms on one thread), so a team that cannot be placed is not placed.
 ///
-/// `false` when participant pinning is off for this pool, when the platform has
+/// `None` when participant pinning is off for this pool, when the platform has
 /// no CPU set (off Linux), or when the calling thread's mask could not be read:
-/// then nothing ran, `team.home` is untouched and the caller acknowledges as
-/// usual. `true` when a section ran (pin or unpin), which also served as the
-/// acknowledgement; `team.home` is then the new placement's home, `usize::MAX`
-/// after an unpin section.
-fn pin_scope(team: &mut TeamExec<'_>) -> bool {
-    let Some(awake) = team.awake.filter(|awake| awake.pin) else {
-        return false;
-    };
+/// then nothing ran and the caller acknowledges as usual. `Some` when a section
+/// ran (pin or unpin), which also served as the acknowledgement; keep the guard
+/// alive for the scope.
+fn pin_scope(team: &mut TeamExec<'_>) -> Option<ScopePin> {
+    let awake = team.awake.filter(|awake| awake.pin)?;
     // The leader reads its own mask: that set is where the team is placed, and
-    // the leader's mask is that set again once the scope has opened.
-    let Some(set) = crate::pin::read_here() else {
-        return false;
-    };
+    // the leader's mask is that set again once the scope has closed.
+    let set = crate::pin::read_here()?;
     if crate::pin::count(&set) < team.size().get() {
         awake.pin_skips.fetch_add(1, Ordering::Relaxed);
-        team.home = usize::MAX;
         team.unpin_section();
-        return true;
+        return Some(ScopePin(None));
     }
-    // The leader's home is `S[0]`, the CPU no member takes. Every section of
-    // the scope places the leader there first (`Awake::place_leader`), the pin
-    // section included, so the scope opens with the leader home too.
-    team.home = crate::pin::nth(&set, 0).unwrap_or(usize::MAX);
+    // The leader's home is `S[0]`, the CPU no member takes. It is pinned there
+    // before the pin section, so the scope opens with the leader home too.
+    let leader = crate::pin::nth(&set, 0).and_then(|home| crate::pin::LeaderPin::enter(&set, home));
     team.pin_section(&set);
-    true
+    Some(ScopePin(leader))
 }
 
 impl fmt::Debug for Exec<'_> {

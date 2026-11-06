@@ -1,10 +1,9 @@
 //! Participant placement (Linux only, on by default): every member pins itself
 //! onto one CPU of the calling thread's set at a root team scope and restores
 //! its own mask when its reservation ends; the leader (the calling thread) is
-//! nudged onto the set's first CPU before every section dispatched under that
-//! placement, inside the scope or, for a `Team`, through any later token, but
-//! its mask is never narrowed; a set with fewer CPUs than participants places
-//! nobody and counts the skip.
+//! pinned to the set's first CPU for the whole scope, widened to the set only
+//! inside `TeamExec::external`, and has its mask back when the scope ends; a
+//! set with fewer CPUs than participants places nobody and counts the skip.
 #![cfg(all(feature = "parallel", target_os = "linux"))]
 
 use std::num::NonZeroUsize;
@@ -151,7 +150,7 @@ impl Seen {
 }
 
 #[test]
-fn a_root_team_scope_places_each_member_on_its_own_cpu_and_never_moves_the_leader() {
+fn a_root_team_scope_places_each_member_on_its_own_cpu_and_the_leader_on_the_first() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 2 {
@@ -171,11 +170,12 @@ fn a_root_team_scope_places_each_member_on_its_own_cpu_and_never_moves_the_leade
 
     let masks = seen.take();
     assert_eq!(masks.len(), width, "every participant ran a share");
-    // Participant 0 is the leader: it runs its share on the calling thread and
-    // its mask is untouched, inside the scope included.
+    // Participant 0 is the leader: it runs its share on the calling thread,
+    // pinned to S[0] for the scope.
     assert_eq!(
-        masks[0].1, before,
-        "the leader was moved: {:?} instead of {before:?}",
+        masks[0].1,
+        vec![set[0]],
+        "the leader's mask in its share: {:?}",
         masks[0].1
     );
     for (index, mask) in &masks[1..] {
@@ -207,7 +207,7 @@ fn a_root_team_scope_places_each_member_on_its_own_cpu_and_never_moves_the_leade
 }
 
 #[test]
-fn a_persistent_team_pins_every_root_scope_and_never_moves_the_leader() {
+fn a_persistent_team_pins_every_root_scope_and_restores_the_leader_after_each() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 2 {
@@ -241,8 +241,12 @@ fn a_persistent_team_pins_every_root_scope_and_never_moves_the_leader() {
         let round = rounds[*index];
         rounds[*index] += 1;
         if *index == 0 {
-            // Participant 0 is the leader, which is never pinned.
-            assert_eq!(mask, &before, "round {round}: the leader was moved");
+            // Participant 0 is the leader, pinned to S[0] for each scope.
+            assert_eq!(
+                mask,
+                &vec![set[0]],
+                "round {round}: the leader's mask in its share"
+            );
         } else {
             assert_eq!(
                 mask,
@@ -278,7 +282,7 @@ fn pinning_is_on_by_default() {
 }
 
 #[test]
-fn the_leader_is_placed_on_its_home_cpu_before_every_section_and_keeps_its_mask() {
+fn the_leader_is_pinned_to_its_home_cpu_for_the_whole_scope() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -290,53 +294,103 @@ fn the_leader_is_placed_on_its_home_cpu_before_every_section_and_keeps_its_mask(
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
     let before = own_cpus();
-    let moves_before = team.pool().leader_moves().0;
-    // Inside one root scope, drag the leader onto a member's CPU (S[1]) between
-    // sections, as serial work in a long scope lets the scheduler do, then open
-    // a section: the leader must run its share on S[0] with its whole mask.
-    // Where the leader runs is the scheduler's to keep, so it is sampled over
-    // rounds; the mask is asserted every time.
-    let mut on_home = 0;
-    let rounds = 20;
+    let home = vec![set[0]];
+    // Outside the scope the leader has its whole mask.
+    assert_eq!(own_cpus(), before);
     team.exec(width)
         .team(|mut t| {
-            for round in 0..rounds {
-                assert!(set_own_cpus(&[set[1]]), "moving the leader onto S[1]");
-                assert!(set_own_cpus(&before), "restoring the leader's mask");
+            // From the first instruction of the scope, between sections, in
+            // every share and after every section, the mask is {S[0]}: one
+            // pin at entry, no per-section check.
+            assert_eq!(own_cpus(), home, "at scope entry");
+            for round in 0..20 {
                 let seen = Mutex::new(None);
                 t.reborrow().run_with(|p| {
                     if p.index() == 0 {
-                        // SAFETY: no arguments; -1 on failure, never a CPU.
-                        let cpu = unsafe { libc::sched_getcpu() };
-                        *seen.lock().unwrap() = Some((usize::try_from(cpu).ok(), own_cpus()));
+                        *seen.lock().unwrap() = Some(own_cpus());
                     }
                 });
-                let (cpu, mask) = seen.into_inner().unwrap().unwrap();
                 assert_eq!(
-                    mask, before,
+                    seen.into_inner().unwrap().unwrap(),
+                    home,
                     "round {round}: the leader's mask in its share"
                 );
-                if cpu == Some(set[0]) {
-                    on_home += 1;
-                }
+                assert_eq!(own_cpus(), home, "round {round}: between sections");
             }
         })
         .expect("a team token opens its scope");
     assert_eq!(own_cpus(), before, "the leader's mask after the scope");
-    assert!(
-        on_home > rounds / 2,
-        "the leader ran its share on S[0] in {on_home} of {rounds} sections"
-    );
-    let moves = team.pool().leader_moves().0 - moves_before;
-    assert!(moves > 0, "no placement was counted");
     assert_eq!(team.pool().pin_skips(), 0);
 }
 
-/// Drags the calling thread onto `cpu` and gives it `mask` back, as serial
-/// work between sections lets the scheduler do.
-fn drag(cpu: usize, mask: &[usize]) {
-    assert!(set_own_cpus(&[cpu]), "moving the caller onto CPU {cpu}");
-    assert!(set_own_cpus(mask), "restoring the caller's mask");
+#[test]
+fn team_external_widens_the_leader_for_the_call_and_restores_the_pin() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(3);
+    let pool = builder(width, true).build().unwrap();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let before = own_cpus();
+    let home = vec![set[0]];
+    let mut exec = team.exec(width);
+    exec.team(|mut t| {
+        assert_eq!(own_cpus(), home);
+        // Every call widens and restores: nothing remembers "already wide".
+        for round in 0..3 {
+            let inside = t.external(own_cpus);
+            assert_eq!(inside, before, "round {round}: mask inside the call");
+            assert_eq!(own_cpus(), home, "round {round}: mask after the call");
+        }
+        // The restore is not skipped when the call unwinds.
+        let r = catch_unwind(AssertUnwindSafe(|| {
+            t.external(|| {
+                assert_eq!(own_cpus(), before);
+                panic!("a vendor call panics");
+            })
+        }));
+        assert!(r.is_err());
+        assert_eq!(own_cpus(), home, "mask after an unwinding call");
+        // The next section still runs with the leader on S[0].
+        let seen = Mutex::new(None);
+        t.reborrow().run_with(|p| {
+            if p.index() == 0 {
+                *seen.lock().unwrap() = Some(own_cpus());
+            }
+        });
+        assert_eq!(seen.into_inner().unwrap().unwrap(), home);
+    })
+    .expect("a team token opens its scope");
+    drop(exec);
+    assert_eq!(own_cpus(), before, "the leader's mask after the scope");
+}
+
+#[test]
+fn team_external_is_a_plain_call_where_nothing_was_placed() {
+    let _w = watchdog();
+    let set = own_cpus();
+    let width = set.len().min(3);
+    // Pinning off: the leader never changes mask, so neither does the call.
+    let pool = builder(width, false).build().unwrap();
+    let before = own_cpus();
+    Exec::new(&pool, width)
+        .unwrap()
+        .team(|mut t| {
+            assert_eq!(own_cpus(), before);
+            assert_eq!(t.external(own_cpus), before);
+            assert_eq!(own_cpus(), before);
+        })
+        .expect("an idle pool");
+    // A serial token has no scope to be placed in.
+    Exec::serial()
+        .team(|mut t| assert_eq!(t.external(own_cpus), before))
+        .unwrap();
+    assert_eq!(own_cpus(), before);
 }
 
 /// Where the caller runs a `fork` on `exec`, and the mask it has there: its
@@ -359,8 +413,13 @@ fn leader_share(exec: Exec<'_>) -> (Option<usize>, Vec<usize>) {
     seen.into_inner().unwrap().unwrap_or_else(sample)
 }
 
+/// A token of a placed team that never opens a team scope has no leader pin
+/// (the pin is the scope's): the caller keeps its whole mask in its share and
+/// after it. Its members are still where the last whole-team scope put them,
+/// so the leader is not kept off a member's CPU there; the design record says
+/// so, and this test is the record of the rule.
 #[test]
-fn a_placed_teams_tokens_home_the_leader_outside_a_root_scope() {
+fn a_placed_teams_plain_token_leaves_its_caller_unpinned() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -369,37 +428,24 @@ fn a_placed_teams_tokens_home_the_leader_outside_a_root_scope() {
     }
     let width = set.len().min(4);
     let pool = builder(width, true).build().unwrap();
-    // `into_team` places the members in its acknowledgement scope and opens no
-    // other: every section below goes through plain team tokens (#33).
+    // `into_team` places the members in its acknowledgement scope; every
+    // section below goes through plain team tokens.
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
     let before = own_cpus();
-    let moves_before = team.pool().leader_moves().0;
-    let rounds = 20;
-    let mut on_home = 0;
-    for round in 0..rounds {
-        drag(set[1], &before);
-        let (cpu, mask) = leader_share(team.exec(width));
+    for round in 0..10 {
+        let (_, mask) = leader_share(team.exec(width));
         assert_eq!(
             mask, before,
             "round {round}: the leader's mask in its share"
         );
-        if cpu == Some(set[0]) {
-            on_home += 1;
-        }
+        assert_eq!(own_cpus(), before, "round {round}: the caller afterwards");
     }
-    assert_eq!(own_cpus(), before, "the leader's mask afterwards");
-    assert!(
-        on_home > rounds / 2,
-        "the leader ran its share on S[0] in {on_home} of {rounds} sections"
-    );
-    let moves = team.pool().leader_moves().0 - moves_before;
-    assert!(moves > 0, "the moves outside a root scope were not counted");
     assert_eq!(team.pool().pin_skips(), 0);
 }
 
 #[test]
-fn an_unrelated_token_of_a_placed_teams_pool_never_moves_its_caller() {
+fn an_unrelated_token_of_a_placed_teams_pool_never_pins_its_caller() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -409,25 +455,19 @@ fn an_unrelated_token_of_a_placed_teams_pool_never_moves_its_caller() {
     // A team of two on a pool of four: two workers stay free for other tokens.
     let pool = builder(4, true).build().unwrap();
     let team = pool.into_team(2).expect("an idle pool");
-    let moves = team.pool().leader_moves().0;
 
     // A plain token of the same pool, from a caller whose set holds S[1] and
-    // S[2] but not the team's home S[0].
+    // S[2] but not the team's S[0].
     let cpus = vec![set[1], set[2]];
     let Some(restore) = Restrict::to(&cpus) else {
         eprintln!("skipped: cannot restrict the calling thread to {cpus:?}");
         return;
     };
     for round in 0..10 {
-        let (cpu, mask) = leader_share(Exec::new(team.pool(), 2).unwrap());
+        let (_, mask) = leader_share(Exec::new(team.pool(), 2).unwrap());
         assert_eq!(mask, cpus, "round {round}: the caller's mask");
-        assert_ne!(
-            cpu,
-            Some(set[0]),
-            "round {round}: the caller was moved home"
-        );
         // A team scope of that token with three participants on two CPUs is
-        // not placed and has no home: its sections leave the caller alone too.
+        // not placed: its leader keeps its mask.
         let mut exec = Exec::new(team.pool(), 3).unwrap();
         exec.team(|mut t| {
             t.reborrow().run_with(|p| {
@@ -439,28 +479,10 @@ fn an_unrelated_token_of_a_placed_teams_pool_never_moves_its_caller() {
         .expect("idle workers");
     }
     drop(restore);
-    assert_eq!(
-        team.pool().leader_moves().0,
-        moves,
-        "a caller of an unrelated token was moved"
-    );
-
-    // And the unrelated scopes did not take the team's home away: its own
-    // tokens still place their leader.
-    let before = own_cpus();
-    let mut on_home = 0;
-    for _ in 0..10 {
-        drag(set[1], &before);
-        if leader_share(team.exec(2)).0 == Some(set[0]) {
-            on_home += 1;
-        }
-    }
-    assert!(on_home > 5, "the team's leader was home in {on_home} of 10");
-    assert!(team.pool().leader_moves().0 > moves);
 }
 
 #[test]
-fn a_released_or_unpinned_team_no_longer_moves_its_caller() {
+fn a_released_or_unpinned_team_leaves_its_caller_alone() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -471,43 +493,35 @@ fn a_released_or_unpinned_team_no_longer_moves_its_caller() {
     let pool = builder(width, true).build().unwrap();
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
-    // A root scope that cannot be placed (a one-CPU caller) unpins the members
-    // and ends the home with them.
+    // A root scope that cannot be placed (a one-CPU caller) unpins the members.
     let Some(restore) = Restrict::to(&set[..1]) else {
         eprintln!("skipped: cannot restrict the calling thread to one CPU");
         return;
     };
     team.exec(width)
-        .team(|_| {})
+        .team(|t| {
+            drop(t);
+            assert_eq!(own_cpus(), vec![set[0]]);
+        })
         .expect("a team token opens its scope");
     drop(restore);
     assert_eq!(team.pool().pin_skips(), 1);
-    let moves = team.pool().leader_moves().0;
-    drag(set[2], &set);
     team.exec(width)
         .for_ranges(64, NonZeroUsize::new(16).unwrap(), |_| {});
     assert_eq!(
-        team.pool().leader_moves().0,
-        moves,
-        "an unpinned team moved its caller"
+        own_cpus(),
+        set,
+        "an unpinned team changed its caller's mask"
     );
 
-    // Placed again, then released: the pool keeps no home of the team's.
+    // Placed again, then released: the pool keeps nothing of the team's.
     team.exec(width)
         .team(|_| {})
         .expect("a team token opens its scope");
+    assert_eq!(own_cpus(), set, "the scope's guard gave the mask back");
     let pool = team.into_pool();
-    let moves = pool.leader_moves().0;
-    for _ in 0..5 {
-        drag(set[2], &set);
-        let (_, mask) = leader_share(Exec::new(&pool, width).unwrap());
-        assert_eq!(mask, set, "the caller's mask after the team");
-    }
-    assert_eq!(
-        pool.leader_moves().0,
-        moves,
-        "a released team moved its caller"
-    );
+    let (_, mask) = leader_share(Exec::new(&pool, width).unwrap());
+    assert_eq!(mask, set, "the caller's mask after the team");
 }
 
 /// One `fork_sized` section of one-slot shares on `exec`: per share, the CPU it
@@ -525,26 +539,13 @@ fn flat_shares(exec: Exec<'_>) -> Vec<(Option<usize>, Vec<usize>)> {
 }
 
 /// After a narrower root scope of a placed team of three (members on `S[1]`,
-/// `S[2]`, home `S[0]`): the members are still where the full placement put
-/// them and full-width sections still home the leader on `S[0]`, never on
-/// `avoid`.
-fn assert_full_placement_kept(team: &threadteam::Team, set: &[usize], avoid: usize) {
+/// `S[2]`): the members are still where the full placement put them, and the
+/// narrower scope pinned no leader.
+fn assert_full_placement_kept(team: &threadteam::Team, set: &[usize]) {
     let before = own_cpus();
-    let moves = team.pool().leader_moves().0;
-    let rounds = 20;
-    let mut on_home = 0;
-    for round in 0..rounds {
-        drag(set[1], &before);
+    for round in 0..10 {
         let shares = flat_shares(team.exec(3));
         assert_eq!(shares[0].1, before, "round {round}: the leader's mask");
-        assert_ne!(
-            shares[0].0,
-            Some(avoid),
-            "round {round}: leader moved onto a member's CPU"
-        );
-        if shares[0].0 == Some(set[0]) {
-            on_home += 1;
-        }
         for (k, (_, mask)) in shares.iter().enumerate().skip(1) {
             assert_eq!(
                 mask,
@@ -553,15 +554,10 @@ fn assert_full_placement_kept(team: &threadteam::Team, set: &[usize], avoid: usi
             );
         }
     }
-    assert!(
-        on_home > rounds / 2,
-        "the leader ran on S[0] in {on_home} of {rounds} sections"
-    );
-    assert!(team.pool().leader_moves().0 > moves, "no move was counted");
 }
 
 #[test]
-fn a_narrower_root_scope_that_cannot_be_placed_keeps_the_teams_home() {
+fn a_narrower_root_scope_that_cannot_be_placed_changes_nothing() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -571,8 +567,7 @@ fn a_narrower_root_scope_that_cannot_be_placed_keeps_the_teams_home() {
     let pool = builder(3, true).build().unwrap();
     let team = pool.into_team(3).expect("an idle pool");
     // A root scope of two from a one-CPU caller. Were it to unpin, it could
-    // reach member 1 only, while member 2 stayed pinned on S[2]; clearing the
-    // team's home then would leave full-width sections with no home.
+    // reach member 1 only, while member 2 stayed pinned on S[2].
     let Some(restore) = Restrict::to(&set[..1]) else {
         eprintln!("skipped: cannot restrict the calling thread to one CPU");
         return;
@@ -586,11 +581,11 @@ fn a_narrower_root_scope_that_cannot_be_placed_keeps_the_teams_home() {
         0,
         "a narrower scope places nothing"
     );
-    assert_full_placement_kept(&team, &set, set[2]);
+    assert_full_placement_kept(&team, &set);
 }
 
 #[test]
-fn a_narrower_root_scope_never_homes_the_leader_on_a_members_cpu() {
+fn a_narrower_root_scope_pins_no_leader_and_moves_no_member() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 4 {
@@ -598,25 +593,32 @@ fn a_narrower_root_scope_never_homes_the_leader_on_a_members_cpu() {
         return;
     }
     let pool = builder(3, true).build().unwrap();
-    // Members on S[1] and S[2], home S[0].
+    // Members on S[1] and S[2].
     let team = pool.into_team(3).expect("an idle pool");
     // A root scope of two from [S[2], S[3]]. Were it to place, it would move
-    // member 1 onto S[3] and make S[2] the home, while member 2 stays on S[2]:
-    // every later full-width section would nudge the leader onto member 2.
+    // member 1 onto S[3] and pin the leader to S[2], which member 2 holds.
     let cpus = vec![set[2], set[3]];
     let Some(restore) = Restrict::to(&cpus) else {
         eprintln!("skipped: cannot restrict the calling thread to {cpus:?}");
         return;
     };
     team.exec(2)
-        .team(|_| {})
+        .team(|_| {
+            assert_eq!(own_cpus(), cpus, "a narrower scope pins no leader");
+        })
         .expect("a team token opens its scope");
     drop(restore);
-    assert_full_placement_kept(&team, &set, set[2]);
+    assert_full_placement_kept(&team, &set);
 }
 
+/// The path of #33: a team from `into_team` and nothing but plain team tokens
+/// afterwards, at the machine's width (up to 96). Under the current rule such a
+/// token has no leader pin (see `a_placed_teams_plain_token_leaves_its_caller_
+/// unpinned`), so this test asserts only what still holds, every member alone
+/// on its own CPU, and reports where the leader ran. It does **not** assert the
+/// leader on `S[0]`: that guarantee was removed with the per-section nudge.
 #[test]
-fn the_reported_wide_fork_sized_path_homes_the_leader_once_per_call() {
+fn the_reported_wide_fork_sized_path_keeps_every_member_alone_on_its_cpu() {
     use std::time::Instant;
     let _w = watchdog();
     let set = own_cpus();
@@ -624,22 +626,15 @@ fn the_reported_wide_fork_sized_path_homes_the_leader_once_per_call() {
         eprintln!("skipped: need at least 3 allowed CPUs");
         return;
     }
-    // #33 ran at width 96; take as many CPUs as this machine gives, up to that.
     let width = set.len().min(96);
     let pool = builder(width, true).build().unwrap();
-    // The reporter's setup: a team from `into_team` and nothing but plain team
-    // tokens afterwards, no root scope.
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
     let before = own_cpus();
     let calls = 40;
-    let moves0 = team.pool().leader_moves().0;
     let mut on_home = 0;
     let mut latest_us = Vec::with_capacity(calls);
     for call in 0..calls {
-        // Serial work between calls lets the scheduler move the leader; make
-        // that certain, so each call has exactly one placement to make.
-        drag(set[1], &before);
         let t0 = Instant::now();
         if call % 2 == 0 {
             // Flat: one section of `width` one-slot shares.
@@ -667,29 +662,15 @@ fn the_reported_wide_fork_sized_path_homes_the_leader_once_per_call() {
             latest_us.push(t0.elapsed().as_micros());
         }
     }
-    let moves = team.pool().leader_moves().0 - moves0;
     latest_us.sort_unstable();
     eprintln!(
-        "width {width}: {moves} leader moves in {calls} calls; call time median {} us, max {} us; \
-         leader on S[0] in {on_home} of {} flat calls",
+        "width {width}: call time median {} us, max {} us; \
+         leader on S[0] in {on_home} of {} flat calls (not asserted)",
         latest_us[calls / 2],
         latest_us[calls - 1],
         calls / 2
     );
-    // One move per call: the first section of each call finds the leader off
-    // home; its nested sections find it home, and member-led ones never move.
-    assert!(
-        moves >= calls as u64 * 3 / 4 && moves <= calls as u64 * 5 / 4,
-        "{moves} leader moves in {calls} calls"
-    );
-    // The slow mode of #33 is the leader sharing a member's CPU: in every flat
-    // call each member ran alone on its own CPU (asserted above) and the
-    // leader ran on S[0], the one CPU no member holds.
-    assert!(
-        on_home >= calls / 2 * 9 / 10,
-        "the leader ran on S[0] in {on_home} of {} flat calls",
-        calls / 2
-    );
+    assert_eq!(own_cpus(), before, "the caller's mask afterwards");
     assert_eq!(team.pool().pin_skips(), 0);
 }
 

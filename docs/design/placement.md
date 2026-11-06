@@ -538,9 +538,9 @@ tensor4all/faer#107: `qr_factor` f64 512 at 16 threads on
 | B, width 15 on the same 16 CPUs (one spare CPU) | 7 / 20 | 91 % in the slow half | 196 / 757 us |
 | C, width 16, every participant pinned to CPUs 48-63 | **0 / 20** | **0 %** | 218 us |
 
-Arm C pinned the leader too; `threadteam` pins only the members and leaves the
-leader on the caller's whole set (the rule below), which relaxes the placement of
-participant 0 only.
+Arm C pinned the leader too, as `threadteam` now does (the rule below). An
+earlier version of the crate pinned only the members and kept the leader's mask
+whole; that is the history told after the evo2 table.
 
 12.4 ms is the one-thread time of the call, so the slow mode is the members'
 work not overlapping: they are alive, unparked and receiving the same shares,
@@ -556,22 +556,81 @@ per cell):
 | arm | stalled cells | leader on a member's CPU (8 threads) |
 | --- | --- | --- |
 | A, unpinned | stalls at 11 and 14 threads (3 ms scheduler slices, one per wake of a parked member on a busy CPU) | n/a |
-| B, every participant pinned, the leader to `S[0]` | 0 of 12 | n/a |
+| B, every participant pinned, the leader to `S[0]` for the scope (**the rule now implemented**) | 0 of 12 | n/a |
 | C, members pinned to `S[k]`, leader left where it was (0.3.0's rule) | catastrophic at 8 threads: LU 512 in 231 ms against 0.9 ms | 74-94 % of samples |
-| C3, as C plus the leader nudged onto `S[0]` at scope entry, its mask left whole (n <= 1024 only) | **0 of 12, equal to B** | **1.5 %** |
+| C3, as C plus the leader nudged onto `S[0]` at scope entry, its mask left whole (n <= 1024 only; the nudge, removed in this change) | **0 of 12, equal to B** | **1.5 %** |
 
 0.3.0 pinned only the members and left the leader free: the scheduler then put
 the leader on a pinned member's CPU most of the time, and the two shared it for
-whole slices. C3 fixed that for short scopes only. At n = 4096 (LU f64, T = 4-8,
-one root scope over many calls with about 50 ms of serial leader work between
-them) the leader drifted back onto a member's CPU after the first serial gap:
-90 % of the samples showed leader and member runnable on one CPU, only 1 % had
-the leader on `S[0]`, and the calls ran 5-38x slower than unpinned. The crate
-therefore places the leader on `S[0]` immediately before **every section**,
-not once per scope: measured 106.3 ms against 107.1 unpinned and 107.1 with the
-leader pinned for the whole scope. The leader still keeps all of `S` as its
-mask between sections, for the vendor teams it creates; the mask is what it
-keeps, and the position is what is set, at each dispatch and free in between.
+whole slices. C3 fixed that for short scopes only (and B and C3 were equal
+there). At n = 4096 (LU f64, T = 4-8, one root scope over many calls with about
+50 ms of serial leader work between them) a leader that was placed once and kept
+its whole mask drifted back onto a member's CPU after the first serial gap: 90 %
+of the samples showed leader and member runnable on one CPU, only 1 % had the
+leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
+
+**The rule: the leader is pinned to `S[0]` for the life of the team scope.** One
+`sched_setaffinity` at scope entry, one at scope exit (a guard, so also on
+unwind), and nothing in between: no per-section check, no move and restore
+around a dispatch. Members keep `S[k]`, `k >= 1`. Arm B above is this rule.
+
+The crate used to do something cleverer: it placed the leader on `S[0]`
+immediately before **every section** and handed its whole mask back at once, so
+that the leader could call vendor libraries between sections and a section
+always opened with the leader home (the nudge, `Awake::place_leader`, with a
+`sched_getcpu` check per dispatch). Measured at n = 4096 that was 106.3 ms per
+call against 107.1 unpinned and 107.1 with the leader pinned for the whole
+scope. The two ways of keeping the leader home were therefore not told apart by
+that measurement (about 0.8 ms in 107, and it was not repeated to learn the run
+to run spread), and for short scopes B and C3 were equal. The nudge is removed
+because the pin is simpler, not because it was shown faster or slower; no
+measurement here favours it. It was not re-measured on evo2 for this change (a
+campaign is running there). The vendor-call half of the reason the nudge existed
+is answered by the widening call below; the drift half is answered only inside
+a scope (see "What this rule gives up" below).
+
+#### Widening the leader for a vendor call: `TeamExec::external`
+
+A leader pinned to one CPU confines any vendor thread team it creates
+(OpenMP, OpenBLAS, a LAPACK provider all build their team from the calling
+thread; `tenferro-rs` `PERFORMANCE_TIPS.md`: 3-20x slower `dgemm` and LU at 4
+threads). So the leader's vendor call goes through `TeamExec::external(f)`,
+named after `Exec::external` because the two are halves of one rule: the
+**member** path (`Exec::external`) lends the members and restores the member's
+own mask; the **leader** path (`TeamExec::external`) sets the leader's mask to
+`S` for the duration of `f` and puts `{S[0]}` back when `f` returns.
+
+* **Cost, paid per call.** Two `sched_setaffinity` calls every call, inside
+  whatever the caller times. Nothing is amortised and nothing caches "already
+  wide". Measured on broccoli (EPYC 7702P, release build, empty closure, 200 000
+  calls, once on CPUs 8-15 and once on 32-39): mean **2.30 us**, median 2.26 us,
+  p99 2.85 us, max 20-28 us, against 0.05 us for the timer alone. This is the
+  cost of the syscalls with an idle machine; it is not a measurement of a vendor
+  call and does not include what the kernel does when the vendor threads start
+  on the widened mask. One call around the whole vendor region is cheaper than
+  one per vendor call.
+* **The restore is not skipped**, including when `f` panics (a drop guard).
+* **A refused syscall leaves the thread as it was.** A refused widening leaves
+  the leader on `{S[0]}`, `f` still runs (narrowed) and no restore is made,
+  because nothing changed. A refused restore (a cpuset that shrank) leaves the
+  leader wide until the scope ends, when the exit guard sets `S` again.
+* **Where nothing was placed** (pinning off, a team of one, `|S|` smaller than
+  the team, a non-Linux target, a thread that does not lead a placed scope) it
+  is a plain call to `f`.
+* **The default path takes no vendor call** and so pays nothing: a scope that
+  only runs sections has the leader on `S[0]` from entry to exit.
+* **The members are not lent.** They stay reserved on `S[1..]`, so the vendor
+  team may share those CPUs with them; to lend the members to Rayon use
+  `Exec::external` on a token, not the leader path.
+
+The check for a section dispatched while the leader is wide **is not
+implemented, because it cannot happen**: `external` takes `&mut self`, so the
+closure cannot reach the team, and a `compile_fail` doctest asserts it. Nothing
+runs before a section, which is the costless version of the check. (A different
+token's section dispatched from inside the closure is another scope's, and its
+leader was not placed by this one.) If `TeamExec` ever offers a way to reach the
+team from the closure, the leader must place itself back on `S[0]` before the
+shares start, and that dispatch needs a check.
 
 #### Why it is on by default
 
@@ -580,11 +639,11 @@ and one holds with a bound:
 
 * *It fights the caller's `taskset`.* It does not: every participant is placed
   inside the calling thread's own mask `S`, never outside it, and the leader's
-  mask is `S` again as soon as the scope has opened.
+  mask is `S` again when the scope has closed (it is `{S[0]}` while it is open).
 * *It confines a vendor thread team a member creates.* That is the
   `Exec::external` path, which restores a member's own mask before the vendor
-  call; and the leader, the thread engines call vendor libraries from, is never
-  narrowed.
+  call; and the leader, the thread engines call vendor libraries from, is widened
+  to `S` for that call by `TeamExec::external` (above), at two syscalls per call.
 * *It takes CPUs away from other users of the process.* It can: a placed member
   owns its CPU of `S` while the scope runs. It never takes a CPU outside `S`,
   and a set too small for the team places nobody (below). A pool that shares
@@ -603,17 +662,9 @@ How it works:
   sub-team) — the leader reads **its own** mask `S` with
   `sched_getaffinity(0, ...)` and runs one pin section through the ordinary
   section machinery (it also serves as the rendezvous, replacing
-  `acknowledge`). `S[0]` becomes the *home* CPU of the leader while the
-  members are placed on `S[1..]` (see "Where the leader's home lives" for the
-  one exception, lending), and immediately before every section dispatched
-  under that placement (the pin section first) the leader places itself there: when `sched_getcpu()` does not
-  report `S[0]` it moves with `sched_setaffinity(0, {S[0]})` and gives itself
-  `S` back with a second call at once. In steady state the check is the whole
-  cost; a section is only dispatched once the caller's cost rule admitted the
-  region, so the placement adds no threshold of its own. A thread whose mask is
-  one CPU (a pinned member leading a child section), or whose mask does not
-  contain the home (a team token used from a thread with another CPU set), is
-  never moved. Member `k` (participant `k >= 1`)
+  `acknowledge`). The leader pins itself to `S[0]` with `sched_setaffinity(0, {S[0]})`
+  before the pin section and keeps it for the scope; a guard gives it `S` back
+  when the scope ends or unwinds. Nested scopes on one thread stack. Member `k` (participant `k >= 1`)
   pins itself with `sched_setaffinity(0, ...)` onto the `k`-th set CPU of `S`,
   so the members take `S` minus `S[0]`. A team of one is left alone.
 * **Nothing wraps.** When `|S|` is smaller than the number of participants the
@@ -627,20 +678,13 @@ How it works:
   team runs with the scheduler's placement, and the counter makes that visible
   instead of silent. Such a scope is exactly an *oversubscribed* one, so its
   waits are already throttled.
-* **The leader is never pinned**: after each placement its mask is what it was,
-  and only its *position* was set, onto `S[0]`, immediately before the section
-  about to be dispatched. Between sections it runs anywhere in `S`; the mask is
-  what a vendor team inherits, and the mask is what is kept. A
-  vendor library (an
-  OpenMP or OpenBLAS runtime, a LAPACK provider) builds its thread team from the
-  thread that calls it, and a team built from a one-CPU thread silently confines
-  the whole provider team to that CPU (`tenferro-rs` `PERFORMANCE_TIPS.md`: 3-20x
-  slower `dgemm` and LU at 4 threads); engines call such libraries from the
-  coordinating thread, so that thread keeps its CPU set. Consequently a **pinned
-  member must not build a foreign thread team directly inside a share**: it
-  would confine that library to its one CPU. Route the call through
-  `Exec::external`, which restores the member's own mask first, or turn pinning
-  off for that pool.
+* **The leader is pinned to `S[0]` for the scope, and widened for vendor
+  calls.** Consequently a **pinned member must not build a foreign thread team
+  directly inside a share** (it would confine that library to its one CPU), and
+  neither must the leader outside `TeamExec::external`. A member routes the call
+  through `Exec::external`, which restores the member's own mask first; the
+  leader through `TeamExec::external` (above); or pinning is turned off for that
+  pool.
 * **Every affinity change is made by the thread itself.** A member
   saves its previous mask in its own slot (an `UnsafeCell<cpu_set_t>` plus a
   flag that only the member thread of that slot touches) the first time it is
@@ -655,13 +699,10 @@ How it works:
   leader.
 * **Best effort.** A refused syscall (a kernel mask larger than `cpu_set_t`, a
   cpuset that changed under us) leaves that thread as it was; an empty mask pins
-  nobody; a failed pin or restore never fails the scope. If the kernel accepts
-  the leader's move onto `S[0]` but refuses `S` back (only possible when the
-  cpuset shrank between the two calls), the leader stays on `S[0]`: the mask a
-  refused restore leaves is the single CPU the move installed,
-  `sched_getaffinity` reports that same mask, and nothing here can discover the
-  wider permitted set, so the leader is left on one CPU until the scope ends.
-  That is a limit of the syscalls used, not a promise this code keeps.
+  nobody; a failed pin or restore never fails the scope. If the kernel
+  refuses the leader's pin the leader keeps `S` and the members are still
+  placed; a refused restore at scope exit leaves it on `S[0]`, the mask it
+  already had (`TeamExec::external` has the same rule for its two calls).
 * **Linux only.** Other targets accept the option and do nothing. No libc type
   appears in the public API; the masks are stack `cpu_set_t` values and the
   `k`-th set CPU is found by scanning one, so the path allocates nothing
@@ -672,69 +713,66 @@ How it works:
   own CPU set with `taskset -c`; there is no CPU allocator in this crate and none
   is planned for this fix. Overlapping teams and pools of one process stay
   caller-managed.
-* Only the members of a team are pinned. A token of a `Team` that never opens a
-  team scope (`exec.for_ranges(...)` directly) is not re-pinned; its members
-  keep the placement of the last root scope, or of `Pool::into_team`, and its
-  leader is placed on that placement's home before every section it
-  dispatches, exactly as inside the scope.
+* The members' placement is the team's; the leader's pin is the scope's. A
+  token of a `Team` that never opens a team scope (`exec.for_ranges(...)`,
+  `fork_sized`, directly) is not re-pinned: its members keep the placement of
+  the last whole-team root scope, or of `Pool::into_team`, and **its leader is
+  not placed at all** (see "Where the placement lives" for the cost of that).
 
-#### Where the leader's home lives
+#### Where the placement lives
 
-The home lives where the members' pins are owned and is set and cleared by the
-same sections that pin and unpin them (tensor4all/threadteam-rs#33). It
-describes every member under that authority at once, which gives the rules
-below; lending is the one case where the two lifetimes differ.
+The members' pins are owned by the authority over them and set and cleared by
+the sections that pin and unpin them; the leader's pin is not part of that
+placement, it belongs to one root scope and is held by a guard in that scope's
+frame.
 
 * **Scoped acquisition** (`Exec::team` on a plain token): the members are
   reserved, and pinned, for the scope only; they restore their masks when the
-  reservation ends. The home is a field of the scope's `TeamExec`, copied into
-  its reborrows, splits, `fork` children and sections, and ends with it.
+  reservation ends, and the leader gets `S` back at the same moment.
 * **Persistent `Team`** (`Pool::into_team`): the members stay reserved, and
   pinned, from the pin section of a root scope (the first one is the
   acknowledgement scope of `into_team`) until an unpin section or the end of
-  the `Team`. The home is an atomic on the `Team`; every token minted from it
-  carries a reference, and `fork`, `fork_sized`, `for_ranges`, `broadcast` and
-  the carried `team` read it when they dispatch, inside a root scope or not. A
-  pin section stores the new `S[0]`; an unpin section stores "none"; a scope
-  that runs neither (pinning off, an unreadable mask) leaves it, because it
-  leaves the pins too.
-* **Only a root scope over the whole team changes the placement.** The home is
-  one value for every reserved member, while a root token from
-  `Team::exec(budget)` with a smaller budget (or narrowed by `limit`) carries
-  only the first `budget - 1` members. Letting it pin or unpin that prefix
-  would leave the home describing members it did not touch: an unpin from a
-  one-CPU caller would clear the home while the suffix stays pinned (the
-  #33 defect again for full-width sections), and a pin from another mask
-  could make the home a CPU an untouched member holds (every full-width
-  section would then nudge the leader onto that member). So a narrower root
-  scope runs no pin or unpin section, is not counted in `pin_skips`, and
-  dispatches under the team's current placement and home like any plain team
-  token; its oversubscription and the members' spin budget are still decided
-  from its caller's mask. A team that wants a new placement opens a root scope
-  with its whole budget.
+  the `Team`. The leader is pinned to `S[0]` during each such root scope and
+  has `S` again when it closes, so between scopes, and in any section a plain
+  token of the team dispatches, the leader runs wherever the scheduler puts it.
+* **Only a root scope over the whole team changes the placement.** A root
+  token from `Team::exec(budget)` with a smaller budget (or narrowed by
+  `limit`) carries only the first `budget - 1` members. Letting it pin or unpin
+  that prefix would leave the suffix as it was, and a pin from another mask
+  could put the leader on a CPU an untouched member holds. So a narrower root
+  scope runs no pin or unpin section, pins no leader, is not counted in
+  `pin_skips`, and dispatches under the team's current placement like any plain
+  team token; its oversubscription and the members' spin budget are still
+  decided from its caller's mask. A team that wants a new placement opens a
+  root scope with its whole budget.
 * **Lending is the exception.** `Exec::external` lends the token's members to
   the pool for the call; each restores its own mask before it serves Rayon
   work and is re-pinned only at the next pin section, that is at the next
-  whole-team root scope. The home is kept meanwhile. For a team used only
-  through plain tokens after an `external` call, the lent members therefore
-  stay unpinned while the leader is still placed on `S[0]` before each
-  section: `S[0]` is still a CPU no *pinned* member holds, but an unpinned
-  member may run there too. Lending is not changed here. Only the root scope of the token that holds the team's
-  gate writes it, so the gate orders it between leaders, and a member that
-  leads a `fork` child reads it after the section that handed it the child.
-* The pool has no home. In 0.4.0 the home was one pool-wide atomic, set at
-  root-scope entry and cleared at its exit; a `Team` whose sections ran through
-  plain tokens therefore had pinned members and no home, so its leader was left
-  to the scheduler and could share a member's CPU (#33: at width 96 on a
-  two-socket Xeon, about 40 % of processes at ~11 ms per call instead of
-  ~5.8 ms). Keeping that atomic set past the scope instead would have nudged
-  the caller of any other token of the pool, or of a second scope on it, onto
-  the team's CPU; a home carried by the authority over the placed members
-  cannot reach a token that has none.
+  whole-team root scope.
 
-`Pool::leader_moves` counts every move made by `place_leader`, whichever
-token's section made it, and `Pool::pin_skips` counts every root scope that
-could not be placed, as before.
+**What this rule gives up (tensor4all/threadteam-rs#33).** The earlier code
+kept a *home* for the leader on the `Team` and nudged the leader onto it before
+every section of every token of the team, scope or not. That is what fixed the
+reported path, `into_team` followed by plain tokens (`fork_sized` at width 96:
+leader sharing a member's CPU, about 40 % of processes at ~11 ms per call
+instead of ~5.8 ms). Entry points that are not a `TeamExec` (`Exec::fork`,
+`fork_sized`, `fork_sized_slots`, `for_ranges`, `broadcast` on a team token)
+have no scope in which to hold a leader pin, so under the simplified rule that
+path has no leader placement again. Measured on broccoli (64 CPUs, otherwise
+idle, `fork_sized` at width 64 on a team from `into_team`, 40 calls, one run
+each of five): with the caller dragged onto `S[1]` between calls to imitate
+serial leader work, the median call is 12-16 ms and the leader is on `S[0]`
+in 0 of 20 flat calls; the per-section nudge on the preceding commit, same test,
+had the leader on `S[0]` in 20 of 20 flat calls and a median of about 0.15 ms
+in three of five runs and about 4 ms in the other two. Without the drag the
+leader stays where it started (on `S[0]` in 20 of 20) and the median is 0.13
+ms. Those numbers describe a 64-CPU idle machine, not the reporter's
+two-socket host, and were not repeated beyond five runs. A caller that wants
+the leader held on those paths needs a scope; `TeamExec` offers none of
+`fork_sized`, so the reported path itself is not covered.
+
+`Pool::pin_skips` counts every root scope that could not be placed, as before.
+The doc-hidden `Pool::leader_moves` counter belonged to the nudge and is gone.
 
 ### Waiting policy
 

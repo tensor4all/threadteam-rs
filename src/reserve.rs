@@ -19,12 +19,27 @@ struct Gate {
 
 /// Held by the root token of a [`Team`]; dropping the token hands the
 /// leadership to the next waiting thread.
-pub(crate) struct LeaderGuard<'t>(&'t Gate);
+pub(crate) struct LeaderGuard<'t> {
+    gate: &'t Gate,
+    pin: Option<&'t crate::pin::TeamPin>,
+}
+
+impl LeaderGuard<'_> {
+    /// The CPU set `S` the team placed its leader in, when the calling thread
+    /// is that leader (the thread that created the team).
+    pub(crate) fn placed_here(&self) -> Option<&crate::pin::CpuMask> {
+        self.pin.and_then(crate::pin::TeamPin::set_here)
+    }
+}
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
-        *self.0.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.0.free.notify_one();
+        *self
+            .gate
+            .owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.gate.free.notify_one();
     }
 }
 
@@ -39,6 +54,16 @@ impl Drop for LeaderGuard<'_> {
 /// * `fork` and `for_ranges` dispatch as team sections: no Rayon entry, no
 ///   wake-up, no allocation. Children of `fork` carry the sub-team of their
 ///   share, so nested forks stay on reserved members.
+/// * The thread that creates the team is its placed leader: with
+///   [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)
+///   on (Linux), and when its CPU set `S` has a CPU for every participant,
+///   it is pinned to `S[0]` from `into_team` until the team is dropped or
+///   turned back into its pool, and the members sit on `S[1..]`. Every token
+///   it mints therefore dispatches with each participant on its own CPU, with
+///   or without a team scope. One `sched_setaffinity` at each end; a vendor
+///   call from the leader goes through
+///   [`TeamExec::external`](crate::TeamExec::external). A token minted on
+///   another thread has an unplaced leader.
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
@@ -95,7 +120,9 @@ impl Drop for LeaderGuard<'_> {
 /// # Ok::<(), threadteam::Error>(())
 /// ```
 pub struct Team {
-    // Field order matters: the members are released before the pool is dropped.
+    // Field order matters: the leader gets its mask back and the members are
+    // released before the pool is dropped.
+    leader: Option<crate::pin::TeamPin>,
     reservation: Reservation,
     policy: WaitPolicy,
     gate: Gate,
@@ -202,7 +229,14 @@ impl Pool {
                 Ok(r) => r,
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),
             };
+        // The creating thread leads the team and is pinned to `S[0]` until the
+        // team ends (`pin::TeamPin`), before the acknowledgement scope below,
+        // which then runs under that pin and places the members on `S[1..]`.
+        let leader = (self.awake.pin && width > 1)
+            .then(|| crate::pin::TeamPin::enter(width))
+            .flatten();
         let team = Team {
+            leader,
             reservation,
             policy,
             gate: Gate {
@@ -230,8 +264,12 @@ impl Team {
     /// Releases the members and gives the pool back.
     pub fn into_pool(self) -> Pool {
         let Team {
-            reservation, pool, ..
+            leader,
+            reservation,
+            pool,
+            ..
         } = self;
+        drop(leader);
         drop(reservation);
         pool
     }
@@ -331,7 +369,11 @@ impl Team {
             over: oversubscribed,
             reserved: self.reservation.ids.len(),
         };
-        Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
+        let guard = LeaderGuard {
+            gate: &self.gate,
+            pin: self.leader.as_ref(),
+        };
+        Exec::from_team(&self.pool, auth, guard)
     }
 }
 

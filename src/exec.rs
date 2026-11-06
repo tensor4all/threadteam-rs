@@ -931,7 +931,9 @@ impl<'p> Exec<'p> {
     /// for that call). A scoped acquisition is placed for the scope; a root
     /// token of a [`Team`](crate::Team) with the whole team's budget places the
     /// team's members until a later such scope re-places or unpins them or the
-    /// `Team` ends, and pins its leader for the scope only. A root token of a
+    /// `Team` ends; on the thread that created the `Team`, the leader is pinned
+    /// by the team for its whole life, and the scope places the members in the
+    /// set the team pinned it in. A root token of a
     /// `Team` with a smaller budget changes no placement, pins no leader and
     /// runs under the team's current placement. A mask with fewer CPUs than
     /// participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
@@ -991,13 +993,19 @@ impl<'p> Exec<'p> {
             };
             // Only the root token minted by a `Team` opens a root scope; a
             // child, a reborrow or a sub-team re-pins nothing of its own.
-            if self._leader.is_some() {
+            if let Some(leader) = &self._leader {
+                // The set `S` the team pinned its leader in at `into_team`, if
+                // this thread is that leader: the scope places the team in `S`
+                // under that pin, since the thread's own mask is `{S[0]}` now.
+                // `S` had a CPU for every participant then.
+                let placed = leader.placed_here().copied();
                 // Root-scope entry, on the executing thread: the root pressure
                 // and the members' spin budget are decided by *this* thread's CPU
                 // set. A token minted on another thread (or another mask) is
                 // paced by the thread that enters the scope, exactly as its pin
                 // section is placed by that thread. Descendants inherit it.
-                let oversubscribed = crate::pin::oversubscribed(team.size().get());
+                let oversubscribed =
+                    placed.is_none() && crate::pin::oversubscribed(team.size().get());
                 team.over = oversubscribed;
                 if let Some(awake) = team.awake {
                     awake.set_spin_budget(team.ids, awake.spin_budget(oversubscribed));
@@ -1016,8 +1024,16 @@ impl<'p> Exec<'p> {
                 // dispatches under the team's current placement. A scope that
                 // ran no section (pinning off, no CPU set) leaves the placement
                 // as it was.
+                // A leader the team pinned stays pinned by the team; the scope
+                // only re-places the members.
                 let _pin = if t.ids.len() == t.reserved && team.size().get() > 1 {
-                    pin_scope(&mut team)
+                    match placed {
+                        Some(set) => {
+                            team.pin_section(&set);
+                            None
+                        }
+                        None => pin_scope(&mut team),
+                    }
                 } else {
                     None
                 };

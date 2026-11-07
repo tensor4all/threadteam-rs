@@ -5,18 +5,19 @@ All notable changes to `threadteam` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at
 0.5.0; earlier releases are not recorded here.
 
-## [Unreleased]
+## [0.5.1] - 2026-11-07
 
-### Fixed
-
-- **A `Team`'s tokens are no longer marked oversubscribed on the leader it
-  pinned** (#33). 0.5.0 pins the thread that creates a `Team` to `{S[0]}`;
-  `Team::exec` then measured oversubscription against that one-CPU mask, so
-  every token minted on the leader thread throttled its members' spin budget
-  to `THROTTLED_POLLS`, and `fork_sized` / `for_ranges` / `broadcast` reached
-  without a team scope carried that flag. Oversubscription on a placed leader
-  is now measured against the `S` it was placed in. A `Team` whose `S` has
-  fewer CPUs than participants is still paced.
+A `Team` created on 0.5.0 paced its own members by its leader's one-CPU mask.
+0.5.0 pins the thread that creates a `Team` to `{S[0]}` for the team's life,
+and `Team::exec` then decided oversubscription against that mask. So every team
+of two or more participants, whose mask `S` had a CPU for each participant and
+was therefore not oversubscribed, ran with its members' spin budget cut to
+`THROTTLED_POLLS`. The same flag was carried into `fork_sized`, `for_ranges` and
+`broadcast` reached without opening a team scope (#33). 0.5.1 decides this by
+the team's width instead: `Team::token` no longer consults the post-pin mask on
+the leader the team placed, and `pin::available` answers `|S|` on a leader this
+crate placed (#49). A `Team` whose `S` has fewer CPUs than participants is
+still paced. No public API changes, so this is a patch release.
 
 ## [0.5.0] - 2026-11-06
 

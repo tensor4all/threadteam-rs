@@ -5,7 +5,7 @@ All notable changes to `threadteam` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at
 0.5.0; earlier releases are not recorded here.
 
-## [0.5.1] - Unreleased
+## [0.5.1] - 2026-11-07
 
 A `Team` created on 0.5.0 paced its own members by its leader's one-CPU mask.
 0.5.0 pins the thread that creates a `Team` to `{S[0]}` for the team's life,

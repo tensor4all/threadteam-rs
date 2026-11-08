@@ -10,7 +10,10 @@ All notable changes to `threadteam` are recorded here. The format follows
 ### Added
 
 - `PinStrategy { Spread, Pack }`, `PoolBuilder::pin_strategy` and
-  `Pool::pin_strategy`. `Pack` is the 0.4-0.5 placement (`S[k]`). The reporter of #57 measured packed
+  `Pool::pin_strategy`. The enum is **closed**: adding a strategy later is a
+  minor bump, not a silent non-breaking addition, because it can change where a
+  team lands without the caller opting in. `Pack` is the 0.4-0.5 placement
+  (`S[k]`). The reporter of #57 measured packed
   against unpinned on a 4-node host: 39 against 52 µs warm, 190 against 121 µs
   on a fresh destination (their measurement; not reproduced here, no multi-node
   host in this fleet).

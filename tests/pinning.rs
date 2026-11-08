@@ -1724,8 +1724,8 @@ fn a_second_placement_in_the_same_scope_is_refused() {
 fn a_mask_that_left_the_placement_is_not_narrowed() {
     let _w = watchdog();
     let set = own_cpus();
-    if set.len() < 4 {
-        eprintln!("skipped: need at least 4 allowed CPUs");
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
         return;
     }
     let _restrict = match Restrict::to(&set[..2]) {
@@ -1752,7 +1752,7 @@ fn a_mask_that_left_the_placement_is_not_narrowed() {
             assert_eq!(own_cpus(), home, "the leader of the first scope");
             t.external(|| {
                 assert_eq!(own_cpus(), inner, "the recorded set inside external");
-                if !set_own_cpus(&set[..4]) {
+                if !set_own_cpus(&set[..3]) {
                     eprintln!("skipped: cannot widen the calling thread");
                     return;
                 }

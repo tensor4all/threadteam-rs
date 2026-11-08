@@ -4,18 +4,19 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is pinned to `S[0]` for the life of the scope**, and the
-//!   thread that created a `Team` for the life of the team ([`TeamPin`]),
-//!   which is what places a team token that never opens a scope. One
-//!   `sched_setaffinity` at scope entry ([`LeaderPin::enter`]) and one at scope
-//!   exit (its drop, which also runs on unwind) restore `S`; there is no check
-//!   and no move before a section. The price is that a vendor library creates
-//!   its thread team from the thread that calls it, and a team created from a
-//!   one-CPU thread silently confines the whole library team to that CPU
-//!   (tenferro-rs `PERFORMANCE_TIPS.md`). The leader's half of that rule is
-//!   [`widened`], behind `TeamExec::external`: it sets the mask to `S` for the
-//!   duration of one call and puts `{S[0]}` back when the call returns or
-//!   unwinds.
+//! * **The leader is pinned to `S[0]` for one section at a time**, never for
+//!   the life of a `Team`. One `sched_setaffinity` at scope entry
+//!   ([`LeaderPin::enter`]) and one at scope exit (its drop, which also runs on
+//!   unwind) restore `S`; a team token that dispatches a section without
+//!   opening a scope pins its leader for that section and no longer
+//!   ([`home_pin`], whose home is `S[0]` of the set the team recorded at
+//!   `into_team`). Between sections the thread keeps `S`, so a vendor library
+//!   that creates its thread team from the thread that calls it, or a plain
+//!   thread started there, does not inherit a one-CPU mask (tenferro-rs
+//!   `PERFORMANCE_TIPS.md`). Inside a section, or a scope, the leader's half of
+//!   that rule is [`widened`], behind `TeamExec::external`: it sets the mask to
+//!   `S` for the duration of one call and puts `{S[0]}` back when the call
+//!   returns or unwinds.
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
@@ -49,18 +50,22 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, CpuMask};
 
 /// Number of CPUs the calling thread's team is spread over: the CPUs a root
 /// team scope entered on this thread may place its participants on.
 ///
 /// This is *not* "CPUs in the calling thread's current affinity mask" once
-/// this crate has placed the thread. A placed leader (a [`LeaderPin`], which a
-/// [`TeamPin`] holds for the life of a `Team`) runs on the one CPU `{S[0]}`,
-/// but it still leads a team spread over `S`, so the answer is `|S|`, read
-/// from the placement this thread records. Answering 1 there marked every
-/// token a `Team` mints on its own leader thread as oversubscribed and
-/// throttled its members' waits (threadteam-rs#33).
+/// this crate has placed the thread. A placed leader (a [`LeaderPin`], held by
+/// a team scope or by one section of a [`Team`](crate::Team) token) runs on the
+/// one CPU `{S[0]}`, but it still leads a team spread over `S`, so the answer
+/// is `|S|`, read from the placement this thread records. Answering 1 there
+/// marked every token a `Team` mints on its own leader thread as oversubscribed
+/// and throttled its members' waits (threadteam-rs#33).
+///
+/// Between sections, and on the thread that called `Pool::into_team`, nothing
+/// is placed and the mask itself is the answer, which for that thread is the
+/// same `S`.
 ///
 /// On any other Linux thread it is the number of CPUs in its affinity mask,
 /// i.e. the same set the pin section places participants on. Elsewhere
@@ -158,57 +163,42 @@ impl Drop for LeaderPin {
     }
 }
 
-/// The thread that created a [`Team`](crate::Team) (`Pool::into_team*`), its
-/// leader, pinned to `S[0]` for the life of the team.
+/// The placement a [`Team`](crate::Team) holds: `0` when its members are not
+/// placed, otherwise the CPU no member takes plus one.
 ///
-/// A root scope's pin ends with the scope, and `into_team` opens one only to
-/// acknowledge, so a team driven by tokens that never open a scope
-/// (`fork_sized`, `for_ranges`, `broadcast`) would dispatch with its members on
-/// `S[1..]` and its leader on its whole mask. The team holds this pin instead:
-/// one `sched_setaffinity` when the team is created, one when it is dropped or
-/// turned back into its pool, nothing per token or per section. A root scope
-/// opened on this thread runs under this pin and places the members in this
-/// `S` instead of reading the (now one-CPU) mask. `TeamExec::external` is the
-/// only call that widens it, for the duration of one call.
-///
-/// The pin belongs to the creating thread. A `Team` is `Send` and `Sync`: a
-/// token minted on another thread dispatches from a leader that is not placed,
-/// and a team dropped on another thread restores nothing (that thread was not
-/// moved), so the creating thread keeps `{S[0]}`.
-pub(crate) struct TeamPin {
-    pin: core::mem::ManuallyDrop<LeaderPin>,
-    thread: std::thread::ThreadId,
+/// The `Team` stores one of these, and every root scope over its whole budget
+/// writes it: `nth(set, 0) + 1` of the set the scope placed the members in, or
+/// `0` when the scope placed nobody. A token reads it before each section it
+/// dispatches without a scope, and each scope it opens as a reborrow, so the
+/// leader goes home to the CPU the members of *that* placement left free.
+pub(crate) type Home = usize;
+
+/// The [`Home`] of a set: its first CPU plus one.
+pub(crate) fn home_of(set: &CpuMask) -> Home {
+    nth(set, 0).map_or(0, |cpu| cpu + 1)
 }
 
-impl TeamPin {
-    /// Pins the calling thread onto `S[0]` of its own mask `S` when `S` has a
-    /// CPU for each of the `participants`; `None` (and nothing changed) when
-    /// it has not, off Linux, or when the kernel refuses.
-    pub(crate) fn enter(participants: usize) -> Option<TeamPin> {
-        let set = read_here()?;
-        if count(&set) < participants {
-            return None;
-        }
-        let pin = LeaderPin::enter(&set, nth(&set, 0)?)?;
-        Some(TeamPin {
-            pin: core::mem::ManuallyDrop::new(pin),
-            thread: std::thread::current().id(),
-        })
+/// Pins the calling thread onto `home` for one section or scope and gives it its
+/// own mask `S` back when the returned guard drops (also on unwind).
+///
+/// The leader of a [`Team`](crate::Team) token calls this before every section
+/// it dispatches without opening a team scope: it then opens the section on the
+/// one CPU no member takes, and is not confined to it afterwards. `None`, and
+/// nothing changed, when the team placed nothing (`home` is `0`), when this
+/// thread is already pinned by an enclosing scope or section, when its own mask
+/// is one CPU (a pinned member whose CPU it must keep) or does not hold `home`
+/// (a caller that narrowed itself away from it: a leader is never moved outside
+/// the mask its caller gave it), or when the kernel refuses.
+pub(crate) fn home_pin(home: Home) -> Option<LeaderPin> {
+    let home = home.checked_sub(1)?;
+    if PLACED.with(|p| p.get()).is_some() {
+        return None;
     }
-
-    /// `S`, when the calling thread is the one this team pinned.
-    pub(crate) fn set_here(&self) -> Option<&CpuMask> {
-        (std::thread::current().id() == self.thread).then_some(&self.pin.wide)
+    let here = read_here()?;
+    if count(&here) < 2 || !contains(&here, home) {
+        return None;
     }
-}
-
-impl Drop for TeamPin {
-    fn drop(&mut self) {
-        if std::thread::current().id() == self.thread {
-            // SAFETY: dropped once, here, and never used afterwards.
-            unsafe { core::mem::ManuallyDrop::drop(&mut self.pin) };
-        }
-    }
+    LeaderPin::enter(&here, home)
 }
 
 /// Runs `f` with the calling thread's mask widened to `S` when it leads a
@@ -350,6 +340,15 @@ mod sys {
         }
     }
 
+    /// Whether `cpu` is in the set.
+    pub(crate) fn contains(mask: &CpuMask, cpu: usize) -> bool {
+        if cpu >= SETSIZE {
+            return false;
+        }
+        // SAFETY: reads one bit of a valid set.
+        unsafe { libc::CPU_ISSET(cpu, &mask.set) }
+    }
+
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -394,6 +393,10 @@ mod sys {
     }
 
     pub(crate) fn set_here_to(_cpu: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn contains(_mask: &CpuMask, _cpu: usize) -> bool {
         false
     }
 

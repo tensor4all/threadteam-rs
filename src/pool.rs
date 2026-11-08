@@ -677,7 +677,8 @@ impl PoolBuilder {
     /// 1.7 ms on one thread), so a team that cannot be placed is not placed
     /// badly.
     ///
-    /// **The leader is pinned, and widened for vendor calls.** A vendor library
+    /// **The leader is pinned for a scope or a section, and widened for vendor
+    /// calls.** A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
@@ -688,6 +689,9 @@ impl PoolBuilder {
     /// region; a refused syscall leaves the thread as it was). A member that
     /// makes such a call uses [`Exec::external`](crate::Exec::external), which
     /// restores the member's own mask. A scope with no vendor call pays nothing.
+    /// A leader outside a scope and between the sections of a
+    /// [`Team`](crate::Team) token has its whole mask, so a vendor call there
+    /// needs no widening.
     ///
     /// A member saves its previous mask in its own slot and restores it
     /// *itself* before it stops being reserved: before it returns to Rayon, and
@@ -736,18 +740,18 @@ impl PoolBuilder {
     ///   mask first, or turn this option off.
     /// * The members' placement is the team's and outlives a scope; the
     ///   leader's pin is the scope's. A token of a [`Team`](crate::Team) that
-    ///   never opens a team scope (`exec.for_ranges(...)` directly) is not
-    ///   re-pinned: its members keep the placement of the last whole-team root
-    ///   scope (or of `Pool::into_team`), and **its leader is not placed at
-    ///   all**, so between and during such sections it may run on a member's
-    ///   CPU. Open a team scope to get the leader on `S[0]`. The placement
-    ///   is changed only by a root scope of a token with the whole team's
-    ///   budget: it lasts until such a scope re-places the members, or cannot
-    ///   place them and unpins them, or the `Team` ends. A root scope of a
-    ///   narrower token runs under the team's current placement, changes
-    ///   nothing and pins no leader. One exception: members lent by
-    ///   [`Exec::external`](crate::Exec::external) restore their own masks and
-    ///   are not re-pinned until the next whole-team root scope.
+    ///   never opens a team scope (`exec.for_ranges(...)` directly) does not
+    ///   re-pin the members: they keep the placement of the last whole-team
+    ///   root scope (or of `Pool::into_team`), and its leader is placed on the
+    ///   CPU that placement left free for each section it dispatches, and for
+    ///   nothing else. The placement is changed only by a root scope of a
+    ///   token with the whole team's budget: it lasts until such a scope
+    ///   re-places the members, or cannot place them and unpins them, or the
+    ///   `Team` ends. A root scope of a narrower token runs under the team's
+    ///   current placement and changes nothing about it, and its leader goes
+    ///   to that placement's home like any other when its own mask holds it. One exception: members lent
+    ///   by [`Exec::external`](crate::Exec::external) restore their own masks
+    ///   and are not re-pinned until the next whole-team root scope.
     ///
     /// # Why it is on by default
     ///

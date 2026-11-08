@@ -94,7 +94,8 @@ impl Participant<'_> {
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
 ///   the calling thread's set, and restores its own mask afterwards. The leader
-///   is pinned to the first CPU of that set for the scope, and widened to the
+///   is pinned to the first CPU of that set for the scope — for a section of a
+///   `Team` token that opens no scope, for that section — and widened to the
 ///   whole set for a vendor call by [`external`](Self::external).
 /// * A panic in any participant propagates to the leader after every
 ///   dispatched share has finished; the reservation is released.

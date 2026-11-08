@@ -7,6 +7,7 @@ use crate::policy::{WaitOverride, WaitPolicy};
 use crate::pool::Pool;
 use core::fmt;
 use core::num::NonZeroUsize;
+use core::sync::atomic::AtomicUsize;
 use core::time::Duration;
 use std::sync::{Condvar, Mutex, PoisonError};
 use std::thread::ThreadId;
@@ -19,27 +20,12 @@ struct Gate {
 
 /// Held by the root token of a [`Team`]; dropping the token hands the
 /// leadership to the next waiting thread.
-pub(crate) struct LeaderGuard<'t> {
-    gate: &'t Gate,
-    pin: Option<&'t crate::pin::TeamPin>,
-}
-
-impl LeaderGuard<'_> {
-    /// The CPU set `S` the team placed its leader in, when the calling thread
-    /// is that leader (the thread that created the team).
-    pub(crate) fn placed_here(&self) -> Option<&crate::pin::CpuMask> {
-        self.pin.and_then(crate::pin::TeamPin::set_here)
-    }
-}
+pub(crate) struct LeaderGuard<'t>(&'t Gate);
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
-        *self
-            .gate
-            .owner
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
-        self.gate.free.notify_one();
+        *self.0.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
+        self.0.free.notify_one();
     }
 }
 
@@ -54,16 +40,19 @@ impl Drop for LeaderGuard<'_> {
 /// * `fork` and `for_ranges` dispatch as team sections: no Rayon entry, no
 ///   wake-up, no allocation. Children of `fork` carry the sub-team of their
 ///   share, so nested forks stay on reserved members.
-/// * The thread that creates the team is its placed leader: with
+/// * The thread that creates the team leads it: with
 ///   [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)
 ///   on (Linux), and when its CPU set `S` has a CPU for every participant,
-///   it is pinned to `S[0]` from `into_team` until the team is dropped or
-///   turned back into its pool, and the members sit on `S[1..]`. Every token
-///   it mints therefore dispatches with each participant on its own CPU, with
-///   or without a team scope. One `sched_setaffinity` at each end; a vendor
-///   call from the leader goes through
-///   [`TeamExec::external`](crate::TeamExec::external). A token minted on
-///   another thread has an unplaced leader.
+///   every section a token of this thread dispatches without opening a scope
+///   (`fork`, `for_ranges`, `broadcast`) and every scope that is not the root
+///   token's own opens with the leader on `S[0]`, the CPU no member takes, and
+///   the leader has its own mask back when the section or scope ends.
+///   The members sit on `S[1..]` from the acknowledgement scope of
+///   `into_team` until the team is dropped, so each participant is on its own
+///   CPU. Nothing is pinned between sections: `into_team` returns with the
+///   calling thread's mask unchanged, and a vendor library or a plain thread
+///   started there inherits all of `S`. A token used on another thread places
+///   that thread the same way, inside its own mask.
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
@@ -120,9 +109,12 @@ impl Drop for LeaderGuard<'_> {
 /// # Ok::<(), threadteam::Error>(())
 /// ```
 pub struct Team {
-    // Field order matters: the leader gets its mask back and the members are
-    // released before the pool is dropped.
-    leader: Option<crate::pin::TeamPin>,
+    // Field order matters: the members are released before the pool is dropped.
+    /// The CPU no member takes (`pin::Home`), or `0` when the members are not
+    /// placed. Written by every root scope over the whole budget, read by the
+    /// sections and reborrowed scopes of the team's tokens. Holding it pins
+    /// nothing.
+    placement: AtomicUsize,
     reservation: Reservation,
     policy: WaitPolicy,
     gate: Gate,
@@ -229,14 +221,13 @@ impl Pool {
                 Ok(r) => r,
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),
             };
-        // The creating thread leads the team and is pinned to `S[0]` until the
-        // team ends (`pin::TeamPin`), before the acknowledgement scope below,
-        // which then runs under that pin and places the members on `S[1..]`.
-        let leader = (self.awake.pin && width > 1)
-            .then(|| crate::pin::TeamPin::enter(width))
-            .flatten();
+        // Nothing is pinned here. The acknowledgement scope below places the
+        // members on `S[1..]` and records `S[0]` in `placement`, so the sections
+        // a token dispatches afterwards put the leader on that one CPU and give
+        // it its own mask back (`pin::home_pin`), while the calling thread keeps
+        // its mask between sections.
         let team = Team {
-            leader,
+            placement: AtomicUsize::new(0),
             reservation,
             policy,
             gate: Gate {
@@ -264,12 +255,8 @@ impl Team {
     /// Releases the members and gives the pool back.
     pub fn into_pool(self) -> Pool {
         let Team {
-            leader,
-            reservation,
-            pool,
-            ..
+            reservation, pool, ..
         } = self;
-        drop(leader);
         drop(reservation);
         pool
     }
@@ -363,20 +350,9 @@ impl Team {
         // is oversubscribed. When it is, the members' waits get the throttled
         // spin budget; otherwise the pool's. `Exec::team_with` on the minted token repeats
         // this on the thread that enters each scope, so a token that travels to
-        // a thread with a different CPU set is paced by that set.
-        //
-        // On the thread this team placed, the mask is `{S[0]}` now, so the
-        // team's `S` decides instead, as in `Exec::team_with`: a token minted
-        // by its placed leader is paced by the team's width, and `S` had a CPU
-        // for every participant when the team was created (`TeamPin::enter`).
-        // `pin::available` answers `|S|` on that thread as well; this guard
-        // does not rely on it.
-        let placed = self
-            .leader
-            .as_ref()
-            .and_then(crate::pin::TeamPin::set_here)
-            .is_some();
-        let oversubscribed = !placed && crate::pin::oversubscribed(budget);
+        // a thread with a different CPU set is paced by that set. The leader is
+        // not pinned between sections, so its own mask is the set to measure.
+        let oversubscribed = crate::pin::oversubscribed(budget);
         self.pool
             .awake
             .set_spin_budget(ids, self.pool.awake.spin_budget(oversubscribed));
@@ -386,12 +362,11 @@ impl Team {
             policy: self.policy,
             over: oversubscribed,
             reserved: self.reservation.ids.len(),
+            // The team's placement, shared: a whole-team scope of this token
+            // may replace it, and every token reads it at dispatch.
+            placement: Some(&self.placement),
         };
-        let guard = LeaderGuard {
-            gate: &self.gate,
-            pin: self.leader.as_ref(),
-        };
-        Exec::from_team(&self.pool, auth, guard)
+        Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
     }
 }
 

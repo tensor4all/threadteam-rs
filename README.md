@@ -86,7 +86,10 @@ the token to kernels by value. Kernels never store a token and never mint one.
   never started implicitly.
 * **Placement by caller.** A worker of the target pool spawns into the current
   scope without installing; a plain thread or a worker of another pool enters the
-  target pool once and waits. No thread-local state exists in the crate.
+  target pool once and waits. The crate keeps no ambient thread-local state: the
+  one value it stores per thread is the placement record (`pin::PLACED`, a
+  non-allocating `Cell`), and nothing else is inherited by work that runs on the
+  calling thread.
 * **`broadcast`** refuses with `Refused::ForkChild` for a token derived from
   `fork` (through `reborrow` or `limit` too), and with `Refused::CallerInPool`
   when the caller is a worker of the same pool. Roots, and their `reborrow`s and

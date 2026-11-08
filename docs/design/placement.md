@@ -240,8 +240,9 @@ thread run one of its children, which is one of the tasks already counted.
 - **Already in the target pool**: spawn into the current scope, no install
   (cheap re-entry).
 - **Cross-pool or plain thread**: enter the pool once with `ThreadPool::install`
-  and wait. No thread-local state exists, so nothing is inherited by work that
-  runs on the waiting thread.
+  and wait. Nothing is inherited by work that runs on the waiting thread: the
+  crate's only thread-local is the placement record (`pin::PLACED`), which
+  describes that thread and is not consulted by the work it starts.
 - **External width**: `external` hands over the budget unchanged. A library
   that rounds or splits it does so itself (t4a-faer's `join_raw` splits a width
   into halves that add up to it).
@@ -573,9 +574,12 @@ leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
 for one section when a token of a `Team` dispatches one without opening a scope
 (see "A `Team`'s leader" below). One
 `sched_setaffinity` at scope entry (or at section entry), one at its exit (a
-guard, so also on unwind), and nothing in between: no per-section check, no
-move and restore around a dispatch inside a scope. Members keep `S[k]`,
-`k >= 1`. Arm B above is this rule for a scope.
+guard, so also on unwind), and nothing in between for a `TeamExec` dispatch: no
+per-section check, no move and restore around it. A *token* section dispatched
+inside the scope is the exception the next subsection describes: with a nonzero
+`home` it calls `home_pin`, which reads the mask and declines, so it pays the read
+and no write.
+Members keep `S[k]`, `k >= 1`. Arm B above is this rule for a scope.
 
 The crate used to do something cleverer: it placed the leader on `S[0]`
 immediately before **every section** and handed its whole mask back at once, so
@@ -630,8 +634,9 @@ The check for a section dispatched while the leader is wide **is not
 implemented, because it cannot happen**: `external` takes `&mut self`, so the
 closure cannot reach the team, and a `compile_fail` doctest asserts it. Nothing
 runs before a section, which is the costless version of the check. (A different
-token's section dispatched from inside the closure is another scope's, and its
-leader was not placed by this one.) If `TeamExec` ever offers a way to reach the
+token's section dispatched from inside the closure is another scope's, and it
+reads `S` back, so it is placed on its own team's home rather than on this one's
+— threadteam-rs#54.) If `TeamExec` ever offers a way to reach the
 team from the closure, the leader must place itself back on `S[0]` before the
 shares start, and that dispatch needs a check.
 
@@ -791,20 +796,38 @@ section. A team token the calling thread leads opens every section it dispatches
 outside a scope (`fork`, `fork_sized`, `for_ranges`, `broadcast`) with one
 `sched_setaffinity` onto `home` and one back to its own mask at the end of the
 section, also on unwind (`pin::home_pin`, a guard); a section inside a team
-scope is already covered by the scope's pin and skips it (the guard sees this
-thread's `PLACED`). So the leader is on `S[0]` while a section runs, which is
-what #33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls
-per outermost section (2.1 us on an empty 8-way section) and none for a section
-that runs inside a placed scope; the scope itself pays one pin (`LeaderPin` for a
+scope is already covered by the scope's pin and is not pinned again, because the
+mask this thread reads there is the one CPU it was placed on and a mask of one CPU
+is never narrowed. So the leader is on `S[0]` while a section runs, which is what
+#33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls per
+outermost section (2.1 us on an empty 8-way section). A token section
+(`Exec::fork`, `for_ranges`, `broadcast`, a reborrowed team scope) with a nonzero
+`home` inside a placed scope reads the mask and is refused by it, so it pays that
+one `sched_getaffinity` and no `sched_setaffinity`. The read is what buys the
+refusal, not a memory of the enclosing scope — and it comes after the `home`
+test, so a team whose placement is `0` (pinning off, or a scope that placed
+nobody) pays neither. A `TeamExec` section
+(`run`, `run_with`) dispatches without calling `home_pin` at all, so it pays no
+affinity call either way. A token section inside `TeamExec::external` reads `S`
+back and is pinned in full, on the nested team's home (threadteam-rs#54). The scope itself pays one pin (`LeaderPin` for a
 whole-team scope, `home_pin` for one that is narrower). The
 leader is placed for a scope that is not the root token's too (a reborrow, which
 carries no leader guard of its own: faer's `with_team` shape), and for a child
 that was handed out without a dispatch of its own (`fork_sized` with one share
-runs inline). Three things are never placed: a thread whose own mask has one CPU
-or does not hold `home` (a reserved member pinned to `S[k]`, a caller that
-narrowed itself away from `S[0]`; a leader is never moved outside the mask its
-caller gave it), a child that a member leads (its share was not given the
-leader's CPU), and a thread already pinned by an enclosing scope or section.
+runs inline). Three things are never placed by `home_pin`, which is what a token
+section or a reborrowed scope uses: a thread whose own mask has one CPU or does
+not hold `home` (a reserved member pinned to `S[k]`, a caller that narrowed
+itself away from `S[0]`; a leader is never moved outside the mask its caller gave
+it), a child that a member leads (its share was not given the leader's CPU), and a
+thread whose mask has left the placement it already has — a caller that widened
+itself out of `S` — which is refused rather than moved outside that placement.
+Being placed is not itself a reason to decline: a team scope entered inside
+`TeamExec::external` places this thread on the nested team's home and puts the
+enclosing placement back when it ends (threadteam-rs#54). A whole-team root scope
+is not described by this list either: it places through `pin_scope`, which reads
+the caller's mask as the scope's own set and enters `LeaderPin` with it, and then
+attempts `home_pin` (`src/exec.rs:1045`, `:1055`) — a no-op there, since the
+mask is already the one CPU the scope pinned, and it costs the read.
 
 Why not the `Team`-held pin of #45: it keeps the calling thread on `{S[0]}` for
 the life of the team, and the caller's thread is not ours. `tenferro`'s
@@ -877,9 +900,12 @@ caller that is not on `S[0]` dispatches with the leader on a member's CPU, which
 costs a scheduler slice per section (5.9 ms against 10 us). With the section
 pin the leader is home for every section, at **one `sched_getaffinity` and two
 `sched_setaffinity` calls per outermost section**: 1.6 us for the set/restore
-pair on this host, 2.1 us for the whole hook on an empty 8-way section. A
-section inside a team scope, or a nested one, pays nothing (the guard sees the
-enclosing pin).
+pair on this host, 2.1 us for the whole hook on an empty 8-way section. A token
+section with a nonzero `home` inside a team scope pays the `sched_getaffinity` and
+none of the writes, because the mask it reads has one CPU; a `TeamExec` section
+pays nothing, because it does not call `home_pin`; a section inside
+`TeamExec::external` pays the full
+pair again, because `external` hands `S` back (threadteam-rs#54).
 
 `Pool::pin_skips` counts every root scope that could not be placed, as before.
 The doc-hidden `Pool::leader_moves` counter belonged to the nudge and is gone.

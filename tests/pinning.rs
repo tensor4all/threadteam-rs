@@ -1522,3 +1522,256 @@ fn a_team_as_wide_as_the_mask_gives_every_participant_its_own_cpu() {
         })
         .expect("a root token from a plain thread");
 }
+
+/// A team scope entered inside `TeamExec::external` places the calling thread
+/// again, on the nested team's own home, and gives it the enclosing placement
+/// back when the nested scope ends (threadteam-rs#54).
+///
+/// Two independent pools: `a`'s scope places the leader on `S[0]`, `external`
+/// widens it back to `S` for the call, and `b`'s section inside that call must
+/// narrow it to `b`'s home instead of running wide.
+#[test]
+fn external_lets_a_nested_team_place_its_own_leader() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
+        return;
+    }
+    let _restrict = match Restrict::to(&set[..2]) {
+        Some(r) => r,
+        None => {
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
+            return;
+        }
+    };
+    let set = own_cpus();
+    let team_a = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let team_b = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let home = vec![set[0]];
+    let wide = own_cpus();
+    team_a
+        .exec(2)
+        .team(|mut t| {
+            assert_eq!(own_cpus(), home, "the leader of a at scope entry");
+            t.external(|| {
+                assert_eq!(own_cpus(), wide, "a's leader is wide inside external");
+                team_b
+                    .exec(2)
+                    .broadcast(|i| {
+                        if i == 0 {
+                            assert_eq!(
+                                own_cpus(),
+                                home,
+                                "b's leader runs on b's home, not on a's wide mask"
+                            );
+                        }
+                    })
+                    .expect("a root token from a plain thread");
+                assert_eq!(own_cpus(), wide, "the wide mask is back after b's section");
+            });
+            // The enclosing placement *record* has to survive the nested section
+            // too: `external` widens to `S` from that record, not from the mask,
+            // so a second call is what tells "the record came back" from "the
+            // mask was restored".
+            t.external(|| {
+                assert_eq!(
+                    own_cpus(),
+                    wide,
+                    "the enclosing placement is still recorded after b's section"
+                );
+            });
+            assert_eq!(own_cpus(), home, "a's leader is back on its own home");
+        })
+        .expect("a team token opens its scope");
+    assert_eq!(
+        own_cpus(),
+        wide,
+        "the caller keeps its mask after both scopes"
+    );
+}
+
+/// The same nesting one level deeper: `external` inside `external`, each level
+/// placing the calling thread on the home of the team whose section it runs.
+#[test]
+fn two_nested_externals_each_place_their_own_leader() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
+        return;
+    }
+    let _restrict = match Restrict::to(&set[..2]) {
+        Some(r) => r,
+        None => {
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
+            return;
+        }
+    };
+    let set = own_cpus();
+    let team_a = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let team_b = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let team_c = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let home = vec![set[0]];
+    let wide = own_cpus();
+    team_a
+        .exec(2)
+        .team(|mut ta| {
+            ta.external(|| {
+                assert_eq!(own_cpus(), wide, "level 1 is wide");
+                team_b
+                    .exec(2)
+                    .team(|mut tb| {
+                        assert_eq!(own_cpus(), home, "b's leader placed inside a's external");
+                        tb.external(|| {
+                            assert_eq!(own_cpus(), wide, "level 2 is wide");
+                            team_c
+                                .exec(2)
+                                .broadcast(|i| {
+                                    if i == 0 {
+                                        assert_eq!(
+                                            own_cpus(),
+                                            home,
+                                            "c's leader placed inside b's external"
+                                        );
+                                    }
+                                })
+                                .expect("a root token from a plain thread");
+                            assert_eq!(own_cpus(), wide, "level 2 is wide again");
+                        });
+                        assert_eq!(own_cpus(), home, "b's leader is back on its home");
+                    })
+                    .expect("a team token opens its scope");
+                assert_eq!(own_cpus(), wide, "level 1 is wide again");
+            });
+            assert_eq!(own_cpus(), home, "a's leader is back on its home");
+        })
+        .expect("a team token opens its scope");
+    assert_eq!(own_cpus(), wide, "the caller keeps its mask");
+}
+
+/// The protection on the other side still holds: a leader already confined to
+/// one CPU is not placed again inside the same scope.
+#[test]
+fn a_second_placement_in_the_same_scope_is_refused() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
+        return;
+    }
+    let _restrict = match Restrict::to(&set[..2]) {
+        Some(r) => r,
+        None => {
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
+            return;
+        }
+    };
+    let inner = own_cpus();
+    let team = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let nested = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let home = vec![inner[0]];
+    team.exec(2)
+        .team(|_t| {
+            assert_eq!(own_cpus(), home, "the leader of the first scope");
+            // (a) Same scope, no widening: the thread is already on the one CPU
+            // this placement gives it, so a second placement is refused and the
+            // nested section runs on that CPU.
+            nested
+                .exec(2)
+                .broadcast(|i| {
+                    if i == 0 {
+                        assert_eq!(own_cpus(), home, "no second placement inside the scope");
+                    }
+                })
+                .expect("a root token from a plain thread");
+            assert_eq!(own_cpus(), home, "the mask after the nested section");
+        })
+        .expect("a team token opens its scope");
+}
+
+/// A mask that has left the recorded placement is refused rather than narrowed:
+/// the leader is never moved outside the set its own placement was made in.
+#[test]
+fn a_mask_that_left_the_placement_is_not_narrowed() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let _restrict = match Restrict::to(&set[..2]) {
+        Some(r) => r,
+        None => {
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
+            return;
+        }
+    };
+    let inner = own_cpus();
+    let team = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let nested = builder(2, true)
+        .build()
+        .unwrap()
+        .into_team(2)
+        .expect("an idle pool");
+    let home = vec![inner[0]];
+    team.exec(2)
+        .team(|mut t| {
+            assert_eq!(own_cpus(), home, "the leader of the first scope");
+            t.external(|| {
+                assert_eq!(own_cpus(), inner, "the recorded set inside external");
+                if !set_own_cpus(&set[..3]) {
+                    eprintln!("skipped: cannot widen the calling thread");
+                    return;
+                }
+                let widened = own_cpus();
+                assert!(widened.len() > inner.len(), "{widened:?} vs {inner:?}");
+                nested
+                    .exec(2)
+                    .broadcast(|i| {
+                        if i == 0 {
+                            assert_eq!(
+                                own_cpus(),
+                                widened,
+                                "a mask outside the placement is refused, not narrowed"
+                            );
+                        }
+                    })
+                    .expect("a root token from a plain thread");
+                assert_eq!(own_cpus(), widened, "the widened mask is left alone");
+            });
+        })
+        .expect("a team token opens its scope");
+}

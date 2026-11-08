@@ -16,7 +16,11 @@
 //!   `PERFORMANCE_TIPS.md`). Inside a section, or a scope, the leader's half of
 //!   that rule is [`widened`], behind `TeamExec::external`: it sets the mask to
 //!   `S` for the duration of one call and puts `{S[0]}` back when the call
-//!   returns or unwinds.
+//!   returns or unwinds. A team scope entered inside that call places this
+//!   thread again, on the nested team's own home, and the placement before it
+//!   comes back when *its* scope ends ([`home_pin`]: a placed thread refuses a
+//!   mask that has left the placement, not every second placement), so two
+//!   independent pools nest (threadteam-rs#54).
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
@@ -50,7 +54,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, subset, CpuMask};
 
 /// Number of CPUs the calling thread's team is spread over: the CPUs a root
 /// team scope entered on this thread may place its participants on.
@@ -184,19 +188,32 @@ pub(crate) fn home_of(set: &CpuMask) -> Home {
 /// The leader of a [`Team`](crate::Team) token calls this before every section
 /// it dispatches without opening a team scope: it then opens the section on the
 /// one CPU no member takes, and is not confined to it afterwards. `None`, and
-/// nothing changed, when the team placed nothing (`home` is `0`), when this
-/// thread is already pinned by an enclosing scope or section, when its own mask
-/// is one CPU (a pinned member whose CPU it must keep) or does not hold `home`
-/// (a caller that narrowed itself away from it: a leader is never moved outside
-/// the mask its caller gave it), or when the kernel refuses.
+/// nothing changed, when the team placed nothing (`home` is `0`), when its own
+/// mask is one CPU (a pinned member whose CPU it must keep, and also a leader an
+/// enclosing placement already confined to one CPU) or does not hold `home` (a
+/// caller that narrowed itself away from it: a leader is never moved outside the
+/// mask its caller gave it), when the current mask has left the placement this
+/// thread already has (see below), or when the kernel refuses.
+///
+/// A thread this crate placed is *not* a reason to decline by itself. A placed
+/// leader runs on `{S[0]}`; [`widened`] puts `S` back for the duration of one
+/// `TeamExec::external` call, and a team scope entered inside that call must be
+/// able to place this thread again, on its own home (threadteam-rs#54). The
+/// placement that decides this is the one recorded when the thread was placed:
+/// narrowing into the nested team's home is allowed while the current mask still
+/// belongs to it (`here ⊆ placed.wide`). A mask that reaches outside that
+/// placement is a widening of the caller's own doing, and placing the thread
+/// there would move it out of the set its caller gave it, so it is refused.
 pub(crate) fn home_pin(home: Home) -> Option<LeaderPin> {
     let home = home.checked_sub(1)?;
-    if PLACED.with(|p| p.get()).is_some() {
-        return None;
-    }
     let here = read_here()?;
     if count(&here) < 2 || !contains(&here, home) {
         return None;
+    }
+    if let Some(placed) = PLACED.with(|p| p.get()) {
+        if !subset(&here, &placed.wide) {
+            return None;
+        }
     }
     LeaderPin::enter(&here, home)
 }
@@ -218,7 +235,9 @@ pub(crate) fn widened<R>(f: impl FnOnce() -> R) -> R {
         }
     }
     let placed = PLACED.with(|p| p.get());
-    let _restore = placed.and_then(|p| set_here(&p.wide).then_some(Restore(p.home)));
+    // `then`, not `then_some`: a refused widening must not even construct the
+    // guard, whose `Drop` would issue the restore this path promises not to make.
+    let _restore = placed.and_then(|p| set_here(&p.wide).then(|| Restore(p.home)));
     f()
 }
 
@@ -349,6 +368,14 @@ mod sys {
         unsafe { libc::CPU_ISSET(cpu, &mask.set) }
     }
 
+    /// Whether every CPU of `a` is also in `b`.
+    pub(crate) fn subset(a: &CpuMask, b: &CpuMask) -> bool {
+        (0..SETSIZE).all(|cpu| {
+            // SAFETY: reads one bit of each valid set.
+            !unsafe { libc::CPU_ISSET(cpu, &a.set) } || unsafe { libc::CPU_ISSET(cpu, &b.set) }
+        })
+    }
+
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -400,11 +427,65 @@ mod sys {
         false
     }
 
+    pub(crate) fn subset(_a: &CpuMask, _b: &CpuMask) -> bool {
+        false
+    }
+
     pub(crate) fn count(_mask: &CpuMask) -> usize {
         0
     }
 
     pub(crate) fn nth(_mask: &CpuMask, _k: usize) -> Option<usize> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal assertion in `tests/pinning.rs` sees the mask, and a placement
+    /// onto the CPU the thread is already on leaves the mask unchanged. What
+    /// separates "refused" from "placed again on the same CPU" is the recorded
+    /// placement `S`, which `available()` reports: a second placement would
+    /// replace `S` with the one-CPU mask the thread runs on and halve the answer.
+    #[test]
+    fn a_refused_second_placement_keeps_the_recorded_set() {
+        let Some(wide) = read_here() else {
+            return; // not Linux, or no affinity support: nothing to place
+        };
+        let width = count(&wide);
+        if width < 2 {
+            return; // one allowed CPU: the placement is skipped by design
+        }
+        let home = nth(&wide, 0).expect("a CPU in a non-empty mask");
+        // A refused pin is supported behaviour (`LeaderPin::enter` returns `None`
+        // and the scope places nobody), so this is a skip, not a failure.
+        let Some(first) = LeaderPin::enter(&wide, home) else {
+            eprintln!("skipped: the kernel refused to pin this thread");
+            return;
+        };
+        assert_eq!(
+            available(),
+            width,
+            "the recorded set is the one the scope started in"
+        );
+
+        assert!(
+            home_pin(home + 1).is_none(),
+            "a second placement in the same scope is refused"
+        );
+        assert_eq!(
+            available(),
+            width,
+            "the refused placement must not overwrite the recorded set"
+        );
+
+        drop(first);
+        assert_eq!(
+            available(),
+            width,
+            "the set comes back when the placement ends"
+        );
     }
 }

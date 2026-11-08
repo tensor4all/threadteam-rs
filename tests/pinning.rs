@@ -944,7 +944,7 @@ fn a_narrower_root_scope_that_cannot_be_placed_changes_nothing() {
 }
 
 #[test]
-fn a_narrower_root_scope_pins_no_leader_and_moves_no_member() {
+fn a_narrower_root_scope_whose_mask_excludes_home_pins_nothing() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 4 {
@@ -963,11 +963,54 @@ fn a_narrower_root_scope_pins_no_leader_and_moves_no_member() {
     };
     team.exec(2)
         .team(|_| {
-            assert_eq!(own_cpus(), cpus, "a narrower scope pins no leader");
+            assert_eq!(own_cpus(), cpus, "home is outside the caller's mask");
         })
         .expect("a team token opens its scope");
     drop(restore);
     assert_full_placement_kept(&team, &set);
+}
+
+/// threadteam-rs#53. A root scope narrower than its team places no members (the
+/// whole-team scope did), but its leader still belongs on the CPU that
+/// placement left for it, `S[0]`; left wide it ran on `S[1..]`, the CPUs its
+/// members are pinned to. The team's own token and a `reborrow` of it are the
+/// same path.
+#[test]
+fn a_narrower_root_scope_places_its_leader_on_the_teams_home() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let pool = builder(3, true).build().unwrap();
+    let team = pool.into_team(3).expect("an idle pool");
+    let leader_mask = |mut exec: Exec<'_>| {
+        let seen = Seen::default();
+        exec.team(|t| {
+            t.run_with(|p| {
+                if p.index() == 0 {
+                    seen.record(0);
+                }
+            })
+        })
+        .expect("a team token opens its scope");
+        assert_eq!(seen.take().len(), 1, "only the leader records");
+        seen.take()[0].1.clone()
+    };
+    assert_eq!(
+        leader_mask(team.exec(2)),
+        vec![set[0]],
+        "the leader's mask through the team's own token"
+    );
+    let mut exec = team.exec(2);
+    assert_eq!(
+        leader_mask(exec.reborrow()),
+        vec![set[0]],
+        "the leader's mask through a reborrow"
+    );
+    drop(exec);
+    assert_eq!(own_cpus(), set, "the scope gives the caller its mask back");
 }
 
 /// The path of #33 and #45: a team from `into_team` and nothing but plain team

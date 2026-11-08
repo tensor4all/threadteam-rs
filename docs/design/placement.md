@@ -747,11 +747,13 @@ that opens none, and is held by a guard in that scope's or section's frame.
   `limit`) carries only the first `budget - 1` members. Letting it pin or unpin
   that prefix would leave the suffix as it was, and a pin from another mask
   could put the leader on a CPU an untouched member holds. So a narrower root
-  scope runs no pin or unpin section, pins no leader, is not counted in
-  `pin_skips`, and dispatches under the team's current placement like any plain
-  team token; its oversubscription and the members' spin budget are still
-  decided from its caller's set. A team that wants a new placement opens a
-  root scope with its whole budget.
+  scope runs no pin or unpin section, is not counted in `pin_skips`, and
+  dispatches under the team's current placement like any plain team token; its
+  oversubscription and the members' spin budget are still decided from its
+  caller's set. Its leader is placed all the same, on `home` of that placement
+  through `pin::home_pin` like a reborrowed scope's (threadteam-rs#53: it used
+  to stay wide and run on the CPUs its members are pinned to). A team that
+  wants a new placement opens a root scope with its whole budget.
 * **A placed leader is paced by `S`, not by its one-CPU mask.** Inside a scope
   or a section the leader's mask is `{S[0]}` while "CPUs the caller's team is
   spread over" is still `|S|`, and oversubscription is the second question.
@@ -792,7 +794,9 @@ section, also on unwind (`pin::home_pin`, a guard); a section inside a team
 scope is already covered by the scope's pin and skips it (the guard sees this
 thread's `PLACED`). So the leader is on `S[0]` while a section runs, which is
 what #33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls
-per outermost section (2.1 us on an empty 8-way section) and none per scope. The
+per outermost section (2.1 us on an empty 8-way section) and none for a section
+that runs inside a placed scope; the scope itself pays one pin (`LeaderPin` for a
+whole-team scope, `home_pin` for one that is narrower). The
 leader is placed for a scope that is not the root token's too (a reborrow, which
 carries no leader guard of its own: faer's `with_team` shape), and for a child
 that was handed out without a dispatch of its own (`fork_sized` with one share

@@ -955,8 +955,10 @@ impl<'p> Exec<'p> {
     /// token of a [`Team`](crate::Team) with the whole team's budget places the
     /// team's members until a later such scope re-places or unpins them or the
     /// `Team` ends. A root token of a
-    /// `Team` with a smaller budget changes no placement, pins no leader and
-    /// runs under the team's current placement. A mask with fewer CPUs than
+    /// `Team` with a smaller budget changes no member placement and runs under
+    /// the team's current one; its leader is still pinned to the CPU that
+    /// placement left free, when the caller's own mask holds it. A mask with
+    /// fewer CPUs than
     /// participants places nobody ([`Pool::pin_skips`](crate::Pool::pin_skips) counts it).
     /// Whether or not pinning is on, it records whether the scope is
     /// *oversubscribed* (more participants than CPUs in the mask), which decides
@@ -1036,11 +1038,21 @@ impl<'p> Exec<'p> {
                 // scope over all of them may change it: a token narrower than
                 // the team would pin or unpin a prefix and leave the suffix as
                 // it was. A narrower root scope therefore runs no pin or unpin
-                // section, pins no leader, and dispatches under the team's
-                // current placement. A scope that ran no section (pinning off,
-                // no CPU set) leaves the placement as it was.
+                // section and dispatches under the team's current placement. A
+                // scope that ran no section (pinning off, no CPU set) leaves the
+                // placement as it was.
                 let _pin = if t.ids.len() == t.reserved && team.size().get() > 1 {
                     pin_scope(&mut team, t.placement)
+                } else {
+                    None
+                };
+                // The leader is placed whatever the scope's width: a narrower
+                // one takes its home from the team's record, as a reborrowed
+                // scope does. Left wide it ran on the CPUs its members are
+                // pinned to (threadteam-rs#53). A no-op after `pin_scope` placed
+                // the leader, which left this thread's `PLACED` record set.
+                let _home = if team.size().get() > 1 {
+                    crate::pin::home_pin(placement_home(t))
                 } else {
                     None
                 };

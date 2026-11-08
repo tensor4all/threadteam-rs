@@ -9,6 +9,17 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ### Fixed
 
+- **A root scope narrower than its team places its leader** (#53). The leader of
+  a `Team` token is pinned to the CPU the members' placement left free, `S[0]`,
+  for a whole-team root scope (`pin::LeaderPin`) and for a narrower one like a
+  reborrowed scope (`pin::home_pin`). Since #52 only the whole-team scope placed
+  it, so `team.exec(2).team(|t| t.run_with(...))` on a team of three ran its
+  leader on the caller's whole mask, i.e. on the CPUs its members are pinned
+  to; reached through `reborrow` it was placed. Both paths now place the leader
+  when the caller's mask holds that CPU, and the narrow scope still moves no
+  member and stays out of `pin_skips`.
+  Regression test: `a_narrower_root_scope_places_its_leader_on_the_teams_home`
+  (Linux, skipped below 3 allowed CPUs).
 - **`Pool::into_team` no longer pins the calling thread** (#52). The leader of a
   `Team` token is placed on `S[0]` for the one section it dispatches, and has
   its own mask back when the section ends; nothing is pinned for the team's

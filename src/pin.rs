@@ -257,9 +257,40 @@ impl Topology {
 ///
 /// The first call allocates and reads files; `PoolBuilder::build` makes it for
 /// a spreading pool, so a root scope never does.
+///
+/// Tests may pin it ([`set_test_topology`]) to place on a synthetic machine; the
+/// placement rule then runs unchanged, only the node map is injected.
 pub(crate) fn host_topology() -> &'static Topology {
+    #[cfg(test)]
+    if let Some(topology) = TEST_TOPOLOGY.with(std::cell::Cell::get) {
+        return topology;
+    }
     static HOST: std::sync::OnceLock<Topology> = std::sync::OnceLock::new();
     HOST.get_or_init(read_host_topology)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    /// The topology [`host_topology`] returns on this thread, once a test sets it.
+    /// Thread local so a placement test cannot place another test's team.
+    static TEST_TOPOLOGY: std::cell::Cell<Option<&'static Topology>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Makes [`host_topology`] read `topology` on the calling thread instead of the
+/// host's node map, and [`PinStrategy::Spread`] place on it. `None` restores the
+/// host. Test-only: production always reads the machine it runs on.
+///
+/// The calling thread is the one that places a root scope
+/// (`exec::pin_scope`), so a test that sets this and then enters a team scope
+/// drives the real path from the pool's strategy to the members' CPUs.
+#[cfg(test)]
+#[cfg_attr(
+    not(all(feature = "parallel", target_os = "linux")),
+    allow(dead_code) // only the placement test (Linux, `parallel`) sets it
+)]
+pub(crate) fn set_test_topology(topology: Option<&'static Topology>) {
+    TEST_TOPOLOGY.with(|slot| slot.set(topology));
 }
 
 #[cfg(target_os = "linux")]
@@ -789,9 +820,9 @@ mod tests {
 
     /// The placement object on a synthetic two-node machine, with both
     /// strategies and at two widths, so a mapping change is visible without
-    /// multi-node hardware. What this does **not** cover: which strategy
-    /// `exec::pin_scope` hands in. That needs a multi-node host or an injection
-    /// point in the non-allocating path, and is tracked separately.
+    /// multi-node hardware. Which strategy `exec::pin_scope` hands in is covered
+    /// by `tests::placement::a_root_scope_places_under_the_pools_pin_strategy`,
+    /// which drives a real team through the seam (`pin::set_test_topology`).
     #[cfg(target_os = "linux")]
     #[test]
     fn placement_takes_the_strategy_on_a_two_node_machine() {

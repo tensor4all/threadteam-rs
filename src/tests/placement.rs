@@ -3,7 +3,7 @@
 //! every section of the root.
 
 use crate::awake::{Geometry, Section};
-use crate::{Exec, Pool};
+use crate::{Exec, PinStrategy, Pool};
 use std::time::Duration;
 
 fn own_cpus() -> Vec<usize> {
@@ -340,4 +340,91 @@ fn a_team_created_on_too_few_cpus_is_still_paced() {
             "a fork_sized child of an oversubscribed team"
         );
     });
+}
+
+/// Puts the host's topology back when the test ends, also on unwind.
+struct HostTopology;
+
+impl Drop for HostTopology {
+    fn drop(&mut self) {
+        crate::pin::set_test_topology(None);
+    }
+}
+
+/// The mask each participant of a two-wide root team scope ran its share in,
+/// participant 0 (the leader) first.
+fn participant_masks(pool: &Pool) -> Vec<Vec<usize>> {
+    // `run_with` joins every participant before it returns, so a plain
+    // `Mutex` holding the rows is enough for the closure to borrow.
+    let seen = std::sync::Mutex::new(Vec::new());
+    let mut exec = Exec::new(pool, 2).expect("a two-wide token");
+    exec.team(|mut team| {
+        team.reborrow().run_with(|p| {
+            seen.lock().unwrap().push((p.index(), own_cpus()));
+        });
+    })
+    .expect("an idle pool");
+    let mut rows = seen.into_inner().unwrap();
+    rows.sort_by_key(|&(index, _)| index);
+    assert_eq!(rows.len(), 2, "both participants ran a share");
+    rows.into_iter().map(|(_, mask)| mask).collect()
+}
+
+/// `exec::pin_scope` hands the pool's own strategy to `pin::Placement::of`. On
+/// one NUMA node `Spread` and `Pack` place identically, so the node map is a
+/// synthetic two-node machine over this host's own CPUs: `Spread` then takes the
+/// second participant across to the first CPU of the second node, `Pack` keeps
+/// it on the second CPU of the first.
+///
+/// A `pin_scope` that passes a hard-coded strategy (or the wrong field) moves
+/// one of the two members onto the other's CPU and fails here. That the builder's
+/// default is `Spread` is asserted in `tests/pinning.rs`.
+#[test]
+fn a_root_scope_places_under_the_pools_pin_strategy() {
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!(
+            "skipped: needs 4 allowed CPUs to build two synthetic nodes, this process has {}",
+            set.len()
+        );
+        return;
+    }
+    let nodes = vec![vec![set[0], set[1]], vec![set[2], set[3]]];
+    let topology: &'static crate::pin::Topology =
+        Box::leak(Box::new(crate::pin::Topology::from_nodes(&nodes)));
+    crate::pin::set_test_topology(Some(topology));
+    let _host = HostTopology;
+
+    let member_cpu = |strategy: PinStrategy| {
+        let pool = Pool::builder()
+            .threads(2)
+            .pin_strategy(strategy)
+            .idle_spin(Duration::ZERO)
+            .acquire_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        assert_eq!(pool.pin_strategy(), strategy);
+        let masks = participant_masks(&pool);
+        // Participant 0, the leader, is on `S[0]` under either strategy, so the
+        // member's CPU is the one the strategy decides.
+        assert_eq!(masks[0], vec![set[0]], "the leader's CPU for {strategy:?}");
+        assert_eq!(pool.pin_skips(), 0, "nothing skipped for {strategy:?}");
+        masks[1].clone()
+    };
+
+    assert_eq!(
+        member_cpu(PinStrategy::Spread),
+        vec![set[2]],
+        "Spread puts the second participant on node 2's first CPU"
+    );
+    assert_eq!(
+        member_cpu(PinStrategy::Pack),
+        vec![set[1]],
+        "Pack puts it on node 1's second CPU"
+    );
+    assert_eq!(
+        own_cpus(),
+        set,
+        "the calling thread's mask after both scopes"
+    );
 }

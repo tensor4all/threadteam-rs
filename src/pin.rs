@@ -437,3 +437,48 @@ mod sys {
         None
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refusal assertion in `tests/pinning.rs` sees the mask, and a placement
+    /// onto the CPU the thread is already on leaves the mask unchanged. What
+    /// separates "refused" from "placed again on the same CPU" is the recorded
+    /// placement `S`, which `available()` reports: a second placement would
+    /// replace `S` with the one-CPU mask the thread runs on and halve the answer.
+    #[test]
+    fn a_refused_second_placement_keeps_the_recorded_set() {
+        let Some(wide) = read_here() else {
+            return; // not Linux, or no affinity support: nothing to place
+        };
+        let width = count(&wide);
+        if width < 2 {
+            return; // one allowed CPU: the placement is skipped by design
+        }
+        let home = nth(&wide, 0).expect("a CPU in a non-empty mask");
+        let first = LeaderPin::enter(&wide, home).expect("the first placement");
+        assert_eq!(
+            available(),
+            width,
+            "the recorded set is the one the scope started in"
+        );
+
+        assert!(
+            home_pin(home + 1).is_none(),
+            "a second placement in the same scope is refused"
+        );
+        assert_eq!(
+            available(),
+            width,
+            "the refused placement must not overwrite the recorded set"
+        );
+
+        drop(first);
+        assert_eq!(
+            available(),
+            width,
+            "the set comes back when the placement ends"
+        );
+    }
+}

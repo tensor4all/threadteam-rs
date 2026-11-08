@@ -5,6 +5,29 @@ All notable changes to `threadteam` are recorded here. The format follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Entries start at
 0.5.0; earlier releases are not recorded here.
 
+## [Unreleased]
+
+### Fixed
+
+- **`Pool::into_team` no longer pins the calling thread** (#52). The leader of a
+  `Team` token is placed on `S[0]` for the one section it dispatches, and has
+  its own mask back when the section ends; nothing is pinned for the team's
+  life. 0.5.0's `pin::TeamPin` left the caller of `into_team` on `{S[0]}` until
+  the `Team` was dropped, so a vendor thread pool (MKL, OpenBLAS) or a plain
+  thread started from that thread while the engine lived inherited one CPU: an
+  engine's construction thread is not ours. Measured on evo2 (32 CPUs, width
+  8): the caller's `Cpus_allowed_list` is `0-7` before `into_team`, `0` after it
+  and in everything started from there on 0.5.1, and `0-7` throughout now. The
+  leader is still on `S[0]` in 40 of 40 calls (0.5.1: 0 of 40 with the caller
+  off `S[0]`, 5.9 ms per call against 10 us). The pin costs one
+  `sched_getaffinity` and two `sched_setaffinity` calls per outermost section
+  of a team token that opens no scope, and nothing inside a team scope.
+  `pin::TeamPin` is replaced by one record on the `Team` (`pin::Home`, the CPU
+  no member takes), which pins nothing: a whole-team root scope writes it and
+  the sections read it. Other threads are no longer second class: a token used
+  on another thread places that thread for its sections too, inside its own
+  mask.
+
 ## [0.5.1] - 2026-11-07
 
 A `Team` created on 0.5.0 paced its own members by its leader's one-CPU mask.

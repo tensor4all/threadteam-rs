@@ -154,7 +154,7 @@ fn a_team_scope_takes_the_oversubscription_from_the_thread_that_enters_it() {
     let pool = pool(width);
     let team = pool.into_team(width).expect("an idle pool");
     // Mint the root token on the full mask: four participants on four CPUs is
-    // not oversubscribed at mint, and the team pinned this thread to `S[0]`.
+    // not oversubscribed there.
     let mut exec = team.exec(width);
     // Enter the scope from another thread whose mask holds one CPU: the scope
     // decides from that set, exactly as its pin section does.
@@ -252,28 +252,25 @@ fn member_budgets(team: &crate::Team) -> Vec<u32> {
         .collect()
 }
 
-/// threadteam-rs#33. `into_team` pins its creating thread to `{S[0]}` for the
-/// life of the team. A token minted on that thread is still a team of `|S|`
-/// CPUs: two participants on a two-CPU set are not oversubscribed, so the
-/// members keep the pool's spin budget instead of `THROTTLED_POLLS`.
+/// threadteam-rs#33. A `Team`'s token is a team of `|S|` CPUs even though its
+/// leader is placed only for a section: two participants on a two-CPU set are
+/// not oversubscribed, so the members keep the pool's spin budget instead of
+/// `THROTTLED_POLLS`.
 #[test]
-fn a_team_token_minted_by_its_placed_leader_keeps_the_pool_spin_budget() {
+fn a_team_token_minted_by_its_leader_keeps_the_pool_spin_budget() {
     use crate::park::THROTTLED_POLLS;
     let budget = 50_000;
     on_two_cpus(|| {
         let set = own_cpus();
         let team = spinning_pool(2, budget).into_team(2).expect("an idle pool");
-        if own_cpus() != set[..1] {
-            eprintln!("skipped: the team did not pin its leader to S[0]");
-            return;
-        }
-        assert_eq!(crate::pin::available(), 2, "a placed leader leads |S| CPUs");
+        assert_eq!(own_cpus(), set, "into_team leaves the caller's mask");
+        assert_eq!(crate::pin::available(), 2, "the leader leads |S| CPUs");
         let exec = team.exec(2);
         let budgets = member_budgets(&team);
         assert!(!budgets.is_empty());
         assert!(
             budgets.iter().all(|&b| b == budget && b != THROTTLED_POLLS),
-            "2 participants on a 2-CPU S, token minted on the placed leader: {budgets:?}"
+            "2 participants on a 2-CPU S, token minted by the team's leader: {budgets:?}"
         );
         drop(exec);
     });
@@ -283,15 +280,12 @@ fn a_team_token_minted_by_its_placed_leader_keeps_the_pool_spin_budget() {
 /// child carries the pressure decided at mint, so it is not oversubscribed and
 /// its members keep the pool's spin budget.
 #[test]
-fn a_fork_sized_child_of_a_placed_team_token_is_not_oversubscribed() {
+fn a_fork_sized_child_of_a_team_token_is_not_oversubscribed() {
     let budget = 50_000;
     on_two_cpus(|| {
         let set = own_cpus();
         let team = spinning_pool(2, budget).into_team(2).expect("an idle pool");
-        if own_cpus() != set[..1] {
-            eprintln!("skipped: the team did not pin its leader to S[0]");
-            return;
-        }
+        assert_eq!(own_cpus(), set, "into_team leaves the caller's mask");
         let seen = std::sync::Mutex::new(None);
         team.exec(2)
             .fork_sized(&[2], |_, mut child| {
@@ -307,7 +301,7 @@ fn a_fork_sized_child_of_a_placed_team_token_is_not_oversubscribed() {
             })
             .unwrap();
         let (over, budgets) = seen.into_inner().unwrap().expect("the child ran");
-        assert!(!over, "a fork_sized child of a placed team token");
+        assert!(!over, "a fork_sized child of a team token");
         assert!(!budgets.is_empty(), "the child carries the member");
         assert!(budgets.iter().all(|&b| b == budget), "{budgets:?}");
     });
@@ -315,8 +309,8 @@ fn a_fork_sized_child_of_a_placed_team_token_is_not_oversubscribed() {
 
 /// The fix keeps pacing where it belongs: a `Team` of four participants
 /// created on a two-CPU thread is genuinely oversubscribed. Its leader is not
-/// placed (`TeamPin::enter` declines), so its tokens, and a `fork_sized` child
-/// reached without a scope, keep the throttled spin budget.
+/// placed (`into_team` records no set), so its tokens, and a
+/// `fork_sized` child reached without a scope, keep the throttled spin budget.
 #[test]
 fn a_team_created_on_too_few_cpus_is_still_paced() {
     use crate::park::THROTTLED_POLLS;

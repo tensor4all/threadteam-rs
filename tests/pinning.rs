@@ -1,10 +1,11 @@
 //! Participant placement (Linux only, on by default): every member pins itself
 //! onto one CPU of the calling thread's set at a root team scope and restores
 //! its own mask when its reservation ends; the leader (the calling thread) is
-//! pinned to the set's first CPU for the whole scope (for a whole-team token of
-//! a `Team`, for the token's life), widened to the set only inside
-//! `TeamExec::external`, and has its mask back when the scope ends; a
-//! set with fewer CPUs than participants places nobody and counts the skip.
+//! pinned to the set's first CPU for the scope, and for each section a `Team`
+//! token dispatches without a scope, widened to the set only inside
+//! `TeamExec::external`, and has its own mask back when the scope or the
+//! section ends; a set with fewer CPUs than participants places nobody and
+//! counts the skip.
 #![cfg(all(feature = "parallel", target_os = "linux"))]
 
 use std::num::NonZeroUsize;
@@ -368,7 +369,7 @@ fn team_external_widens_the_leader_for_the_call_and_restores_the_pin() {
     })
     .expect("a team token opens its scope");
     drop(exec);
-    assert_eq!(own_cpus(), home, "the team still pins its leader");
+    assert_eq!(own_cpus(), before, "the token's end leaves the mask alone");
     drop(team);
     assert_eq!(own_cpus(), before, "the leader's mask after the team");
 }
@@ -416,13 +417,13 @@ fn leader_share(exec: Exec<'_>) -> (Option<usize>, Vec<usize>) {
     seen.into_inner().unwrap().unwrap_or_else(sample)
 }
 
-/// The thread that creates a `Team` is pinned to `S[0]` from `into_team` to the
-/// team's drop (#33, #45): every token it mints dispatches with the leader on
-/// `{S[0]}` without opening a team scope (`fork_sized`, `for_ranges`, any
-/// budget), the leader stays there between tokens, and dropping the team gives
-/// the mask back.
+/// The thread that creates a `Team` keeps its own CPU set (#52): every token it
+/// mints dispatches with the leader on `{S[0]}` without opening a team scope
+/// (`fork_sized`, `for_ranges`, any budget), but only for the section, so
+/// `into_team`, the time between tokens and the team's drop all leave the
+/// caller's mask as they found it.
 #[test]
-fn a_team_pins_its_creating_thread_until_it_drops() {
+fn a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -435,7 +436,7 @@ fn a_team_pins_its_creating_thread_until_it_drops() {
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
     let home = vec![set[0]];
-    assert_eq!(own_cpus(), home, "the leader after into_team");
+    assert_eq!(own_cpus(), before, "the leader after into_team");
     for round in 0..10 {
         let budget = if round % 2 == 0 { width } else { 2 };
         let mut exec = team.exec(budget);
@@ -443,16 +444,17 @@ fn a_team_pins_its_creating_thread_until_it_drops() {
             let (cpu, mask) = leader_share(exec.reborrow());
             assert_eq!(mask, home, "round {round}, call {call}: the leader's share");
             assert_eq!(cpu, Some(set[0]), "round {round}, call {call}: its CPU");
+            assert_eq!(own_cpus(), before, "round {round}, call {call}: after it");
         }
         exec.for_ranges(64, NonZeroUsize::new(16).unwrap(), |_| {});
-        assert_eq!(own_cpus(), home, "round {round}: between tokens");
+        assert_eq!(own_cpus(), before, "round {round}: between tokens");
     }
     assert_eq!(team.pool().pin_skips(), 0);
     drop(team);
     assert_eq!(own_cpus(), before, "the caller after the team");
 }
 
-/// `into_pool` ends the pin too.
+/// `into_pool` changes no mask either.
 #[test]
 fn into_pool_gives_the_leader_its_mask_back() {
     let _w = watchdog();
@@ -463,14 +465,70 @@ fn into_pool_gives_the_leader_its_mask_back() {
     }
     let pool = builder(3, true).build().unwrap();
     let team = pool.into_team(3).expect("an idle pool");
-    assert_eq!(own_cpus(), vec![set[0]]);
+    assert_eq!(own_cpus(), set, "the caller after into_team");
     let _pool = team.into_pool();
     assert_eq!(own_cpus(), set);
 }
 
+/// #52: `into_team` gives the calling thread its own CPU set back, also while
+/// the team lives and after a section it dispatched. The engine-construction
+/// path (`CpuEngine::new`, `pool.into_team(width)`) runs on a caller thread
+/// that is not ours, and its mask decides what a vendor thread pool built there
+/// gets.
+#[test]
+fn into_team_leaves_the_callers_cpu_set_as_it_was() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: the process has fewer than 2 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let pool = builder(width, true).build().unwrap();
+    let before = own_cpus();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    assert_eq!(own_cpus(), before, "the caller's set after into_team");
+    // A section it dispatches narrows the leader for that section only.
+    let shares = flat_shares(team.exec(width));
+    assert_eq!(
+        shares[0].1,
+        vec![set[0]],
+        "the leader's mask in the section"
+    );
+    assert_eq!(own_cpus(), before, "the caller's set after the section");
+    assert_eq!(team.pool().pin_skips(), 0);
+    drop(team);
+    assert_eq!(own_cpus(), before, "the caller's set after the team");
+}
+
+/// #52: a thread started while a team lives inherits the caller's whole set,
+/// not the one CPU the leader holds during a section. A vendor library that
+/// builds its thread pool from the engine's thread is this shape.
+#[test]
+fn a_thread_spawned_while_a_team_lives_is_not_confined_to_one_cpu() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: the process has fewer than 2 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let pool = builder(width, true).build().unwrap();
+    let before = own_cpus();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let spawned = std::thread::scope(|s| s.spawn(own_cpus).join().unwrap());
+    assert_eq!(spawned, before, "a thread started after into_team");
+    // The same after a section of the team: the leader has its set back.
+    flat_shares(team.exec(width));
+    let spawned = std::thread::scope(|s| s.spawn(own_cpus).join().unwrap());
+    assert_eq!(spawned, before, "a thread started after a section");
+}
+
 /// A root scope opened on the creating thread places the members in the
-/// team's `S` (not in the leader's one-CPU mask, which would skip the
-/// placement), widens the leader in `external` and leaves it on `{S[0]}`.
+/// caller's `S`, widens the leader in `external` for the call, leaves the
+/// leader on `{S[0]}` for the scope and gives it `S` back at the end of it.
 #[test]
 fn a_scope_on_the_creating_thread_places_the_members_in_the_teams_set() {
     let _w = watchdog();
@@ -495,7 +553,7 @@ fn a_scope_on_the_creating_thread_places_the_members_in_the_teams_set() {
                 assert_eq!(own_cpus(), home, "after external");
             })
             .expect("a team token opens its scope");
-        assert_eq!(own_cpus(), home, "after the scope");
+        assert_eq!(own_cpus(), before, "after the scope");
     }
     for (index, mask) in seen.take() {
         assert_eq!(mask, vec![set[index]], "participant {index}");
@@ -503,11 +561,11 @@ fn a_scope_on_the_creating_thread_places_the_members_in_the_teams_set() {
     assert_eq!(team.pool().pin_skips(), 0);
 }
 
-/// A team is `Send` and `Sync`. A token minted on another thread has an
-/// unplaced leader, and neither its dispatch nor its drop changes that
-/// thread's mask; the creating thread keeps its pin.
+/// A team is `Send` and `Sync`. A token used on another thread places that
+/// thread for its sections, from the set the team recorded, and leaves its mask
+/// as it found it; the creating thread is not touched.
 #[test]
-fn a_token_minted_on_another_thread_leaves_that_thread_alone() {
+fn a_token_used_on_another_thread_places_only_that_thread() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -518,19 +576,220 @@ fn a_token_minted_on_another_thread_leaves_that_thread_alone() {
     let pool = builder(width, true).build().unwrap();
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
+    let home = vec![set[0]];
     std::thread::scope(|s| {
         s.spawn(|| {
             let mine = own_cpus();
             let (_, mask) = leader_share(team.exec(width));
-            assert_eq!(mask, mine, "the other thread is not placed");
+            assert_eq!(mask, home, "the other thread leads on the team's S[0]");
             assert_eq!(own_cpus(), mine, "nor moved by the drop");
         });
     });
+    assert_eq!(own_cpus(), set, "the creating thread keeps its own mask");
+}
+
+/// A team token reborrowed before it opens its scope is still the team: the
+/// leader is placed for that scope even though a reborrow carries no leader
+/// guard of its own (the shape faer's `with_team` uses).
+#[test]
+fn a_reborrowed_team_token_places_its_leader_for_the_scope() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(3);
+    let pool = builder(width, true).build().unwrap();
+    let before = own_cpus();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let home = vec![set[0]];
+    let seen = Mutex::new(None);
+    let mut exec = team.exec(width);
+    exec.reborrow()
+        .team(|mut t| {
+            assert_eq!(own_cpus(), home, "the leader at scope entry");
+            t.reborrow().run_with(|p| {
+                if p.index() == 0 {
+                    *seen.lock().unwrap() = Some(own_cpus());
+                }
+            });
+            assert_eq!(own_cpus(), home, "the leader between sections");
+        })
+        .expect("a reborrowed team token opens its scope");
     assert_eq!(
-        own_cpus(),
-        vec![set[0]],
-        "the creating thread keeps the pin"
+        seen.into_inner().unwrap(),
+        Some(home),
+        "the leader's mask in its share"
     );
+    assert_eq!(own_cpus(), before, "the caller's mask after the scope");
+}
+
+/// A child token that was handed out without a dispatch of its own
+/// (`fork_sized` with one share runs inline) still places its leader for the
+/// sections it dispatches.
+#[test]
+fn a_child_reached_without_a_dispatch_still_places_its_leader() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(3);
+    let pool = builder(width, true).build().unwrap();
+    let before = own_cpus();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let home = vec![set[0]];
+    let seen = Mutex::new(None);
+    team.exec(width)
+        .fork_sized(&[width], |_, child| {
+            assert_eq!(own_cpus(), before, "an inline share pins nothing");
+            child.fork(width, |k, _| {
+                if k == 0 {
+                    *seen.lock().unwrap() = Some(own_cpus());
+                }
+            });
+        })
+        .unwrap();
+    assert_eq!(
+        seen.into_inner().unwrap(),
+        Some(home),
+        "the leader's mask in the child's section"
+    );
+    assert_eq!(own_cpus(), before, "the caller's mask afterwards");
+}
+
+/// A member that leads a child keeps its own share's CPU: a lent call restores
+/// A member that leads a child keeps its own share's CPU: a lent call restores
+/// its mask, and the section it dispatches next must not move it onto the team
+/// leader's `S[0]`.
+#[test]
+fn a_member_led_child_keeps_its_own_cpu_after_a_lent_call() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let pool = builder(width, true).build().unwrap();
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    let mut exec = team.exec(width);
+    // Place the members, then fork: child 1 is led by member 1.
+    exec.team(|mut t| t.reborrow().run_with(|_| {}))
+        .expect("a team token opens its scope");
+    let seen = Mutex::new(None);
+    exec.fork(2, |child, mut token| {
+        if child != 1 {
+            return;
+        }
+        // A lent call: the member restores its own mask for the work it serves.
+        token.reborrow().external(|_| ());
+        // The section this child dispatches next is led by that member.
+        token.reborrow().fork(2, |k, _| {
+            if k == 0 {
+                *seen.lock().unwrap() = Some(own_cpus());
+            }
+        });
+    });
+    let seen = seen
+        .into_inner()
+        .unwrap()
+        .expect("the member-led child ran");
+    assert_ne!(
+        seen,
+        vec![set[0]],
+        "the member moved onto the team leader's CPU: {seen:?}"
+    );
+}
+
+/// A whole-team root scope decides the placement of the team, and a section a
+/// token dispatches afterwards follows it: the leader goes home to the CPU the
+/// members of the latest placement left free, also when the team was created on
+/// a mask too small for it.
+#[test]
+fn a_whole_team_scope_replaces_the_teams_placement() {
+    let _w = watchdog();
+    let all = own_cpus();
+    if all.len() < 5 {
+        eprintln!("skipped: need at least 5 allowed CPUs");
+        return;
+    }
+    // A team created on two CPUs cannot place four participants.
+    let Some(_two) = Restrict::to(&all[..2]) else {
+        eprintln!("skipped: cannot restrict the calling thread to two CPUs");
+        return;
+    };
+    let pool = builder(4, true).build().unwrap();
+    let team = pool.into_team(4).expect("an idle pool");
+    let width = team.size().get();
+    assert_eq!(
+        team.pool().pin_skips(),
+        1,
+        "the creation scope placed nobody"
+    );
+    // Widened, the next whole-team scope places the team, and records it.
+    let set = all[..4].to_vec();
+    let Some(_four) = Restrict::to(&set) else {
+        eprintln!("skipped: cannot restrict the calling thread to four CPUs");
+        return;
+    };
+    let seen = Seen::default();
+    team.exec(width)
+        .team(|mut t| t.reborrow().run_with(|p| seen.record(p.index())))
+        .expect("a team token opens its scope");
+    for (index, mask) in seen.take() {
+        assert_eq!(mask, vec![set[index]], "participant {index} in the scope");
+    }
+    // A section dispatched without a scope goes home, to a CPU no member has.
+    let shares = flat_shares(team.exec(width));
+    assert_eq!(shares[0].1, vec![set[0]], "the leader's mask in a section");
+    for (k, (_, mask)) in shares.iter().enumerate().skip(1) {
+        assert_eq!(mask, &vec![set[k]], "member {k} in a section");
+    }
+    assert_eq!(team.pool().pin_skips(), 1, "no further skip");
+}
+
+/// A scope that cannot be placed clears the placement, so a later section does
+/// not send its leader to a CPU a member of an older placement holds.
+#[test]
+fn a_scope_that_cannot_be_placed_clears_the_placement() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let pool = builder(3, true).build().unwrap();
+    let team = pool.into_team(3).expect("an idle pool");
+    let width = team.size().get();
+    let before = own_cpus();
+    let shares = flat_shares(team.exec(width));
+    assert_eq!(shares[0].1, vec![set[0]], "the leader's mask in a section");
+    // One CPU cannot host three participants: the members are unpinned and the
+    // placement is cleared.
+    let Some(_one) = Restrict::to(&set[2..3]) else {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    };
+    team.exec(width)
+        .team(|mut t| {
+            t.reborrow().run_with(|p| {
+                if p.index() > 0 {
+                    assert!(own_cpus().len() > 1, "member {} was placed", p.index());
+                }
+            })
+        })
+        .expect("a team token opens its scope");
+    drop(_one);
+    assert_eq!(team.pool().pin_skips(), 1, "the scope could not be placed");
+    // The leader is not sent home to a CPU that may now be a member's.
+    let shares = flat_shares(team.exec(width));
+    assert_eq!(shares[0].1, before, "the leader stays where its caller is");
 }
 
 #[test]
@@ -582,7 +841,6 @@ fn a_released_or_unpinned_team_leaves_its_caller_alone() {
     let pool = builder(width, true).build().unwrap();
     let team = pool.into_team(width).expect("an idle pool");
     let width = team.size().get();
-    let home = vec![set[0]];
     // A root scope that cannot be placed (entered from another thread with a
     // one-CPU mask) unpins the members.
     let entered = std::thread::scope(|s| {
@@ -603,9 +861,10 @@ fn a_released_or_unpinned_team_leaves_its_caller_alone() {
         return;
     }
     assert_eq!(team.pool().pin_skips(), 1);
-    // The members are unpinned; the team's own leader is still on `S[0]`.
+    // The members are unpinned and the placement is cleared, so nothing sends
+    // the leader anywhere either.
     let shares = flat_shares(team.exec(width));
-    assert_eq!(shares[0].1, home, "the leader's mask");
+    assert_eq!(shares[0].1, set, "the leader's mask");
     for (k, (_, mask)) in shares.iter().enumerate().skip(1) {
         assert!(mask.len() > 1, "member {k} kept a pin: {mask:?}");
     }
@@ -614,9 +873,9 @@ fn a_released_or_unpinned_team_leaves_its_caller_alone() {
     team.exec(width)
         .team(|_| {})
         .expect("a team token opens its scope");
-    assert_eq!(own_cpus(), home, "the team still pins its leader");
+    assert_eq!(own_cpus(), set, "the team pins nobody between sections");
     let pool = team.into_pool();
-    assert_eq!(own_cpus(), set, "into_pool gave the mask back");
+    assert_eq!(own_cpus(), set, "into_pool changed the mask");
     let (_, mask) = leader_share(Exec::new(&pool, width).unwrap());
     assert_eq!(mask, set, "the caller's mask after the team");
 }
@@ -637,7 +896,7 @@ fn flat_shares(exec: Exec<'_>) -> Vec<(Option<usize>, Vec<usize>)> {
 
 /// After a narrower root scope of a placed team of three (members on `S[1]`,
 /// `S[2]`): the members are still where the full placement put them, and a
-/// whole-team token pins its leader to `S[0]`.
+/// whole-team token opens its section with the leader on `S[0]`.
 fn assert_full_placement_kept(team: &threadteam::Team, set: &[usize]) {
     for round in 0..10 {
         let shares = flat_shares(team.exec(3));
@@ -712,9 +971,10 @@ fn a_narrower_root_scope_pins_no_leader_and_moves_no_member() {
 }
 
 /// The path of #33 and #45: a team from `into_team` and nothing but plain team
-/// tokens afterwards, at the machine's width (up to 96). The token pins its
-/// leader (see `a_whole_team_token_pins_its_leader_until_it_drops`), so every
-/// participant is alone on its own CPU, the leader on `S[0]`.
+/// tokens afterwards, at the machine's width (up to 96). Every section opens
+/// with its leader placed (see
+/// `a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer`), so
+/// every participant is alone on its own CPU, the leader on `S[0]`.
 #[test]
 fn the_reported_wide_fork_sized_path_keeps_every_participant_alone_on_its_cpu() {
     use std::time::Instant;
@@ -884,6 +1144,9 @@ fn a_team_wider_than_the_callers_set_is_not_pinned_and_the_skip_is_counted() {
     assert_eq!(own_cpus(), before, "the leader's mask after the scope");
 }
 
+/// A scope whose caller cannot be home for the team's recorded set places
+/// nobody: the members pinned earlier restore their own masks instead of
+/// keeping a placement whose leader CPU this caller is not allowed on.
 #[test]
 fn a_persistent_team_pinned_on_a_wide_set_unpins_when_a_scope_cannot_be_placed() {
     let _w = watchdog();
@@ -907,11 +1170,11 @@ fn a_persistent_team_pinned_on_a_wide_set_unpins_when_a_scope_cannot_be_placed()
             "participant {index} on the wide set"
         );
     }
-    // Second scope from a two-CPU caller: nobody can be placed, so the members
-    // pinned by the first scope restore their own masks for this one.
-    // It is entered from another thread: the creating thread's scopes place
-    // the team in the set it was created on.
-    let cpus = vec![all[0], all[1]];
+    // Second scope from another thread that is allowed two CPUs, neither of
+    // them the team's `S[0]`: the leader cannot be home there and two CPUs
+    // cannot host four participants, so nobody is placed and the members pinned
+    // by the first scope restore their own masks for this one.
+    let cpus = vec![all[1], all[2]];
     let narrow = Seen::default();
     let entered = std::thread::scope(|s| {
         s.spawn(|| {
@@ -1081,8 +1344,8 @@ fn a_team_as_wide_as_the_mask_gives_every_participant_its_own_cpu() {
     assert_eq!(team.size().get(), width, "a team as wide as the mask");
     assert_eq!(
         own_cpus(),
-        vec![set[0]],
-        "the creating thread leads the team pinned onto S[0]"
+        set,
+        "into_team leaves the creating thread's set alone"
     );
     {
         let mut exec = team.exec(width);

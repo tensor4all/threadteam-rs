@@ -677,7 +677,8 @@ impl PoolBuilder {
     /// 1.7 ms on one thread), so a team that cannot be placed is not placed
     /// badly.
     ///
-    /// **The leader is pinned, and widened for vendor calls.** A vendor library
+    /// **The leader is pinned for a scope or a section, and widened for vendor
+    /// calls.** A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
@@ -688,6 +689,9 @@ impl PoolBuilder {
     /// region; a refused syscall leaves the thread as it was). A member that
     /// makes such a call uses [`Exec::external`](crate::Exec::external), which
     /// restores the member's own mask. A scope with no vendor call pays nothing.
+    /// A leader outside a scope and between the sections of a
+    /// [`Team`](crate::Team) token has its whole mask, so a vendor call there
+    /// needs no widening.
     ///
     /// A member saves its previous mask in its own slot and restores it
     /// *itself* before it stops being reserved: before it returns to Rayon, and

@@ -189,10 +189,9 @@ fn the_scope_that_enters_decides_the_park_delay_not_the_mint() {
     let team = pool.into_team(3).expect("an idle pool");
     let width = team.size().get();
     let mut exec = team.exec(width);
-    // Enter the scope from another thread whose mask holds one CPU (the team
-    // pinned this thread to `S[0]`, and a scope on this thread uses the set
-    // the team was created on): oversubscribed there, so its members must park after the
-    // short spin, not after 60 s.
+    // Enter the scope from another thread whose mask holds one CPU: the scope
+    // is paced by that set, exactly as its pin section is placed by it, so its
+    // members must park after the short spin, not after 60 s.
     let sum = AtomicUsize::new(0);
     let entered = std::thread::scope(|s| {
         s.spawn(|| {

@@ -570,10 +570,12 @@ of the samples showed leader and member runnable on one CPU, only 1 % had the
 leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
 
 **The rule: the leader is pinned to `S[0]` for the life of the team scope**, and
-the leader of a `Team` for the life of the team (see "A `Team`'s leader" below). One
-`sched_setaffinity` at scope entry, one at scope exit (a guard, so also on
-unwind), and nothing in between: no per-section check, no move and restore
-around a dispatch. Members keep `S[k]`, `k >= 1`. Arm B above is this rule.
+for one section when a token of a `Team` dispatches one without opening a scope
+(see "A `Team`'s leader" below). One
+`sched_setaffinity` at scope entry (or at section entry), one at its exit (a
+guard, so also on unwind), and nothing in between: no per-section check, no
+move and restore around a dispatch inside a scope. Members keep `S[k]`,
+`k >= 1`. Arm B above is this rule for a scope.
 
 The crate used to do something cleverer: it placed the leader on `S[0]`
 immediately before **every section** and handed its whole mask back at once, so
@@ -588,7 +590,7 @@ because the pin is simpler, not because it was shown faster or slower; no
 measurement here favours it. It was not re-measured on evo2 for this change (a
 campaign is running there). The vendor-call half of the reason the nudge existed
 is answered by the widening call below; the drift half by the pin itself, held
-by the scope or, for a `Team`, by the team (see "A `Team`'s leader" below).
+by the scope or, for a `Team`, by the section (see "A `Team`'s leader" below).
 
 #### Widening the leader for a vendor call: `TeamExec::external`
 
@@ -714,18 +716,20 @@ How it works:
   own CPU set with `taskset -c`; there is no CPU allocator in this crate and none
   is planned for this fix. Overlapping teams and pools of one process stay
   caller-managed.
-* The members' placement is the team's; the leader's pin is the scope's. A
-  token of a `Team` that never opens a team scope (`exec.for_ranges(...)`,
-  `fork_sized`, directly) is not re-pinned: its members keep the placement of
-  the last whole-team root scope, or of `Pool::into_team`, and **its leader is
-  not placed at all** (see "Where the placement lives" for the cost of that).
+* The members' placement is the team's; the leader's pin is the scope's, or the
+  section's. A token of a `Team` that never opens a team scope
+  (`exec.for_ranges(...)`, `fork_sized`, directly) is not re-pinned: its members
+  keep the placement of the last whole-team root scope, or of
+  `Pool::into_team`, and **its leader is placed for each section it dispatches**
+  and for each scope it opens without being the root token (see "A `Team`'s
+  leader" for the cost of that).
 
 #### Where the placement lives
 
 The members' pins are owned by the authority over them and set and cleared by
 the sections that pin and unpin them; the leader's pin is not part of that
-placement, it belongs to one root scope and is held by a guard in that scope's
-frame.
+placement, it belongs to one root scope, or to one section of a `Team` token
+that opens none, and is held by a guard in that scope's or section's frame.
 
 * **Scoped acquisition** (`Exec::team` on a plain token): the members are
   reserved, and pinned, for the scope only; they restore their masks when the
@@ -734,8 +738,10 @@ frame.
   pinned, from the pin section of a root scope (the first one is the
   acknowledgement scope of `into_team`) until an unpin section or the end of
   the `Team`. The leader is pinned to `S[0]` during each such root scope and
-  has `S` again when it closes, so between scopes, and in any section a plain
-  token of the team dispatches, the leader runs wherever the scheduler puts it.
+  has `S` again when it closes; a section that a token of the team dispatches
+  without a scope pins it for that section and gives `S` back when the section
+  returns (see "A `Team`'s leader"). Between scopes and between sections the
+  leader, and the thread that called `into_team`, keep their own mask.
 * **Only a root scope over the whole team changes the placement.** A root
   token from `Team::exec(budget)` with a smaller budget (or narrowed by
   `limit`) carries only the first `budget - 1` members. Letting it pin or unpin
@@ -746,16 +752,17 @@ frame.
   team token; its oversubscription and the members' spin budget are still
   decided from its caller's set. A team that wants a new placement opens a
   root scope with its whole budget.
-* **A placed leader is paced by `S`, not by its one-CPU mask.** Once the leader
-  is pinned to `{S[0]}`, "CPUs in the caller's mask" and "CPUs the caller's
-  team is spread over" differ, and oversubscription is the second question.
+* **A placed leader is paced by `S`, not by its one-CPU mask.** Inside a scope
+  or a section the leader's mask is `{S[0]}` while "CPUs the caller's team is
+  spread over" is still `|S|`, and oversubscription is the second question.
   `pin::available` answers `|S|` on a thread this crate placed (it reads the
-  thread's `PLACED` record), and `Team::token` and `Exec::team_with` also skip
-  the check on the thread the team placed, since `S` had a CPU for every
-  participant when the team was created. 0.5.0 answered 1 there, so every token
-  a `Team` minted on its own leader thread was marked oversubscribed and its
-  members ran with `THROTTLED_POLLS` (threadteam-rs#33). A team whose `S` is
-  genuinely too small places no leader, so it is still paced by its mask.
+  thread's `PLACED` record), and `Team::token` and `Exec::team_with` measure
+  oversubscription between placements, where the surprise cannot happen: the
+  leader of a `Team` is no longer pinned between sections, so the caller's own
+  mask is the team's set. 0.5.0 answered 1 on the team-pinned thread, so every
+  token a `Team` minted there was marked oversubscribed and its members ran with
+  `THROTTLED_POLLS` (threadteam-rs#33). A team whose `S` is genuinely too small
+  places no leader, so it is still paced by its mask.
 * **Lending is the exception.** `Exec::external` lends the token's members to
   the pool for the call; each restores its own mask before it serves Rayon
   work and is re-pinned only at the next pin section, that is at the next
@@ -772,34 +779,58 @@ again. That is the path reported in #33 (`fork_sized` at width 96 on a 96-CPU
 two-socket host: 7 of 16 processes at about 11 ms per call instead of about 5.8
 ms, leaders off `S[0]`).
 
-**The rule: the leader's pin belongs to the `Team`.** `into_team` pins the
-calling thread to `S[0]` before its acknowledgement scope (`pin::TeamPin`, a
-field of the `Team`) and the team gives `S` back when it is dropped or turned
-into its pool with `into_pool`: one `sched_setaffinity` at each end, nothing per
-token and nothing per section. The pin is hoisted to the `Team` rather than held
-by the scope because the scope's guard ends with the scope, and the
-acknowledgement scope ends at once. `TeamExec::external` is the only call that
-widens it, for one call. A team scope opened on that thread runs under the
-team's pin and places the members in the team's `S` (the thread's own mask is
-`{S[0]}` by then). A team of one, a mask with fewer CPUs than participants and
-pinning turned off pin nothing, as before. There is no home and no per-section
-check: the pin is cheaper than both.
+**The rule: the leader's pin belongs to the section** (tensor4all/threadteam-rs#52).
+`into_team` pins nothing: the caller gets its own mask back the moment the
+acknowledgement scope ends, and the team's tokens place their leader only for
+the section (or reborrowed scope) they dispatch. The team keeps one record of
+where its members are, `pin::Home` — `S[0]` of the set the last whole-team root
+scope placed them in, `0` for none — written by that scope and read by every
+section. A team token the calling thread leads opens every section it dispatches
+outside a scope (`fork`, `fork_sized`, `for_ranges`, `broadcast`) with one
+`sched_setaffinity` onto `home` and one back to its own mask at the end of the
+section, also on unwind (`pin::home_pin`, a guard); a section inside a team
+scope is already covered by the scope's pin and skips it (the guard sees this
+thread's `PLACED`). So the leader is on `S[0]` while a section runs, which is
+what #33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls
+per outermost section (2.1 us on an empty 8-way section) and none per scope. The
+leader is placed for a scope that is not the root token's too (a reborrow, which
+carries no leader guard of its own: faer's `with_team` shape), and for a child
+that was handed out without a dispatch of its own (`fork_sized` with one share
+runs inline). Three things are never placed: a thread whose own mask has one CPU
+or does not hold `home` (a reserved member pinned to `S[k]`, a caller that
+narrowed itself away from `S[0]`; a leader is never moved outside the mask its
+caller gave it), a child that a member leads (its share was not given the
+leader's CPU), and a thread already pinned by an enclosing scope or section.
 
-The pin belongs to the creating thread. A `Team` is `Send` and `Sync`: a token
-minted on another thread has an unplaced leader, and a team dropped on another
-thread restores nothing (that thread was not moved), so the creating thread keeps
-`{S[0]}`. Between tokens the creating thread stays on `{S[0]}`, so a vendor call
-it makes directly runs on one CPU; it goes through `TeamExec::external`, or
-through `Exec::external`, which runs on the pool. Before this rule the leader's
-pin was held by the scope, and a token used without a scope had the leader on its
-whole mask (`e59dbbc`, #45); this is a breaking change in where a `Team`'s caller
-runs.
+Why not the `Team`-held pin of #45: it keeps the calling thread on `{S[0]}` for
+the life of the team, and the caller's thread is not ours. `tenferro`'s
+`CpuEngine::new` runs `pool.into_team(width)` on the thread that builds the
+engine, keeps the `Team` for the engine's life, and constructs its vendor
+backend from that same thread, so a lazily created MKL/OpenBLAS thread pool, any
+plain `std::thread::spawn`, and a second `Pool` built there all inherited a
+one-CPU mask (measured on evo2, 32 CPUs, width 8, see #52). Why not the same pin
+held by the token instead: a token is not the unit that needs the pin either,
+and a guard that is entered on one thread and dropped on another has to restore
+nothing on the second one, which the section guard cannot get wrong.
+
+The record belongs to the team. A `Team` is `Send` and `Sync`: a token used on
+another thread places that thread for its sections too, from the same record,
+and only inside the mask that thread has; its mask is what it was afterwards. A
+whole-team root scope from another thread re-places the team, so the record
+follows the latest placement and a section never sends its leader to a CPU a
+member of an older placement holds. A scope that places nobody clears the
+record. A team of one, a mask with fewer CPUs than participants and pinning
+turned off place nothing, as before.
 
 The earlier fix of #33, a home for the leader kept on the `Team` and a nudge onto
 it before every section (#43, `e4fe0f4`), **landed, not measured**: `01bb587d`,
 which the reporter re-ran, is the commit before that change, and the first nodes
 of the same model did not reproduce #33 on 0.4.0 either (null controls), so no
 run has measured #43 either way. It was removed in #45 for the scope-held pin.
+The per-section pin added for #52 is the same unit as that nudge but *holds* the
+pin for the section instead of handing `S` back immediately, because the drift
+measured below at n = 4096 shows that a leader which keeps its whole mask does
+not stay where it was moved.
 
 Measured on broccoli (64 CPUs, otherwise idle), `into_team(64)` and then a fresh
 `team.exec(64).fork_sized(&[1; 64], ..)` per call, about 2.8 ms of arithmetic per
@@ -815,9 +846,36 @@ sleep, move): the leader on `S[0]` (`sched_getcpu`) with mask `{S[0]}` in 40 of 
 calls of every run, every member alone on its own pinned CPU in 40 of 40, medians
 3.1-3.2 ms (minimum 3.0 ms), and `TeamExec::external` widened to `S` and restored
 `{S[0]}`. The probe is not in the repository; the tests
-`a_team_pins_its_creating_thread_until_it_drops` and
+`a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer`,
+`into_team_leaves_the_callers_cpu_set_as_it_was`,
+`a_thread_spawned_while_a_team_lives_is_not_confined_to_one_cpu` and
 `the_reported_wide_fork_sized_path_keeps_every_participant_alone_on_its_cpu`
 assert the placement on this path.
+
+Measured on evo2 (32 CPUs allowed, `taskset -c 0-7`, release, `into_team(8)` and
+a fresh `team.exec(8).fork_sized(&[1; 8], ..)` per call, 40 calls, one run per
+cell; the shares do no work, so the cell times the dispatch and the placement,
+not arithmetic). The mask rows are `/proc/thread-self/status`
+`Cpus_allowed_list` of the calling thread:
+
+| phase | 0.5.1 (team-held pin) | this change |
+| --- | --- | --- |
+| before the `Team` | `0-7` | `0-7` |
+| after `into_team(8)` | `0` | `0-7` |
+| thread started while the team lives | `0` | `0-7` |
+| 4 workers of a second pool built there | all `0` | all `0-7` |
+| after the `Team` | `0-7` | `0-7` |
+| leader in its share, caller left where it is | `S[0]` 40/40, 1.7 us per call | `S[0]` 40/40, 3.8 us per call |
+| leader in its share, caller moved off `S[0]` first | `S[0]` 0/40, **5.9 ms per call** | `S[0]` 40/40, 10 us per call |
+
+The last row is #33 itself: on 0.5.1 the leader's placement is the team's, and a
+caller that is not on `S[0]` dispatches with the leader on a member's CPU, which
+costs a scheduler slice per section (5.9 ms against 10 us). With the section
+pin the leader is home for every section, at **one `sched_getaffinity` and two
+`sched_setaffinity` calls per outermost section**: 1.6 us for the set/restore
+pair on this host, 2.1 us for the whole hook on an empty 8-way section. A
+section inside a team scope, or a nested one, pays nothing (the guard sees the
+enclosing pin).
 
 `Pool::pin_skips` counts every root scope that could not be placed, as before.
 The doc-hidden `Pool::leader_moves` counter belonged to the nudge and is gone.

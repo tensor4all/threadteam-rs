@@ -791,8 +791,8 @@ section. A team token the calling thread leads opens every section it dispatches
 outside a scope (`fork`, `fork_sized`, `for_ranges`, `broadcast`) with one
 `sched_setaffinity` onto `home` and one back to its own mask at the end of the
 section, also on unwind (`pin::home_pin`, a guard); a section inside a team
-scope is already covered by the scope's pin and skips it (the guard sees this
-thread's `PLACED`). So the leader is on `S[0]` while a section runs, which is
+scope is already covered by the scope's pin and skips it (the thread's mask is
+already the one CPU it was placed on, and a mask of one CPU is never narrowed). So the leader is on `S[0]` while a section runs, which is
 what #33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls
 per outermost section (2.1 us on an empty 8-way section) and none for a section
 that runs inside a placed scope; the scope itself pays one pin (`LeaderPin` for a
@@ -800,11 +800,15 @@ whole-team scope, `home_pin` for one that is narrower). The
 leader is placed for a scope that is not the root token's too (a reborrow, which
 carries no leader guard of its own: faer's `with_team` shape), and for a child
 that was handed out without a dispatch of its own (`fork_sized` with one share
-runs inline). Three things are never placed: a thread whose own mask has one CPU
-or does not hold `home` (a reserved member pinned to `S[k]`, a caller that
-narrowed itself away from `S[0]`; a leader is never moved outside the mask its
-caller gave it), a child that a member leads (its share was not given the
-leader's CPU), and a thread already pinned by an enclosing scope or section.
+runs inline). Three things are never placed: a thread whose own mask has one CPU or does not
+hold `home` (a reserved member pinned to `S[k]`, a caller that narrowed itself
+away from `S[0]`; a leader is never moved outside the mask its caller gave it), a
+child that a member leads (its share was not given the leader's CPU), and a
+thread whose mask has left the placement it already has — a caller that widened
+itself out of `S` — which is refused rather than moved outside that placement.
+Being placed is not itself a reason to decline: a team scope entered inside
+`TeamExec::external` places this thread on the nested team's home and puts the
+enclosing placement back when it ends (threadteam-rs#54).
 
 Why not the `Team`-held pin of #45: it keeps the calling thread on `{S[0]}` for
 the life of the team, and the caller's thread is not ours. `tenferro`'s

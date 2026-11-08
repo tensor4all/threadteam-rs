@@ -1161,7 +1161,9 @@ struct ScopePin(#[allow(dead_code)] Option<crate::pin::LeaderPin>);
 /// Places a root team scope on the calling thread's CPU set `S`: the leader is
 /// pinned to `S[0]` for the life of the scope (`pin::LeaderPin`, one
 /// `sched_setaffinity` now and one when the returned guard drops), member `k`
-/// pins itself onto `S[k]`.
+/// pins itself onto `P[k]`, the `k`-th CPU of the placement order of `S` under
+/// the pool's `PinStrategy` (`pin::order`: round-robin over NUMA nodes by
+/// default, `S[k]` under `Pack`).
 ///
 /// When `S` has fewer CPUs than the team has participants nothing is pinned:
 /// the skip is counted (`Pool::pin_skips`) and the members restore their own
@@ -1193,14 +1195,19 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
         team.unpin_section();
         return Some(ScopePin(None));
     }
-    // The leader's home is `S[0]`, the CPU no member takes. It is pinned there
-    // before the pin section, so the scope opens with the leader home too, and
-    // recorded for the sections and reborrowed scopes that follow.
-    let leader = crate::pin::nth(&set, 0).and_then(|home| crate::pin::LeaderPin::enter(&set, home));
+    // Participant `k`'s CPU under the pool's strategy (`pin::order`). The
+    // leader's home is participant 0's, which is `S[0]` under every strategy and
+    // which no member takes. It is pinned there before the pin section, so the
+    // scope opens with the leader home too, and recorded for the sections and
+    // reborrowed scopes that follow.
+    let order = crate::pin::Placement::of(&set, awake.pin_strategy, team.size().get());
+    let leader = order
+        .get(0)
+        .and_then(|home| crate::pin::LeaderPin::enter(&set, home));
     if let Some(placement) = placement {
-        placement.store(crate::pin::home_of(&set), Ordering::Relaxed);
+        placement.store(crate::pin::home_of(&order), Ordering::Relaxed);
     }
-    team.pin_section(&set);
+    team.pin_section(&order);
     Some(ScopePin(leader))
 }
 

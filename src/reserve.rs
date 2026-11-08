@@ -47,7 +47,7 @@ impl Drop for LeaderGuard<'_> {
 ///   (`fork`, `for_ranges`, `broadcast`) and every scope that is not the root
 ///   token's own opens with the leader on `S[0]`, the CPU no member takes, and
 ///   the leader has its own mask back when the section or scope ends.
-///   The members sit on `S[1..]` from the acknowledgement scope of
+///   The members sit on CPUs of `S` other than `S[0]` from the acknowledgement scope of
 ///   `into_team` until the team is dropped, so each participant is on its own
 ///   CPU. Nothing is pinned between sections: `into_team` returns with the
 ///   calling thread's mask unchanged, and a vendor library or a plain thread
@@ -222,7 +222,7 @@ impl Pool {
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),
             };
         // Nothing is pinned here. The acknowledgement scope below places the
-        // members on `S[1..]` and records `S[0]` in `placement`, so the sections
+        // members on `S` minus `S[0]` (`pin::order`) and records `S[0]` in `placement`, so the sections
         // a token dispatches afterwards put the leader on that one CPU and give
         // it its own mask back (`pin::home_pin`), while the calling thread keeps
         // its mask between sections.

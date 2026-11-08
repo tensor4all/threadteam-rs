@@ -385,7 +385,7 @@ impl<'team> TeamExec<'team> {
     ///   dispatched while the leader is wide, and the leader needs no placement
     ///   check before a section. That is how the rule is kept at no cost.
     /// * The members stay reserved (spinning or parked per the team's
-    ///   [`WaitPolicy`]); they are **not** lent. Their CPUs are `S[1..]`, which
+    ///   [`WaitPolicy`]); they are **not** lent. Their CPUs are in `S` minus `S[0]`, which
     ///   the vendor team may also use: to give them to Rayon, use
     ///   [`Exec::external`](crate::Exec::external) instead.
     /// * Where nothing was placed (pinning off, a mask smaller than the team,
@@ -484,24 +484,27 @@ impl<'team> TeamExec<'team> {
         section(self.awake, &|pos| ids[pos], &body, geometry);
     }
 
-    /// Places every member on its own CPU of `set`: member `k` (participant
-    /// `k >= 1`) pins itself onto the `k`-th set CPU. The caller has checked
-    /// that `set` has a CPU for every participant; nothing wraps. The leader,
-    /// participant 0, is not pinned here: `pin_scope` has already pinned it to
-    /// `set[0]`, the CPU no member takes, for the life of the scope (see
-    /// [`PoolBuilder::pin_participants`]).
+    /// Places every member on its own CPU of `placement`: member `k`
+    /// (participant `k >= 1`) pins itself onto `placement.get(k)`. The caller
+    /// has checked that the placement has a CPU for every participant; nothing
+    /// wraps. The leader, participant 0, is not pinned here: `pin_scope` has
+    /// already pinned it to `placement.get(0)` (`S[0]`), the CPU no member
+    /// takes, for the life of the scope (see [`PoolBuilder::pin_participants`]).
     ///
     /// One section of the existing machinery, so all participants are on their
     /// own threads; it also serves as the rendezvous that precedes any user
     /// section. Each member changes its own affinity, and saves its previous
     /// mask first (once per reservation). Best effort: an empty or refused set
     /// leaves a member where it was.
-    pub(crate) fn pin_section(&mut self, set: &crate::pin::CpuMask) {
+    pub(crate) fn pin_section(&mut self, placement: &crate::pin::Placement) {
         self.reborrow().run_with_pin(
             |p| {
                 let _ = p.barrier();
                 if p.index() > 0 {
-                    crate::pin::pin_to(set, p.index());
+                    if let Some(cpu) = placement.get(p.index()) {
+                        // Best effort: a refused pin leaves the member where it was.
+                        let _ = crate::pin::set_here_to(cpu);
+                    }
                 }
             },
             true,

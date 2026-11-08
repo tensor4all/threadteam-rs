@@ -584,7 +584,9 @@ per-section check, no move and restore around it. A *token* section dispatched
 inside the scope is the exception the next subsection describes: with a nonzero
 `home` it calls `home_pin`, which reads the mask and declines, so it pays the read
 and no write.
-Members keep `S[k]`, `k >= 1`. Arm B above is this rule for a scope.
+Members keep one CPU of `S` each, `P[k]` for `k >= 1` (which CPUs is the
+`PinStrategy` below; `P[0]` is always `S[0]`). Arm B above is this rule for a
+scope.
 
 The crate used to do something cleverer: it placed the leader on `S[0]`
 immediately before **every section** and handed its whole mask back at once, so
@@ -600,6 +602,78 @@ measurement here favours it. It was not re-measured on evo2 for this change (a
 campaign is running there). The vendor-call half of the reason the nudge existed
 is answered by the widening call below; the drift half by the pin itself, held
 by the scope or, for a `Team`, by the section (see "A `Team`'s leader" below).
+
+#### Which CPUs the members take: `PinStrategy` (threadteam-rs#57)
+
+Until 0.5.1 member `k` took `S[k]`, the `k`-th CPU of the caller's mask in
+ascending order, so a team narrower than `S` always sat on the lowest CPUs of
+`S` and, on a multi-socket host, on its first NUMA nodes. Work that writes a
+freshly allocated destination places its pages by first touch on the nodes of
+the threads that write it, so that write used only part of the machine's memory
+controllers.
+
+**The rule now: participant `k` takes `P[k]`, where `P` deals the CPUs of `S`
+round-robin over the NUMA nodes `S` spans** (`PinStrategy::Spread`, the
+default): the first CPU of each node (nodes in the order of their lowest CPU in
+`S`), then the second CPU of each node that has one, and so on, ascending within
+a node. Two nodes `{0, 1}` and `{2, 3}` give `P = 0, 2, 1, 3`. The old order is
+kept, named and reachable: `PoolBuilder::pin_strategy(PinStrategy::Pack)` gives
+`P[k] = S[k]`.
+
+Invariants, under both strategies:
+
+* `P` is a permutation of `S`: a team never takes a CPU outside the caller's
+  mask, no two participants share a CPU, and nothing wraps (a set too small for
+  the team still places nobody, as before).
+* `P[0] = S[0]` (its node is first, and it is that node's first CPU), so the
+  leader's home, the `Team`'s recorded `pin::Home`, `home_pin` and the nested
+  placement of threadteam-rs#54/#55 are unchanged.
+* Under `Spread`, a team of `n` participants on a mask that spans `m` nodes
+  covers `min(n, m)` of them: it is never concentrated on fewer nodes than `S`
+  spans unless it is smaller than the node count allows.
+
+How it is computed: `pin::order(mask, topology, strategy, out)` is a pure
+function of the mask (ascending CPU list), a node topology and the strategy,
+tested without the hardware on synthetic two- and four-node topologies (every
+mask of an 8-CPU machine, every team size) in `src/pin.rs`. At run time the
+leader computes the order once per placing root scope into a stack array
+(`pin::Placement`, no allocation, one sort of at most 1024 entries) and member
+`k` reads its entry in the pin section. The host topology is read once per
+process from `/sys/devices/system/node/node*/cpulist` when the first pool that
+spreads is built; when sysfs lists no nodes (or off Linux) every CPU is in one
+group and `Spread` places exactly as `Pack`. CPUs a partial topology does not
+name are one group of their own. SMT siblings are not treated specially: within
+a node the order is ascending CPU number, which on the usual Linux numbering
+fills physical cores before their siblings.
+
+**The trade-off, and why `Spread` is the default.** The decision rests on the
+allocation pattern of the stack, not on a microbenchmark: tensor4all allocates a
+fresh destination for essentially every contraction, so first touch is the
+common case, while a warm destination is the one a caller has to arrange. The
+reporter of #57 priced both directions (their measurement, not repeated here:
+Xeon Platinum 9242, 2 × 48 cores, 4 NUMA nodes, a 96-thread pool, a strided
+permutation into a destination with 48 participants, ABBA ×6, median µs):
+
+| placement | fresh f64 destination | warm destination |
+| --- | --- | --- |
+| 0.4.0 default, members on `S[k]` (packed onto nodes 0-1) | 190 | **39** |
+| 0.4.0, `pin_participants(false)` | **121** | 52 |
+
+In the reporter's numbers the packed team was 1.57× slower than unpinned on the
+fresh destination and 1.33× faster on the warm one, which they attribute to the
+compact team sharing caches. Paying 1.57× on the common case to win 1.33× on the
+uncommon one is the wrong default for a library, so the default spreads; a
+caller that has measured warm destinations sets `Pack`. **What `Spread` may give
+up is that warm case**: whoever re-packs the default should see the 39 against
+52 µs first.
+
+**Not verified here.** The table compares packed against *unpinned*, not
+against `Spread`, and it is the reporter's measurement. No host in this fleet
+has more than one NUMA node (broccoli and primerose report one), so this change
+makes no performance claim: whether `Spread` recovers the fresh-destination time
+is unmeasured, and the node-coverage property is checked by the unit tests
+only. The re-measurement on a multi-node host is left to the reporter of #57 as
+the acceptance step.
 
 #### Widening the leader for a vendor call: `TeamExec::external`
 

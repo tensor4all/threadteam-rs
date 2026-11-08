@@ -105,8 +105,7 @@ fn kind_is_decided_at_call_time() {
         .build()
         .unwrap()
         .into_team(4)
-        .ok()
-        .expect("idle pool");
+        .unwrap_or_else(|_| panic!("idle pool"));
     let exec = team.exec(4);
     assert_eq!(exec.dispatch_cost(nz(4)), us(1));
     assert_eq!(exec.width_for(us(1_000), 1).get(), 4);

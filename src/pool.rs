@@ -3,6 +3,7 @@
 use crate::awake::Awake;
 use crate::cost::DispatchCosts;
 use crate::error::Error;
+use crate::pin::PinStrategy;
 use crate::policy::{Qos, WaitPolicy};
 use core::fmt;
 use core::num::NonZeroUsize;
@@ -233,6 +234,21 @@ impl Pool {
         self.awake.pin
     }
 
+    /// The placement strategy of this pool's pinned teams
+    /// ([`PoolBuilder::pin_strategy`]; [`PinStrategy::Spread`] by default).
+    /// Reported whether or not pinning is on.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// let pool = threadteam::Pool::builder().threads(1).build()?;
+    /// assert_eq!(pool.pin_strategy(), threadteam::PinStrategy::Spread);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    pub fn pin_strategy(&self) -> PinStrategy {
+        self.awake.pin_strategy
+    }
+
     /// Root team scopes of this pool that placed nobody because the calling
     /// thread's CPU set had fewer CPUs than the team had participants.
     ///
@@ -447,6 +463,7 @@ pub struct PoolBuilder {
     qos: Option<Qos>,
     costs: DispatchCosts,
     pin_participants: bool,
+    pin_strategy: PinStrategy,
     spin_polls: u32,
 }
 
@@ -462,6 +479,7 @@ impl PoolBuilder {
             qos: None,
             costs: DispatchCosts::host_default(),
             pin_participants: PIN_PARTICIPANTS_DEFAULT,
+            pin_strategy: PinStrategy::Spread,
             spin_polls: SPIN_POLLS_DEFAULT,
         }
     }
@@ -663,9 +681,12 @@ impl PoolBuilder {
     ///   `sched_setaffinity` at scope entry and one at scope exit (which also
     ///   runs on unwind) giving it `S` back, and nothing in between: no check
     ///   and no move before a section;
-    /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`:
-    ///   member `k` (participant `k`, counting the leader as 0) onto the `k`-th
-    ///   set CPU of `S`. The members take `S` minus `S[0]`.
+    /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`
+    ///   other than `S[0]`, no two on one CPU. Which CPUs is the
+    ///   [`pin_strategy`](Self::pin_strategy): by default round-robin over the
+    ///   NUMA nodes `S` spans ([`PinStrategy::Spread`]); with
+    ///   [`PinStrategy::Pack`], member `k` (participant `k`, counting the
+    ///   leader as 0) onto the `k`-th set CPU of `S`.
     ///
     /// **Nothing wraps.** When `S` has fewer CPUs than the team has
     /// participants, nobody is placed: the scope runs with the scheduler's
@@ -784,6 +805,31 @@ impl PoolBuilder {
         self
     }
 
+    /// Which CPUs of the caller's set `S` the participants of a root team scope
+    /// take when [`pin_participants`](Self::pin_participants) is on.
+    /// [`PinStrategy::Spread`] by default: participants go round-robin over the
+    /// NUMA nodes `S` spans, so a team narrower than `S` is not concentrated on
+    /// the lowest nodes. [`PinStrategy::Pack`] is the placement of 0.4 to 0.5,
+    /// member `k` on `S[k]`. Under both the leader is on `S[0]`, every
+    /// participant has its own CPU of `S`, and nothing wraps; on a one-node mask
+    /// they place identically. See [`PinStrategy`] for the trade-off (fresh
+    /// destinations favour `Spread`, warm ones `Pack`) and
+    /// `docs/design/placement.md`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use threadteam::{PinStrategy, Pool};
+    /// let pool = Pool::builder().threads(2).pin_strategy(PinStrategy::Pack).build()?;
+    /// assert_eq!(pool.pin_strategy(), PinStrategy::Pack);
+    /// # Ok::<(), threadteam::Error>(())
+    /// ```
+    #[must_use]
+    pub fn pin_strategy(mut self, strategy: PinStrategy) -> Self {
+        self.pin_strategy = strategy;
+        self
+    }
+
     /// Spin budget of a team wait, in polls of one PAUSE (YIELD on aarch64):
     /// how long a reserved member waiting for work, a leader in a section's
     /// join, or a participant in a barrier spins before it yields a few times
@@ -828,6 +874,11 @@ impl PoolBuilder {
         if self.threads == Some(0) {
             return Err(Error::ZeroThreads);
         }
+        if self.pin_participants && self.pin_strategy == PinStrategy::Spread {
+            // Read the NUMA topology now (once per process), so a root scope
+            // never touches sysfs or allocates for it.
+            let _ = crate::pin::host_topology();
+        }
         self.build_checked()
     }
 
@@ -865,6 +916,7 @@ impl PoolBuilder {
                 self.acquire_timeout,
                 self.costs,
                 self.pin_participants,
+                self.pin_strategy,
                 self.spin_polls,
             )),
         })
@@ -932,6 +984,7 @@ impl PoolBuilder {
                 self.acquire_timeout,
                 self.costs,
                 self.pin_participants,
+                self.pin_strategy,
                 self.spin_polls,
             )),
         })
@@ -946,6 +999,7 @@ impl fmt::Debug for PoolBuilder {
             .field("wait", &self.wait)
             .field("acquire_timeout", &self.acquire_timeout)
             .field("pin_participants", &self.pin_participants)
+            .field("pin_strategy", &self.pin_strategy)
             .finish_non_exhaustive()
     }
 }

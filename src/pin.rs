@@ -21,8 +21,15 @@
 //!   comes back when *its* scope ends ([`home_pin`]: a placed thread refuses a
 //!   mask that has left the placement, not every second placement), so two
 //!   independent pools nest (threadteam-rs#54).
-//! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
-//!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
+//! * **Member `k >= 1` pins itself onto `P[k]`**, the `k`-th CPU of the
+//!   placement order [`order`] gives `S` under the pool's [`PinStrategy`], so
+//!   the members take `n - 1` CPUs of `S` other than `S[0]`, one CPU each.
+//!   `P[0]` is always `S[0]`, the leader's home. Under
+//!   [`PinStrategy::Spread`] (the default) `P` deals the CPUs of `S`
+//!   round-robin over the NUMA nodes `S` spans, so a team narrower than `S` is
+//!   spread over every node it can reach (threadteam-rs#57); under
+//!   [`PinStrategy::Pack`] `P` is `S` in ascending order, the placement before
+//!   0.6 (`P[k] = S[k]`). A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
 //! * **No wrapping.** When `S` has fewer CPUs than the team has participants
 //!   nothing is pinned (today's unpinned placement), the members of a persistent
@@ -33,9 +40,30 @@
 //! Every affinity change is made by the thread that is being moved, with
 //! `sched_setaffinity(0, ...)`, so no thread ever changes another thread's
 //! placement and there is no thread-id bookkeeping. Linux only: on other
-//! targets the option is accepted and does nothing. Nothing here allocates: the
-//! masks are `cpu_set_t` values on the stack and the `k`-th set CPU is found by
-//! scanning one.
+//! targets the option is accepted and does nothing. Nothing on a scope's path
+//! allocates: the masks are `cpu_set_t` values on the stack and the placement
+//! order is a stack array the leader computes once per root scope. The node
+//! topology is read from sysfs once per process, when the first pool that
+//! spreads is built ([`host_topology`]).
+//!
+//! **A mask is not a provider's thread count.** Widening the leader to `S`
+//! ([`widened`], `TeamExec::external`) only decides *where* a vendor library's
+//! threads may run; *how many* threads OpenMP, OpenBLAS or MKL starts is their
+//! own setting (`OMP_NUM_THREADS`, `OPENBLAS_NUM_THREADS`, `MKL_NUM_THREADS`,
+//! or the library's API), not anything this module sets. A provider left at its
+//! default may start one thread per CPU of the machine whatever the mask is;
+//! one started from a one-CPU thread is confined to that CPU whatever its count
+//! is. Both knobs have to be right; see tenferro-rs `PERFORMANCE_TIPS.md`.
+//!
+//! **Which CPUs, and when they are decided.** The [`PinStrategy`] is fixed for
+//! a pool's life ([`PoolBuilder::pin_strategy`](crate::PoolBuilder::pin_strategy))
+//! and the host's node topology for the process's ([`host_topology`]). The
+//! order `P` ([`order`]) is computed by the leader once per placing root scope
+//! ([`Placement::of`]); the sections inside a scope, and the sections a `Team`
+//! token dispatches without a scope, never recompute it: the members keep the
+//! CPUs that scope gave them. Under [`PinStrategy::Spread`] the NUMA effect is
+//! **not verified on this project's hosts**, which all have one NUMA node; on a
+//! one-node mask it places exactly as [`PinStrategy::Pack`].
 //!
 //! The same CPU set decides whether a root scope is *oversubscribed* (see
 //! [`available`]): a team of more participants than the caller's set has CPUs
@@ -54,7 +82,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, subset, CpuMask};
+pub(crate) use sys::{contains, cpus, read_here, set_here, set_here_to, subset, CpuMask};
 
 /// Number of CPUs the calling thread's team is spread over: the CPUs a root
 /// team scope entered on this thread may place its participants on.
@@ -105,19 +133,290 @@ pub(crate) fn oversubscribed(participants: usize) -> bool {
     participants > available()
 }
 
-/// Pins the calling thread onto the `k`-th CPU of `set`.
+/// How the participants of a root team scope are laid out on the calling
+/// thread's CPU set `S` when [`PoolBuilder::pin_participants`] is on
+/// ([`PoolBuilder::pin_strategy`]).
 ///
-/// Called by a member for itself (`k >= 1`); the leader never calls it. Never
-/// wraps: `k >= |set|` leaves the thread where it was (the root scope does not
-/// pin at all in that case, see `exec::pin_scope`, so this is only a second
-/// line of defence). It does not look at the current mask first: it asks the
-/// kernel for the single CPU `set[k]` wherever the thread happens to be, so a
-/// thread that was outside `set` is moved into it. Best effort: an empty set,
-/// or a refused syscall (the CPU is not in the caller's permitted cpuset),
-/// leaves the thread where it was.
-pub(crate) fn pin_to(set: &CpuMask, k: usize) {
-    if let Some(cpu) = nth(set, k) {
-        set_here_to(cpu);
+/// Both strategies place participant 0, the leader, on `S[0]`, give every
+/// participant its own CPU of `S`, never use a CPU outside `S`, and never wrap.
+/// They differ only in *which* CPUs a team narrower than `S` takes, which
+/// matters when `S` spans several NUMA nodes. On a host (or a mask) with one
+/// node, or where the kernel does not report nodes, they place identically.
+///
+/// [`PoolBuilder::pin_participants`]: crate::PoolBuilder::pin_participants
+/// [`PoolBuilder::pin_strategy`]: crate::PoolBuilder::pin_strategy
+///
+/// # Examples
+///
+/// ```
+/// use threadteam::{PinStrategy, Pool};
+/// let pool = Pool::builder().threads(2).build()?;
+/// assert_eq!(pool.pin_strategy(), PinStrategy::Spread); // the default
+/// let pool = Pool::builder().threads(2).pin_strategy(PinStrategy::Pack).build()?;
+/// assert_eq!(pool.pin_strategy(), PinStrategy::Pack);
+/// # Ok::<(), threadteam::Error>(())
+/// ```
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum PinStrategy {
+    /// **The default.** Participant `k` goes round-robin over the NUMA nodes
+    /// `S` spans, then in ascending CPU order within a node: the first
+    /// participant on each node (nodes in the order of their lowest CPU in
+    /// `S`), then the second on each node that has one left, and so on.
+    ///
+    /// **Invariant:** a team never sees a CPU outside `S`, and it is never
+    /// concentrated on fewer nodes than `S` spans unless it has fewer
+    /// participants than `S` spans nodes: a team of `n` participants on a mask
+    /// spanning `m` nodes covers `min(n, m)` of them.
+    ///
+    /// Chosen as the default because a freshly allocated destination is the
+    /// common case in the tensor4all stack, and first-touch places its pages on
+    /// the nodes of the threads that write it: a packed team uses only part of
+    /// the machine's memory controllers. **What it may cost:** the reporter of
+    /// threadteam-rs#57 saw a warm destination, already in cache, run faster
+    /// with the team packed, which they attribute to shared caches. Their
+    /// report (Xeon Platinum
+    /// 9242, 2 × 48 cores, 4 NUMA nodes, a strided permutation with 48
+    /// participants, the reporter's measurement) priced both directions: with
+    /// the team packed onto the lowest nodes, 190 µs on a fresh f64 destination
+    /// against 121 µs unpinned, but 39 µs warm against 52 µs. Choose
+    /// [`Pack`](Self::Pack) when you have measured that your destinations are
+    /// warm.
+    #[default]
+    Spread,
+    /// Participant `k` goes on `S[k]`, the `k`-th CPU of `S` in ascending
+    /// order: a team narrower than `S` sits on its lowest CPUs, and on a
+    /// multi-socket host on its first nodes. The placement of threadteam 0.4
+    /// to 0.5. In the threadteam-rs#57 report (the reporter's measurement,
+    /// packed against unpinned) it was ahead on a warm destination (39 against
+    /// 52 µs) and behind on a fresh one (190 against 121 µs); this crate has not
+    /// measured it on a multi-node host.
+    Pack,
+}
+
+/// The most CPUs a placement can name: the bits of a Linux `cpu_set_t`.
+pub(crate) const MAX_CPUS: usize = 1024;
+
+/// Group index of a CPU whose node is not known: one group of its own, after
+/// every node id a placement can see.
+const UNKNOWN: usize = MAX_CPUS;
+
+/// The NUMA node of each CPU: the input of [`order`].
+///
+/// Built from "node `i` holds these CPUs" lists ([`Topology::from_nodes`]),
+/// once per process for the host ([`host_topology`]), or by a test for a
+/// synthetic machine. A CPU no list names is in no node; all such CPUs are
+/// placed as one group of their own.
+#[derive(Debug, Default)]
+pub(crate) struct Topology {
+    /// `node_of[cpu]`, `u16::MAX` for a CPU no node names.
+    node_of: Box<[u16]>,
+}
+
+impl Topology {
+    /// The topology in which `nodes[i]` lists the CPUs of node `i`. A CPU named
+    /// twice keeps its last node; CPUs and nodes past [`MAX_CPUS`] are ignored.
+    pub(crate) fn from_nodes(nodes: &[Vec<usize>]) -> Self {
+        let width = nodes
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&cpu| cpu < MAX_CPUS)
+            .max()
+            .map_or(0, |cpu| cpu + 1);
+        let mut node_of = vec![u16::MAX; width].into_boxed_slice();
+        for (node, cpus) in nodes.iter().enumerate().take(MAX_CPUS) {
+            for &cpu in cpus {
+                if let Some(slot) = node_of.get_mut(cpu) {
+                    *slot = node as u16;
+                }
+            }
+        }
+        Topology { node_of }
+    }
+
+    /// The group `cpu` is placed in: its node, or [`UNKNOWN`].
+    fn group(&self, cpu: u16) -> usize {
+        match self.node_of.get(usize::from(cpu)) {
+            Some(&node) if node != u16::MAX => usize::from(node),
+            _ => UNKNOWN,
+        }
+    }
+}
+
+/// The host's NUMA topology, read once per process from
+/// `/sys/devices/system/node/node*/cpulist`. Empty (every CPU in one group,
+/// so [`PinStrategy::Spread`] places as [`PinStrategy::Pack`]) off Linux and
+/// when sysfs does not list the nodes.
+///
+/// The first call allocates and reads files; `PoolBuilder::build` makes it for
+/// a spreading pool, so a root scope never does.
+pub(crate) fn host_topology() -> &'static Topology {
+    static HOST: std::sync::OnceLock<Topology> = std::sync::OnceLock::new();
+    HOST.get_or_init(read_host_topology)
+}
+
+#[cfg(target_os = "linux")]
+fn read_host_topology() -> Topology {
+    let Ok(dir) = std::fs::read_dir("/sys/devices/system/node") else {
+        return Topology::default();
+    };
+    let mut nodes: Vec<Vec<usize>> = Vec::new();
+    for entry in dir.flatten() {
+        let name = entry.file_name();
+        let Some(id) = name
+            .to_str()
+            .and_then(|n| n.strip_prefix("node"))
+            .and_then(|n| n.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        if id >= MAX_CPUS {
+            continue;
+        }
+        let Ok(list) = std::fs::read_to_string(entry.path().join("cpulist")) else {
+            continue;
+        };
+        if nodes.len() <= id {
+            nodes.resize_with(id + 1, Vec::new);
+        }
+        nodes[id] = parse_cpulist(&list);
+    }
+    Topology::from_nodes(&nodes)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_host_topology() -> Topology {
+    Topology::default()
+}
+
+/// Parses a sysfs CPU list (`"0-3,8,10-11"`). Malformed pieces are skipped.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_cpulist(list: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for piece in list.trim().split(',').filter(|p| !p.is_empty()) {
+        let mut ends = piece.splitn(2, '-').map(|n| n.trim().parse::<usize>());
+        match (ends.next(), ends.next()) {
+            (Some(Ok(lo)), None) => cpus.push(lo),
+            (Some(Ok(lo)), Some(Ok(hi))) if lo <= hi => {
+                cpus.extend(lo..=hi.min(MAX_CPUS - 1));
+            }
+            _ => {}
+        }
+    }
+    cpus
+}
+
+/// The placement order of a mask: writes into `out` the CPU of participant
+/// `k = 0, 1, ...` and returns how many it wrote, `min(out.len(), mask.len())`.
+///
+/// A pure function of `(mask, topology, strategy)`, so the placement rule is
+/// tested without the hardware. `mask` lists the CPUs of `S` in ascending order
+/// (at most [`MAX_CPUS`] are read). The result is a prefix of a permutation of
+/// `mask`, so no CPU outside `S` is named and none twice, and `out[0]` is
+/// `mask[0]`:
+///
+/// * [`PinStrategy::Pack`]: `mask` itself.
+/// * [`PinStrategy::Spread`]: CPU `c` of node `g` gets the key `(r, o)`, where
+///   `r` is the number of CPUs of `mask` in node `g` below `c` and `o` is the
+///   rank of `g` among the nodes in the order of their lowest CPU in `mask`;
+///   the CPUs are listed by ascending key. So the first `m` participants (`m`
+///   nodes spanned) take one CPU on each node, the next take the second CPU of
+///   each node that has one, and so on. Two nodes `{0, 1}` and `{2, 3}` give
+///   `0, 2, 1, 3`.
+///
+/// No allocation: about 12 KiB of stack.
+pub(crate) fn order(
+    mask: &[u16],
+    topology: &Topology,
+    strategy: PinStrategy,
+    out: &mut [u16],
+) -> usize {
+    let m = mask.len().min(MAX_CPUS);
+    let n = out.len().min(m);
+    if strategy == PinStrategy::Pack {
+        out[..n].copy_from_slice(&mask[..n]);
+        return n;
+    }
+    // Per group: CPUs of `mask` seen so far, and the group's rank by first
+    // appearance (`u16::MAX` until it appears).
+    let mut seen = [0u16; UNKNOWN + 1];
+    let mut rank = [u16::MAX; UNKNOWN + 1];
+    let mut groups = 0u16;
+    let mut keyed = [(0u32, 0u16); MAX_CPUS];
+    for (slot, &cpu) in keyed.iter_mut().zip(&mask[..m]) {
+        let g = topology.group(cpu);
+        if rank[g] == u16::MAX {
+            rank[g] = groups;
+            groups += 1;
+        }
+        *slot = ((u32::from(seen[g]) << 16) | u32::from(rank[g]), cpu);
+        seen[g] += 1;
+    }
+    // Keys are distinct (one CPU per (group, position) pair), so an unstable
+    // sort is deterministic.
+    keyed[..m].sort_unstable_by_key(|&(key, _)| key);
+    for (o, &(_, cpu)) in out[..n].iter_mut().zip(&keyed[..m]) {
+        *o = cpu;
+    }
+    n
+}
+
+/// Participant `k`'s CPU on `mask` (ascending CPU list) under `topology` and
+/// `strategy`: entry `k` of [`order`], `None` when the mask has `k` or fewer
+/// CPUs (never wraps). The placement rule as a pure function of
+/// `(mask, topology, k)`; [`Placement::of`] computes all of them at once for a
+/// root scope. Under [`PinStrategy::Pack`] it is `mask[k]`, today's
+/// `nth(S, k)`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn cpu_for(
+    mask: &[u16],
+    topology: &Topology,
+    strategy: PinStrategy,
+    k: usize,
+) -> Option<u16> {
+    if k >= mask.len().min(MAX_CPUS) {
+        return None;
+    }
+    let mut out = [0u16; MAX_CPUS];
+    let n = order(mask, topology, strategy, &mut out[..=k]);
+    (n > k).then(|| out[k])
+}
+
+/// The placement of one root scope: participant `k`'s CPU, for every
+/// participant. Computed by the leader ([`Placement::of`]) and read by each
+/// member in the pin section.
+pub(crate) struct Placement {
+    cpus: [u16; MAX_CPUS],
+    len: usize,
+}
+
+impl Placement {
+    /// The placement of `participants` participants on `set` under `strategy`,
+    /// with the host's topology. Shorter than `participants` only when `set`
+    /// has fewer CPUs (the root scope does not place then).
+    pub(crate) fn of(set: &CpuMask, strategy: PinStrategy, participants: usize) -> Placement {
+        let mut mask = [0u16; MAX_CPUS];
+        let m = cpus(set, &mut mask);
+        let mut placement = Placement {
+            cpus: [0; MAX_CPUS],
+            len: 0,
+        };
+        let want = participants.min(MAX_CPUS);
+        // Pack never reads the topology; an empty one does not allocate, and
+        // does not make the scope read sysfs.
+        let empty = Topology::default();
+        let topology = match strategy {
+            PinStrategy::Pack => &empty,
+            PinStrategy::Spread => host_topology(),
+        };
+        placement.len = order(&mask[..m], topology, strategy, &mut placement.cpus[..want]);
+        placement
+    }
+
+    /// Participant `k`'s CPU, `None` past the placement (never wraps).
+    pub(crate) fn get(&self, k: usize) -> Option<usize> {
+        (k < self.len).then(|| usize::from(self.cpus[k]))
     }
 }
 
@@ -171,15 +470,15 @@ impl Drop for LeaderPin {
 /// placed, otherwise the CPU no member takes plus one.
 ///
 /// The `Team` stores one of these, and every root scope over its whole budget
-/// writes it: `nth(set, 0) + 1` of the set the scope placed the members in, or
+/// writes it: `S[0] + 1` of the set the scope placed the members in ([`home_of`]), or
 /// `0` when the scope placed nobody. A token reads it before each section it
 /// dispatches without a scope, and each scope it opens as a reborrow, so the
 /// leader goes home to the CPU the members of *that* placement left free.
 pub(crate) type Home = usize;
 
-/// The [`Home`] of a set: its first CPU plus one.
-pub(crate) fn home_of(set: &CpuMask) -> Home {
-    nth(set, 0).map_or(0, |cpu| cpu + 1)
+/// The [`Home`] of a placement: participant 0's CPU (`S[0]`) plus one.
+pub(crate) fn home_of(placement: &Placement) -> Home {
+    placement.get(0).map_or(0, |cpu| cpu + 1)
 }
 
 /// Pins the calling thread onto `home` for one section or scope and gives it its
@@ -383,24 +682,21 @@ mod sys {
         n.max(0) as usize
     }
 
-    /// Index of the `k`-th set CPU; `None` when the set has `k` or fewer CPUs
-    /// (never wrap: two participants on one CPU is the failure the placement
-    /// exists to prevent).
-    pub(crate) fn nth(mask: &CpuMask, k: usize) -> Option<usize> {
-        if k >= count(mask) {
-            return None;
-        }
-        let mut want = k;
-        for cpu in 0..SETSIZE {
+    /// Writes the CPUs of the set into `out` in ascending order; returns how
+    /// many (at most `out.len()`).
+    pub(crate) fn cpus(mask: &CpuMask, out: &mut [u16]) -> usize {
+        let mut n = 0;
+        for cpu in 0..SETSIZE.min(usize::from(u16::MAX)) {
+            if n == out.len() {
+                break;
+            }
             // SAFETY: reads one bit of a valid set.
             if unsafe { libc::CPU_ISSET(cpu, &mask.set) } {
-                if want == 0 {
-                    return Some(cpu);
-                }
-                want -= 1;
+                out[n] = cpu as u16;
+                n += 1;
             }
         }
-        None
+        n
     }
 }
 
@@ -435,14 +731,190 @@ mod sys {
         0
     }
 
-    pub(crate) fn nth(_mask: &CpuMask, _k: usize) -> Option<usize> {
-        None
+    pub(crate) fn cpus(_mask: &CpuMask, _out: &mut [u16]) -> usize {
+        0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `order` of `mask` on `nodes`, for `n` participants.
+    fn place(nodes: &[Vec<usize>], mask: &[u16], strategy: PinStrategy, n: usize) -> Vec<u16> {
+        let topology = Topology::from_nodes(nodes);
+        let mut out = vec![0u16; n];
+        let len = order(mask, &topology, strategy, &mut out);
+        out.truncate(len);
+        out
+    }
+
+    fn two_nodes() -> Vec<Vec<usize>> {
+        vec![vec![0, 1], vec![2, 3]]
+    }
+
+    fn four_nodes() -> Vec<Vec<usize>> {
+        vec![vec![0, 1], vec![2, 3], vec![4, 5], vec![6, 7]]
+    }
+
+    #[test]
+    fn spread_alternates_the_nodes_of_a_two_node_mask() {
+        let got = place(&two_nodes(), &[0, 1, 2, 3], PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 2, 1, 3]);
+    }
+
+    #[test]
+    fn pack_is_the_mask_in_ascending_order() {
+        let got = place(&two_nodes(), &[0, 1, 2, 3], PinStrategy::Pack, 4);
+        assert_eq!(got, [0, 1, 2, 3]);
+        let got = place(&two_nodes(), &[0, 1, 2, 3], PinStrategy::Pack, 2);
+        assert_eq!(got, [0, 1], "a narrow packed team sits on node 0");
+    }
+
+    #[test]
+    fn a_narrow_spread_team_covers_both_nodes() {
+        let got = place(&two_nodes(), &[0, 1, 2, 3], PinStrategy::Spread, 2);
+        assert_eq!(got, [0, 2]);
+    }
+
+    #[test]
+    fn a_team_of_one_on_a_four_node_mask_gets_one_cpu() {
+        let mask: Vec<u16> = (0..8).collect();
+        for strategy in [PinStrategy::Spread, PinStrategy::Pack] {
+            assert_eq!(
+                place(&four_nodes(), &mask, strategy, 1),
+                [0],
+                "{strategy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spread_never_leaves_the_mask() {
+        // The mask covers parts of three of the four nodes.
+        let got = place(&four_nodes(), &[1, 2, 3, 5], PinStrategy::Spread, 4);
+        assert_eq!(got, [1, 2, 5, 3]);
+    }
+
+    #[test]
+    fn uneven_nodes_drop_out_of_the_rotation_when_empty() {
+        let nodes = vec![vec![0, 1, 2], vec![3]];
+        let got = place(&nodes, &[0, 1, 2, 3], PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn nodes_are_visited_in_the_order_of_their_lowest_cpu() {
+        // Node 1 holds the lowest CPU, so it leads and `S[0]` stays first.
+        let nodes = vec![vec![4, 5], vec![0, 1]];
+        let got = place(&nodes, &[0, 1, 4, 5], PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 4, 1, 5]);
+        // Interleaved node numbering (node 0 = even CPUs, node 1 = odd).
+        let nodes = vec![vec![0, 2], vec![1, 3]];
+        let got = place(&nodes, &[0, 1, 2, 3], PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn without_a_topology_spread_places_as_pack() {
+        let mask: Vec<u16> = (0..6).collect();
+        let got = place(&[], &mask, PinStrategy::Spread, 6);
+        assert_eq!(got, mask, "every CPU in one unknown group");
+        // CPUs a partial topology does not name form one group of their own.
+        let got = place(&[vec![0, 1]], &[0, 1, 8, 9], PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 8, 1, 9]);
+    }
+
+    #[test]
+    fn a_placement_is_never_longer_than_the_mask() {
+        let got = place(&two_nodes(), &[0, 2], PinStrategy::Spread, 3);
+        assert_eq!(got, [0, 2], "no wrapping");
+    }
+
+    /// The invariant on `PinStrategy::Spread`, over every mask of an 8-CPU
+    /// machine with two and with four nodes and every team size: the placement
+    /// is a prefix of a permutation of the mask that starts at `S[0]`, and a team
+    /// of `n` covers `min(n, m)` of the `m` nodes the mask spans.
+    #[test]
+    fn spread_covers_as_many_nodes_as_the_team_allows() {
+        let two = vec![vec![0, 1, 2, 3], vec![4, 5, 6, 7]];
+        for nodes in [two, four_nodes()] {
+            let node_of = |cpu: u16| nodes.iter().position(|n| n.contains(&usize::from(cpu)));
+            for bits in 1u32..256 {
+                let mask: Vec<u16> = (0..8).filter(|c| bits & (1 << c) != 0).collect();
+                let mut spanned: Vec<_> = mask.iter().map(|&c| node_of(c)).collect();
+                spanned.sort();
+                spanned.dedup();
+                for n in 1..=mask.len() {
+                    let got = place(&nodes, &mask, PinStrategy::Spread, n);
+                    assert_eq!(got.len(), n);
+                    assert_eq!(got[0], mask[0], "the leader is on S[0]");
+                    let mut sorted = got.clone();
+                    sorted.sort();
+                    sorted.dedup();
+                    assert_eq!(sorted.len(), n, "no CPU twice: {got:?}");
+                    assert!(got.iter().all(|c| mask.contains(c)), "inside S");
+                    let mut covered: Vec<_> = got.iter().map(|&c| node_of(c)).collect();
+                    covered.sort();
+                    covered.dedup();
+                    assert_eq!(
+                        covered.len(),
+                        n.min(spanned.len()),
+                        "mask {mask:?}, n {n}: {got:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn on_a_one_node_mask_spread_and_pack_place_identically() {
+        // A mask inside one node of a multi-node machine, a one-node machine,
+        // and a machine whose nodes the kernel does not report.
+        let cases: [(Vec<Vec<usize>>, Vec<u16>); 3] = [
+            (four_nodes(), vec![2, 3]),
+            (vec![(0..8).collect()], (0..8).collect()),
+            (vec![], vec![1, 3, 4, 6]),
+        ];
+        for (nodes, mask) in cases {
+            let topology = Topology::from_nodes(&nodes);
+            for k in 0..=mask.len() {
+                let spread = cpu_for(&mask, &topology, PinStrategy::Spread, k);
+                let pack = cpu_for(&mask, &topology, PinStrategy::Pack, k);
+                assert_eq!(spread, pack, "mask {mask:?}, k {k}");
+                assert_eq!(pack, mask.get(k).copied(), "Pack is nth(S, k)");
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_for_is_entry_k_of_the_order() {
+        let topology = Topology::from_nodes(&two_nodes());
+        let mask = [0, 1, 2, 3];
+        let got: Vec<_> = (0..5)
+            .map(|k| cpu_for(&mask, &topology, PinStrategy::Spread, k))
+            .collect();
+        assert_eq!(got, [Some(0), Some(2), Some(1), Some(3), None]);
+    }
+
+    #[test]
+    fn a_narrow_spread_team_covers_all_four_nodes() {
+        let mask: Vec<u16> = (0..8).collect();
+        let got = place(&four_nodes(), &mask, PinStrategy::Spread, 4);
+        assert_eq!(got, [0, 2, 4, 6], "one CPU on each of the four nodes");
+    }
+
+    #[test]
+    fn sysfs_cpu_lists_parse() {
+        assert_eq!(parse_cpulist("0-3,8,10-11\n"), [0, 1, 2, 3, 8, 10, 11]);
+        assert_eq!(parse_cpulist(""), Vec::<usize>::new());
+        assert_eq!(parse_cpulist("5"), [5]);
+        assert_eq!(
+            parse_cpulist("x,2,3-1"),
+            [2],
+            "malformed pieces are skipped"
+        );
+    }
 
     /// The refusal assertion in `tests/pinning.rs` sees the mask, and a placement
     /// onto the CPU the thread is already on leaves the mask unchanged. What
@@ -458,7 +930,9 @@ mod tests {
         if width < 2 {
             return; // one allowed CPU: the placement is skipped by design
         }
-        let home = nth(&wide, 0).expect("a CPU in a non-empty mask");
+        let home = Placement::of(&wide, PinStrategy::Pack, 1)
+            .get(0)
+            .expect("a CPU in a non-empty mask");
         // A refused pin is supported behaviour (`LeaderPin::enter` returns `None`
         // and the scope places nobody), so this is a skip, not a failure.
         let Some(first) = LeaderPin::enter(&wide, home) else {

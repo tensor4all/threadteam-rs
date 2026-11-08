@@ -12,7 +12,7 @@ use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use threadteam::{Exec, Pool};
+use threadteam::{Exec, PinStrategy, Pool};
 
 /// A hang is a failure: abort the whole process if the test body stalls.
 fn watchdog() -> impl Drop {
@@ -75,10 +75,17 @@ impl Drop for Restrict {
     }
 }
 
+/// A pool for the placement tests. They check the leader's pin, the members'
+/// pins and their restores against the exact CPUs `S[k]`, so they use
+/// `PinStrategy::Pack`, whose order does not depend on the host's NUMA nodes.
+/// The default, `Spread`, places identically on a one-node mask; its order is a
+/// pure function tested in `src/pin.rs`, and
+/// `the_default_spread_strategy_places_inside_the_callers_set` covers it here.
 fn builder(width: usize, pin: bool) -> threadteam::PoolBuilder {
     Pool::builder()
         .threads(width)
         .pin_participants(pin)
+        .pin_strategy(PinStrategy::Pack)
         .idle_spin(Duration::from_millis(1))
         .acquire_timeout(Duration::from_secs(10))
 }
@@ -1774,4 +1781,104 @@ fn a_mask_that_left_the_placement_is_not_narrowed() {
             });
         })
         .expect("a team token opens its scope");
+}
+
+/// The default strategy (`Spread`) on whatever host runs the tests: every
+/// participant on its own CPU of the caller's set, the leader on `S[0]`, no
+/// member on `S[0]`, and the members' masks back when the pool is released. On
+/// a host whose mask spans one NUMA node this is also `S[k]`; the round-robin
+/// order on several nodes is checked without the hardware in `src/pin.rs`.
+#[test]
+fn the_default_spread_strategy_places_inside_the_callers_set() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 2 {
+        eprintln!("skipped: the process has fewer than 2 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let pool = Pool::builder()
+        .threads(width)
+        .idle_spin(Duration::from_millis(1))
+        .acquire_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    assert_eq!(pool.pin_strategy(), PinStrategy::Spread, "the default");
+    assert!(pool.pin_participants());
+    let seen = Seen::default();
+    let mut exec = Exec::new(&pool, width).unwrap();
+    exec.team(|mut team| team.reborrow().run_with(|p| seen.record(p.index())))
+        .expect("an idle pool");
+    let masks = seen.take();
+    assert_eq!(masks.len(), width, "every participant ran a share");
+    assert_eq!(masks[0].1, vec![set[0]], "the leader on S[0]");
+    for (index, mask) in &masks[1..] {
+        assert_eq!(mask.len(), 1, "participant {index} is pinned: {mask:?}");
+        assert!(set.contains(&mask[0]), "participant {index} inside S");
+        assert_ne!(
+            mask[0], set[0],
+            "participant {index} is off the leader's CPU"
+        );
+    }
+    let distinct: std::collections::HashSet<_> = masks.iter().map(|(_, m)| m[0]).collect();
+    assert_eq!(distinct.len(), width, "no two participants share a CPU");
+    assert_eq!(own_cpus(), set, "the leader's mask after the scope");
+}
+
+/// The leader and member invariants of the placement under the default
+/// strategy (`Spread`), which the tests above check under `Pack`: the leader
+/// keeps `S` between sections and after `into_team`, `TeamExec::external`
+/// widens it to `S` for the call and puts `{S[0]}` back, and every member
+/// restores the mask it saved before it returns its thread to Rayon.
+#[test]
+fn the_default_spread_strategy_keeps_the_leader_and_member_invariants() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let origin = Origin::default();
+    let store = origin.clone();
+    let pool = Pool::builder()
+        .threads(width)
+        .idle_spin(Duration::from_millis(1))
+        .acquire_timeout(Duration::from_secs(10))
+        .on_start(move |worker| store.record(worker, own_cpus()))
+        .build()
+        .unwrap();
+    assert_eq!(pool.pin_strategy(), PinStrategy::Spread);
+    let before = own_cpus();
+    let home = vec![set[0]];
+    let team = pool.into_team(width).expect("an idle pool");
+    let width = team.size().get();
+    assert_eq!(own_cpus(), before, "the leader keeps S after into_team");
+    for round in 0..3 {
+        let mut exec = team.exec(width);
+        exec.team(|mut t| {
+            assert_eq!(own_cpus(), home, "round {round}: the leader in the scope");
+            let inside = t.external(own_cpus);
+            assert_eq!(inside, before, "round {round}: external widens to S");
+            assert_eq!(own_cpus(), home, "round {round}: and puts S[0] back");
+        })
+        .expect("a team token opens its scope");
+        assert_eq!(own_cpus(), before, "round {round}: S after the scope");
+        let (_, mask) = leader_share(exec.reborrow());
+        assert_eq!(mask, home, "round {round}: the leader for one section");
+        assert_eq!(own_cpus(), before, "round {round}: S between sections");
+    }
+    let pool = team.into_pool();
+    assert_eq!(own_cpus(), before, "the leader's mask after the team");
+    pool.release_idle();
+    Exec::new(&pool, width)
+        .unwrap()
+        .broadcast(|worker| {
+            assert_eq!(
+                own_cpus(),
+                origin.of(worker),
+                "worker {worker} kept a pinned mask after the team"
+            );
+        })
+        .expect("a root token from a plain thread");
 }

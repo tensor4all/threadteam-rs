@@ -141,6 +141,9 @@ pub(crate) struct Awake {
     pub(crate) costs: crate::cost::DispatchCosts,
     /// Participant pinning (`PoolBuilder::pin_participants`, on by default).
     pub(crate) pin: bool,
+    /// Which CPUs of the caller's set the participants take
+    /// (`PoolBuilder::pin_strategy`, `Spread` by default).
+    pub(crate) pin_strategy: crate::pin::PinStrategy,
     /// Root scopes of a pinning pool that placed nobody because the caller's
     /// set had fewer CPUs than the team had participants (`Pool::pin_skips`).
     pub(crate) pin_skips: AtomicU64,
@@ -157,6 +160,7 @@ impl Awake {
         acquire_timeout: Duration,
         costs: crate::cost::DispatchCosts,
         pin: bool,
+        pin_strategy: crate::pin::PinStrategy,
         spin_polls: u32,
     ) -> Self {
         Awake {
@@ -173,6 +177,7 @@ impl Awake {
             defaults,
             costs,
             pin,
+            pin_strategy,
             pin_skips: AtomicU64::new(0),
             acquire_timeout,
             #[cfg(feature = "trace")]

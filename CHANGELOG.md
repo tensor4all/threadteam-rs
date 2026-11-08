@@ -7,6 +7,25 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `PinStrategy { Spread, Pack }`, `PoolBuilder::pin_strategy` and
+  `Pool::pin_strategy`. `Pack` is the 0.4-0.5 placement (`S[k]`). The reporter of #57 measured packed
+  against unpinned on a 4-node host: 39 against 52 µs warm, 190 against 121 µs
+  on a fresh destination (their measurement; not reproduced here, no multi-node
+  host in this fleet).
+
+### Changed
+
+- **Pinned teams spread over the NUMA nodes of the caller's mask by default**
+  (#57). Member `k` of a root team scope used to take `S[k]`, the `k`-th CPU of
+  the caller's mask, so a team narrower than `S` sat on its lowest CPUs and, on
+  a multi-socket host, on its first NUMA nodes, where first-touch then put a
+  fresh destination's pages. Participants now go round-robin over the nodes `S`
+  spans, ascending within a node (`PinStrategy::Spread`); the leader is still on
+  `S[0]`, nothing leaves `S`, nothing wraps. On a one-node mask the placement is
+  unchanged.
+
 ### Fixed
 
 - **A root scope narrower than its team places its leader** (#53). The leader of

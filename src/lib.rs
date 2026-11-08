@@ -73,6 +73,7 @@ pub use park::Parker;
 #[cfg(loom)]
 #[doc(hidden)]
 pub use park::{Barrier, Completion, Waiter};
+pub use pin::PinStrategy;
 pub use policy::{raise_current_thread_qos, Qos, WaitOverride, WaitPolicy};
 #[doc(hidden)]
 pub use pool::WaitCounters;

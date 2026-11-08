@@ -240,8 +240,9 @@ thread run one of its children, which is one of the tasks already counted.
 - **Already in the target pool**: spawn into the current scope, no install
   (cheap re-entry).
 - **Cross-pool or plain thread**: enter the pool once with `ThreadPool::install`
-  and wait. No thread-local state exists, so nothing is inherited by work that
-  runs on the waiting thread.
+  and wait. Nothing is inherited by work that runs on the waiting thread: the
+  crate's only thread-local is the placement record (`pin::PLACED`), which
+  describes that thread and is not consulted by the work it starts.
 - **External width**: `external` hands over the budget unchanged. A library
   that rounds or splits it does so itself (t4a-faer's `join_raw` splits a width
   into halves that add up to it).

@@ -9,8 +9,9 @@
    conserve slots (every share is positive and the shares sum to at most the
    parent's budget; `fork`'s shares also differ by at most one and sum to
    exactly the budget).
-4. No thread-local state and no implicit global pool; lazy inline execution
-   for serial, budget-one and single-task cases.
+4. No ambient thread-local state (the placement record `pin::PLACED` is the one
+   thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
+   inline execution for serial, budget-one and single-task cases.
 5. Steady-state entries do not allocate.
 6. API changes keep the contracts in `README.md` and `docs/design/placement.md`
    in sync.

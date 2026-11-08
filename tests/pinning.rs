@@ -446,13 +446,52 @@ fn a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer() {
             assert_eq!(cpu, Some(set[0]), "round {round}, call {call}: its CPU");
             assert_eq!(own_cpus(), before, "round {round}, call {call}: after it");
         }
-        exec.for_ranges(64, NonZeroUsize::new(16).unwrap(), |_| {});
+        // The masks the ranges ran under: the leader's chunk must be on home,
+        // which is what `home_pin` in `Exec::for_ranges` is for. Without the
+        // assertion the call leaves no trace and the guard can be deleted.
+        let masks = Mutex::new(Vec::new());
+        exec.for_ranges(64, NonZeroUsize::new(16).unwrap(), |_| {
+            masks.lock().unwrap().push(own_cpus());
+        });
+        let masks = masks.into_inner().unwrap();
+        assert!(
+            masks.contains(&home),
+            "round {round}: for_ranges ran the leader off {home:?}: {masks:?}"
+        );
         assert_eq!(own_cpus(), before, "round {round}: between tokens");
     }
     assert_eq!(team.pool().pin_skips(), 0);
     drop(team);
     assert_eq!(own_cpus(), before, "the caller after the team");
 }
+/// A `Team` token's `broadcast` places its leader too: it is one of the section
+/// entries a token dispatches without opening a scope (`Exec::broadcast`), and
+/// nothing else in this file reaches it through a team token.
+#[test]
+fn a_team_broadcast_places_its_leader() {
+    let _w = watchdog();
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let pool = builder(3, true).build().unwrap();
+    let team = pool.into_team(3).expect("an idle pool");
+    let width = team.size().get();
+    let seen = Mutex::new(Vec::new());
+    team.exec(width)
+        .broadcast(|worker| seen.lock().unwrap().push((worker, own_cpus())))
+        .expect("a team token broadcasts");
+    let mut seen = seen.into_inner().unwrap();
+    seen.sort_by_key(|(worker, _)| *worker);
+    assert_eq!(
+        seen[0].1,
+        vec![set[0]],
+        "the leader's mask in a broadcast: {seen:?}"
+    );
+    assert_eq!(seen.len(), width, "every participant ran");
+}
+
 
 /// `into_pool` changes no mask either.
 #[test]

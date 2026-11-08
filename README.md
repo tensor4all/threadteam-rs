@@ -140,10 +140,10 @@ where 0.4.0 left its mask whole. Three things to change:
   section dispatched without a scope, pins the leader for that scope or section
   only, inside the mask the calling thread has.
 
-**From 0.5.0 only:** 0.5.0 pinned the thread that calls `Pool::into_team` onto
-`S[0]` until the `Team` was dropped (`pin::TeamPin`), so a vendor thread pool
+**From 0.5.0 and 0.5.1:** both pinned the thread that calls `Pool::into_team` onto
+`S[0]` until the `Team` was dropped (`pin::TeamPin`, still in 0.5.1), so a vendor thread pool
 built there (MKL, OpenBLAS), a plain `std::thread::spawn` and a second `Pool` all
-inherited one CPU. 0.5.1 does not: that thread keeps its own mask, and the leader
+inherited one CPU. This release (after 0.5.1) does not: that thread keeps its own mask, and the leader
 is placed for each section and each scope instead, so a vendor library or a
 plain thread started from there is not confined to one CPU.
 

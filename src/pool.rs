@@ -812,9 +812,11 @@ impl PoolBuilder {
     /// the lowest nodes. [`PinStrategy::Pack`] is the placement of 0.4 to 0.5,
     /// member `k` on `S[k]`. Under both the leader is on `S[0]`, every
     /// participant has its own CPU of `S`, and nothing wraps; on a one-node mask
-    /// they place identically. See [`PinStrategy`] for the trade-off (fresh
-    /// destinations favour `Spread`, warm ones `Pack`) and
-    /// `docs/design/placement.md`.
+    /// they place identically. See [`PinStrategy`] for the trade-off —
+    /// fresh destinations are *expected* to favour `Spread` and warm ones
+    /// `Pack`, but the table in `docs/design/placement.md` measures only `Pack`
+    /// against unpinned placement, so the `Spread` side is a prediction, not a
+    /// result.
     ///
     /// # Examples
     ///

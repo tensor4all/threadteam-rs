@@ -139,9 +139,13 @@ pub(crate) fn oversubscribed(participants: usize) -> bool {
 ///
 /// Both strategies place participant 0, the leader, on `S[0]`, give every
 /// participant its own CPU of `S`, never use a CPU outside `S`, and never wrap.
-/// They differ only in *which* CPUs a team narrower than `S` takes, which
-/// matters when `S` spans several NUMA nodes. On a host (or a mask) with one
-/// node, or where the kernel does not report nodes, they place identically.
+/// They differ in *which* CPUs a team narrower than `S` takes, which matters
+/// when `S` spans several NUMA nodes. A team as wide as `S` takes every CPU of
+/// `S` under both, but **not in the same order**: on nodes `{0,1}` and `{2,3}`
+/// with four participants `Spread` gives `[0, 2, 1, 3]` and `Pack` gives
+/// `[0, 1, 2, 3]`, so participant 1's shard sits on another node. The aggregate
+/// set is the same; the mapping is not. On a host (or a mask) with one node, or
+/// where the kernel does not report nodes, they place identically.
 ///
 /// [`PoolBuilder::pin_participants`]: crate::PoolBuilder::pin_participants
 /// [`PoolBuilder::pin_strategy`]: crate::PoolBuilder::pin_strategy
@@ -216,6 +220,9 @@ pub(crate) struct Topology {
 impl Topology {
     /// The topology in which `nodes[i]` lists the CPUs of node `i`. A CPU named
     /// twice keeps its last node; CPUs and nodes past [`MAX_CPUS`] are ignored.
+    // Only `read_host_topology` (Linux) and the tests call this; the doc link
+    // above keeps it named on other targets, where nothing calls it.
+    #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
     pub(crate) fn from_nodes(nodes: &[Vec<usize>]) -> Self {
         let width = nodes
             .iter()
@@ -396,13 +403,6 @@ impl Placement {
     /// with the host's topology. Shorter than `participants` only when `set`
     /// has fewer CPUs (the root scope does not place then).
     pub(crate) fn of(set: &CpuMask, strategy: PinStrategy, participants: usize) -> Placement {
-        let mut mask = [0u16; MAX_CPUS];
-        let m = cpus(set, &mut mask);
-        let mut placement = Placement {
-            cpus: [0; MAX_CPUS],
-            len: 0,
-        };
-        let want = participants.min(MAX_CPUS);
         // Pack never reads the topology; an empty one does not allocate, and
         // does not make the scope read sysfs.
         let empty = Topology::default();
@@ -410,6 +410,25 @@ impl Placement {
             PinStrategy::Pack => &empty,
             PinStrategy::Spread => host_topology(),
         };
+        Placement::with_topology(set, strategy, participants, topology)
+    }
+
+    /// [`Placement::of`] with the topology supplied, so a test can place on a
+    /// synthetic machine instead of this one. The whole production path from
+    /// `strategy` to participant CPUs runs here: only the node map is injected.
+    fn with_topology(
+        set: &CpuMask,
+        strategy: PinStrategy,
+        participants: usize,
+        topology: &Topology,
+    ) -> Placement {
+        let mut mask = [0u16; MAX_CPUS];
+        let m = cpus(set, &mut mask);
+        let mut placement = Placement {
+            cpus: [0; MAX_CPUS],
+            len: 0,
+        };
+        let want = participants.min(MAX_CPUS);
         placement.len = order(&mask[..m], topology, strategy, &mut placement.cpus[..want]);
         placement
     }
@@ -623,6 +642,22 @@ mod sys {
         set: libc::cpu_set_t,
     }
 
+    /// A mask holding exactly `cpus`. Tests only: production masks come from
+    /// the kernel ([`read_here`]).
+    #[cfg(test)]
+    pub(crate) fn mask_from(cpus: &[u16]) -> CpuMask {
+        // SAFETY: a zeroed `cpu_set_t`; `CPU_ZERO`/`CPU_SET` only clear and set
+        // bits, and every caller keeps the indices inside the set.
+        unsafe {
+            let mut set = mem::zeroed::<libc::cpu_set_t>();
+            libc::CPU_ZERO(&mut set);
+            for &cpu in cpus {
+                libc::CPU_SET(usize::from(cpu), &mut set);
+            }
+            CpuMask { set }
+        }
+    }
+
     /// The calling thread's affinity mask, or `None` when the syscall refuses
     /// it (a kernel mask larger than `cpu_set_t`, no current thread).
     pub(crate) fn read_here() -> Option<CpuMask> {
@@ -751,6 +786,31 @@ mod tests {
 
     fn two_nodes() -> Vec<Vec<usize>> {
         vec![vec![0, 1], vec![2, 3]]
+    }
+
+    /// The production placement on a synthetic two-node machine: the strategy
+    /// decides, and only the pool's strategy reaches `exec::pin_scope`. A `Pack`
+    /// substituted for `Spread` there moves participant 1 onto node 0, which
+    /// this asserts against without any multi-node hardware.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn placement_takes_the_strategy_on_a_two_node_machine() {
+        use super::sys::mask_from;
+        let set = mask_from(&[0, 1, 2, 3]);
+        let topology = Topology::from_nodes(&two_nodes());
+        let placed = |strategy| {
+            let placement = Placement::with_topology(&set, strategy, 2, &topology);
+            (0..2).filter_map(|k| placement.get(k)).collect::<Vec<_>>()
+        };
+        assert_eq!(placed(PinStrategy::Spread), vec![0, 2]);
+        assert_eq!(placed(PinStrategy::Pack), vec![0, 1]);
+        // Full width: the set is the same, the mapping is not.
+        let wide = |strategy| {
+            let placement = Placement::with_topology(&set, strategy, 4, &topology);
+            (0..4).filter_map(|k| placement.get(k)).collect::<Vec<_>>()
+        };
+        assert_eq!(wide(PinStrategy::Spread), vec![0, 2, 1, 3]);
+        assert_eq!(wide(PinStrategy::Pack), vec![0, 1, 2, 3]);
     }
 
     fn four_nodes() -> Vec<Vec<usize>> {

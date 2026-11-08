@@ -457,7 +457,12 @@ mod tests {
             return; // one allowed CPU: the placement is skipped by design
         }
         let home = nth(&wide, 0).expect("a CPU in a non-empty mask");
-        let first = LeaderPin::enter(&wide, home).expect("the first placement");
+        // A refused pin is supported behaviour (`LeaderPin::enter` returns `None`
+        // and the scope places nobody), so this is a skip, not a failure.
+        let Some(first) = LeaderPin::enter(&wide, home) else {
+            eprintln!("skipped: the kernel refused to pin this thread");
+            return;
+        };
         assert_eq!(
             available(),
             width,

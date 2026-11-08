@@ -754,6 +754,58 @@ fn a_whole_team_scope_replaces_the_teams_placement() {
     assert_eq!(team.pool().pin_skips(), 1, "no further skip");
 }
 
+/// A second whole-team scope **replaces** the recorded placement, so a section
+/// that follows goes home to the CPU *that* placement left free. A team of two
+/// on four CPUs is enough: the first scope records `all[0]`, the second records
+/// a different first CPU, and the following section's leader must move to it.
+#[test]
+fn a_second_placement_replaces_the_recorded_home() {
+    let _w = watchdog();
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let pool = builder(2, true).build().unwrap();
+    let team = pool.into_team(2).expect("an idle pool");
+    let width = team.size().get();
+    assert_eq!(width, 2);
+    // First placement: the leader's home is `all[0]`, the member's CPU `all[1]`.
+    let Some(_first) = Restrict::to(&all[..2]) else {
+        eprintln!("skipped: cannot restrict the calling thread to two CPUs");
+        return;
+    };
+    team.exec(width)
+        .team(|mut t| t.reborrow().run_with(|_| ()))
+        .expect("a team token opens its scope");
+    assert_eq!(team.pool().pin_skips(), 0, "two participants, two CPUs");
+    // Second placement on a set whose first CPU is not the first one: the
+    // record has to move from `all[0]` to `all[1]`.
+    let second = all[1..4].to_vec();
+    let Some(_second) = Restrict::to(&second) else {
+        eprintln!("skipped: cannot restrict the calling thread to three CPUs");
+        return;
+    };
+    team.exec(width)
+        .team(|mut t| t.reborrow().run_with(|_| ()))
+        .expect("a team token opens its scope");
+    assert_eq!(team.pool().pin_skips(), 0, "two participants, three CPUs");
+    // A section dispatched without a scope follows the *second* placement. It
+    // fails when the record keeps the first home (`all[0]`, outside this set, so
+    // nothing is pinned and the leader keeps all three CPUs), which is the
+    // update `a_whole_team_scope_replaces_the_teams_placement` cannot see on a
+    // four-CPU host: that test's scopes place once.
+    let shares = flat_shares(team.exec(width));
+    assert_eq!(
+        shares[0].1,
+        vec![second[0]],
+        "the leader's mask in a section of the second placement"
+    );
+    for (k, (_, mask)) in shares.iter().enumerate().skip(1) {
+        assert_eq!(mask, &vec![second[k]], "member {k} in a section");
+    }
+}
+
 /// A scope that cannot be placed clears the placement, so a later section does
 /// not send its leader to a CPU a member of an older placement holds.
 #[test]

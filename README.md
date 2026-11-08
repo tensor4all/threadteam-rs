@@ -125,11 +125,11 @@ Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
 a test binary that runs serial and pooled work and then checks that
 `rayon::ThreadPoolBuilder::new().build_global()` still succeeds.
 
-## Upgrading from 0.4
+## Upgrading from 0.4 or 0.5.0
 
-0.5.0 pins the leader of a team onto `S[0]` for the life of the scope, and for
-that one section when a token of a `Team` dispatches one without opening a
-scope, where 0.4.0 left its mask whole. Three things to change:
+The leader of a team is pinned onto `S[0]` for the life of a scope, and for that
+one section when a token of a `Team` dispatches one without opening a scope,
+where 0.4.0 left its mask whole. Three things to change:
 
 * a vendor call made by the leader goes through `TeamExec::external`, which
   widens the mask to `S` for that call; a direct call inside a share runs on one
@@ -140,9 +140,12 @@ scope, where 0.4.0 left its mask whole. Three things to change:
   section dispatched without a scope, pins the leader for that scope or section
   only, inside the mask the calling thread has.
 
-The thread that calls `Pool::into_team` keeps its own mask: the leader is placed
-for each section, not for the team's life, so a vendor library or a plain thread
-started from there is not confined to one CPU.
+**From 0.5.0 only:** 0.5.0 pinned the thread that calls `Pool::into_team` onto
+`S[0]` until the `Team` was dropped (`pin::TeamPin`), so a vendor thread pool
+built there (MKL, OpenBLAS), a plain `std::thread::spawn` and a second `Pool` all
+inherited one CPU. 0.5.1 does not: that thread keeps its own mask, and the leader
+is placed for each section and each scope instead, so a vendor library or a
+plain thread started from there is not confined to one CPU.
 
 [`CHANGELOG.md`](CHANGELOG.md) names every removed item, including the internal
 ones, and lists the behaviour that did not change.

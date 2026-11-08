@@ -787,10 +787,11 @@ mod tests {
         vec![vec![0, 1], vec![2, 3]]
     }
 
-    /// The production placement on a synthetic two-node machine: the strategy
-    /// decides, and only the pool's strategy reaches `exec::pin_scope`. A `Pack`
-    /// substituted for `Spread` there moves participant 1 onto node 0, which
-    /// this asserts against without any multi-node hardware.
+    /// The placement object on a synthetic two-node machine, with both
+    /// strategies and at two widths, so a mapping change is visible without
+    /// multi-node hardware. What this does **not** cover: which strategy
+    /// `exec::pin_scope` hands in. That needs a multi-node host or an injection
+    /// point in the non-allocating path, and is tracked separately.
     #[cfg(target_os = "linux")]
     #[test]
     fn placement_takes_the_strategy_on_a_two_node_machine() {

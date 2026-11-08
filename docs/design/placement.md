@@ -575,8 +575,9 @@ for one section when a token of a `Team` dispatches one without opening a scope
 `sched_setaffinity` at scope entry (or at section entry), one at its exit (a
 guard, so also on unwind), and nothing in between for a `TeamExec` dispatch: no
 per-section check, no move and restore around it. A *token* section dispatched
-inside the scope is the exception the next subsection describes: it calls
-`home_pin`, which reads the mask and declines, so it pays the read and no write.
+inside the scope is the exception the next subsection describes: with a nonzero
+`home` it calls `home_pin`, which reads the mask and declines, so it pays the read
+and no write.
 Members keep `S[k]`, `k >= 1`. Arm B above is this rule for a scope.
 
 The crate used to do something cleverer: it placed the leader on `S[0]`
@@ -799,10 +800,12 @@ mask this thread reads there is the one CPU it was placed on and a mask of one C
 is never narrowed. So the leader is on `S[0]` while a section runs, which is what
 #33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls per
 outermost section (2.1 us on an empty 8-way section). A token section
-(`Exec::fork`, `for_ranges`, `broadcast`, a reborrowed team scope) inside a placed
-scope pays the one `sched_getaffinity` and no `sched_setaffinity`: the mask is
-read before anything is decided (`src/pin.rs:209-218`), so it is the read that
-buys the refusal, not a memory of the enclosing scope. A `TeamExec` section
+(`Exec::fork`, `for_ranges`, `broadcast`, a reborrowed team scope) with a nonzero
+`home` inside a placed scope reads the mask and is refused by it, so it pays that
+one `sched_getaffinity` and no `sched_setaffinity`. The read is what buys the
+refusal, not a memory of the enclosing scope — and it comes after the `home`
+test, so a team whose placement is `0` (pinning off, or a scope that placed
+nobody) pays neither. A `TeamExec` section
 (`run`, `run_with`) dispatches without calling `home_pin` at all, so it pays no
 affinity call either way. A token section inside `TeamExec::external` reads `S`
 back and is pinned in full, on the nested team's home (threadteam-rs#54). The scope itself pays one pin (`LeaderPin` for a
@@ -897,9 +900,10 @@ costs a scheduler slice per section (5.9 ms against 10 us). With the section
 pin the leader is home for every section, at **one `sched_getaffinity` and two
 `sched_setaffinity` calls per outermost section**: 1.6 us for the set/restore
 pair on this host, 2.1 us for the whole hook on an empty 8-way section. A token
-section inside a team scope pays the `sched_getaffinity` and none of the writes,
-because the mask it reads has one CPU; a `TeamExec` section pays nothing, because
-it does not call `home_pin`; a section inside `TeamExec::external` pays the full
+section with a nonzero `home` inside a team scope pays the `sched_getaffinity` and
+none of the writes, because the mask it reads has one CPU; a `TeamExec` section
+pays nothing, because it does not call `home_pin`; a section inside
+`TeamExec::external` pays the full
 pair again, because `external` hands `S` back (threadteam-rs#54).
 
 `Pool::pin_skips` counts every root scope that could not be placed, as before.

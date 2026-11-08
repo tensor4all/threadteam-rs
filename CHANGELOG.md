@@ -32,7 +32,8 @@ All notable changes to `threadteam` are recorded here. The format follows
   leader is still on `S[0]` in 40 of 40 calls (0.5.1: 0 of 40 with the caller
   off `S[0]`, 5.9 ms per call against 10 us). The pin costs one
   `sched_getaffinity` and two `sched_setaffinity` calls per outermost section
-  of a team token that opens no scope, and nothing inside a team scope.
+  of a team token that opens no scope. A token section inside a placed scope
+  pays the read and no write; a `TeamExec` section pays neither.
   `pin::TeamPin` is replaced by one record on the `Team` (`pin::Home`, the CPU
   no member takes), which pins nothing: a whole-team root scope writes it and
   the sections read it. Other threads are no longer second class: a token used

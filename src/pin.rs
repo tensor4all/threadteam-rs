@@ -235,7 +235,9 @@ pub(crate) fn widened<R>(f: impl FnOnce() -> R) -> R {
         }
     }
     let placed = PLACED.with(|p| p.get());
-    let _restore = placed.and_then(|p| set_here(&p.wide).then_some(Restore(p.home)));
+    // `then`, not `then_some`: a refused widening must not even construct the
+    // guard, whose `Drop` would issue the restore this path promises not to make.
+    let _restore = placed.and_then(|p| set_here(&p.wide).then(|| Restore(p.home)));
     f()
 }
 

@@ -1578,6 +1578,17 @@ fn external_lets_a_nested_team_place_its_own_leader() {
                     .expect("a root token from a plain thread");
                 assert_eq!(own_cpus(), wide, "the wide mask is back after b's section");
             });
+            // The enclosing placement *record* has to survive the nested section
+            // too: `external` widens to `S` from that record, not from the mask,
+            // so a second call is what tells "the record came back" from "the
+            // mask was restored".
+            t.external(|| {
+                assert_eq!(
+                    own_cpus(),
+                    wide,
+                    "the enclosing placement is still recorded after b's section"
+                );
+            });
             assert_eq!(own_cpus(), home, "a's leader is back on its own home");
         })
         .expect("a team token opens its scope");

@@ -16,7 +16,11 @@
 //!   `PERFORMANCE_TIPS.md`). Inside a section, or a scope, the leader's half of
 //!   that rule is [`widened`], behind `TeamExec::external`: it sets the mask to
 //!   `S` for the duration of one call and puts `{S[0]}` back when the call
-//!   returns or unwinds.
+//!   returns or unwinds. A team scope entered inside that call places this
+//!   thread again, on the nested team's own home, and the placement before it
+//!   comes back when *its* scope ends ([`home_pin`]: a placed thread refuses a
+//!   mask that has left the placement, not every second placement), so two
+//!   independent pools nest (threadteam-rs#54).
 //! * **Member `k >= 1` pins itself onto `S[k]`**, so the members take `S` minus
 //!   `S[0]`, one CPU each. A member saves its previous mask in its own slot and
 //!   restores it itself before it stops being reserved.
@@ -50,7 +54,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, CpuMask};
+pub(crate) use sys::{contains, nth, read_here, set_here, set_here_to, subset, CpuMask};
 
 /// Number of CPUs the calling thread's team is spread over: the CPUs a root
 /// team scope entered on this thread may place its participants on.
@@ -184,19 +188,32 @@ pub(crate) fn home_of(set: &CpuMask) -> Home {
 /// The leader of a [`Team`](crate::Team) token calls this before every section
 /// it dispatches without opening a team scope: it then opens the section on the
 /// one CPU no member takes, and is not confined to it afterwards. `None`, and
-/// nothing changed, when the team placed nothing (`home` is `0`), when this
-/// thread is already pinned by an enclosing scope or section, when its own mask
-/// is one CPU (a pinned member whose CPU it must keep) or does not hold `home`
-/// (a caller that narrowed itself away from it: a leader is never moved outside
-/// the mask its caller gave it), or when the kernel refuses.
+/// nothing changed, when the team placed nothing (`home` is `0`), when its own
+/// mask is one CPU (a pinned member whose CPU it must keep, and also a leader an
+/// enclosing placement already confined to one CPU) or does not hold `home` (a
+/// caller that narrowed itself away from it: a leader is never moved outside the
+/// mask its caller gave it), when the current mask has left the placement this
+/// thread already has (see below), or when the kernel refuses.
+///
+/// A thread this crate placed is *not* a reason to decline by itself. A placed
+/// leader runs on `{S[0]}`; [`widened`] puts `S` back for the duration of one
+/// `TeamExec::external` call, and a team scope entered inside that call must be
+/// able to place this thread again, on its own home (threadteam-rs#54). The
+/// placement that decides this is the one recorded when the thread was placed:
+/// narrowing into the nested team's home is allowed while the current mask still
+/// belongs to it (`here ⊆ placed.wide`). A mask that reaches outside that
+/// placement is a widening of the caller's own doing, and placing the thread
+/// there would move it out of the set its caller gave it, so it is refused.
 pub(crate) fn home_pin(home: Home) -> Option<LeaderPin> {
     let home = home.checked_sub(1)?;
-    if PLACED.with(|p| p.get()).is_some() {
-        return None;
-    }
     let here = read_here()?;
     if count(&here) < 2 || !contains(&here, home) {
         return None;
+    }
+    if let Some(placed) = PLACED.with(|p| p.get()) {
+        if !subset(&here, &placed.wide) {
+            return None;
+        }
     }
     LeaderPin::enter(&here, home)
 }
@@ -349,6 +366,14 @@ mod sys {
         unsafe { libc::CPU_ISSET(cpu, &mask.set) }
     }
 
+    /// Whether every CPU of `a` is also in `b`.
+    pub(crate) fn subset(a: &CpuMask, b: &CpuMask) -> bool {
+        (0..SETSIZE).all(|cpu| {
+            // SAFETY: reads one bit of each valid set.
+            !unsafe { libc::CPU_ISSET(cpu, &a.set) } || unsafe { libc::CPU_ISSET(cpu, &b.set) }
+        })
+    }
+
     /// Number of CPUs in the set.
     pub(crate) fn count(mask: &CpuMask) -> usize {
         // SAFETY: only counts the bits of a valid set.
@@ -397,6 +422,10 @@ mod sys {
     }
 
     pub(crate) fn contains(_mask: &CpuMask, _cpu: usize) -> bool {
+        false
+    }
+
+    pub(crate) fn subset(_a: &CpuMask, _b: &CpuMask) -> bool {
         false
     }
 

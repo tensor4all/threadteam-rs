@@ -492,7 +492,6 @@ fn a_team_broadcast_places_its_leader() {
     assert_eq!(seen.len(), width, "every participant ran");
 }
 
-
 /// `into_pool` changes no mask either.
 #[test]
 fn into_pool_gives_the_leader_its_mask_back() {

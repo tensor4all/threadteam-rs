@@ -573,9 +573,11 @@ leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
 for one section when a token of a `Team` dispatches one without opening a scope
 (see "A `Team`'s leader" below). One
 `sched_setaffinity` at scope entry (or at section entry), one at its exit (a
-guard, so also on unwind), and nothing in between: no per-section check, no
-move and restore around a dispatch inside a scope. Members keep `S[k]`,
-`k >= 1`. Arm B above is this rule for a scope.
+guard, so also on unwind), and nothing in between for a `TeamExec` dispatch: no
+per-section check, no move and restore around it. A *token* section dispatched
+inside the scope is the exception the next subsection describes: it calls
+`home_pin`, which reads the mask and declines, so it pays the read and no write.
+Members keep `S[k]`, `k >= 1`. Arm B above is this rule for a scope.
 
 The crate used to do something cleverer: it placed the leader on `S[0]`
 immediately before **every section** and handed its whole mask back at once, so
@@ -818,9 +820,10 @@ itself out of `S` — which is refused rather than moved outside that placement.
 Being placed is not itself a reason to decline: a team scope entered inside
 `TeamExec::external` places this thread on the nested team's home and puts the
 enclosing placement back when it ends (threadteam-rs#54). A whole-team root scope
-does not go through `home_pin` at all: `pin_scope` reads the caller's mask as the
-scope's own set and enters `LeaderPin` with it, so this list does not describe a
-scope entry.
+is not described by this list either: it places through `pin_scope`, which reads
+the caller's mask as the scope's own set and enters `LeaderPin` with it, and then
+attempts `home_pin` (`src/exec.rs:1045`, `:1055`) — a no-op there, since the
+mask is already the one CPU the scope pinned, and it costs the read.
 
 Why not the `Team`-held pin of #45: it keeps the calling thread on `{S[0]}` for
 the life of the team, and the caller's thread is not ours. `tenferro`'s

@@ -161,7 +161,6 @@ pub(crate) fn oversubscribed(participants: usize) -> bool {
 /// # Ok::<(), threadteam::Error>(())
 /// ```
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
 pub enum PinStrategy {
     /// **The default.** Participant `k` goes round-robin over the NUMA nodes
     /// `S` spans, then in ascending CPU order within a node: the first

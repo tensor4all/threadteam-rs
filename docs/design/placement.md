@@ -240,9 +240,14 @@ thread run one of its children, which is one of the tasks already counted.
 - **Already in the target pool**: spawn into the current scope, no install
   (cheap re-entry).
 - **Cross-pool or plain thread**: enter the pool once with `ThreadPool::install`
-  and wait. Nothing is inherited by work that runs on the waiting thread: the
-  crate's only thread-local is the placement record (`pin::PLACED`), which
-  describes that thread and is not consulted by the work it starts.
+  and wait. Scheduler and budget state are not inherited through thread-local
+  storage by work that runs on the waiting thread. The crate's only thread-local
+  is the placement record (`pin::PLACED`), which says *where this thread was
+  placed*; it is read when a nested team places its leader, and only there: a
+  nested placement is allowed while the current mask still belongs to that
+  record, so the leader can be narrowed onto the nested team's home and is never
+  widened out of the set its caller gave it (`pin::home_pin`,
+  threadteam-rs#54).
 - **External width**: `external` hands over the budget unchanged. A library
   that rounds or splits it does so itself (t4a-faer's `join_raw` splits a width
   into halves that add up to it).

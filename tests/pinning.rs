@@ -1534,14 +1534,14 @@ fn a_team_as_wide_as_the_mask_gives_every_participant_its_own_cpu() {
 fn external_lets_a_nested_team_place_its_own_leader() {
     let _w = watchdog();
     let set = own_cpus();
-    if set.len() < 4 {
-        eprintln!("skipped: need at least 4 allowed CPUs");
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
         return;
     }
-    let _restrict = match Restrict::to(&set[..4]) {
+    let _restrict = match Restrict::to(&set[..2]) {
         Some(r) => r,
         None => {
-            eprintln!("skipped: cannot restrict the calling thread to 4 CPUs");
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
             return;
         }
     };
@@ -1594,14 +1594,14 @@ fn external_lets_a_nested_team_place_its_own_leader() {
 fn two_nested_externals_each_place_their_own_leader() {
     let _w = watchdog();
     let set = own_cpus();
-    if set.len() < 4 {
-        eprintln!("skipped: need at least 4 allowed CPUs");
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
         return;
     }
-    let _restrict = match Restrict::to(&set[..4]) {
+    let _restrict = match Restrict::to(&set[..2]) {
         Some(r) => r,
         None => {
-            eprintln!("skipped: cannot restrict the calling thread to 4 CPUs");
+            eprintln!("skipped: cannot restrict the calling thread to 2 CPUs");
             return;
         }
     };
@@ -1665,8 +1665,8 @@ fn two_nested_externals_each_place_their_own_leader() {
 fn a_second_placement_in_the_same_scope_is_refused() {
     let _w = watchdog();
     let set = own_cpus();
-    if set.len() < 4 {
-        eprintln!("skipped: need at least 4 allowed CPUs");
+    if set.len() < 2 {
+        eprintln!("skipped: need at least 2 allowed CPUs");
         return;
     }
     let _restrict = match Restrict::to(&set[..2]) {

@@ -1198,6 +1198,7 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
             placement.store(0, Ordering::Relaxed);
         }
         team.unpin_section();
+        awake.pin_skips.fetch_add(1, Ordering::Relaxed);
         return Some(ScopePin(None));
     }
     // Participant `k`'s CPU under the pool's strategy (`pin::order`). The

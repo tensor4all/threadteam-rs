@@ -75,12 +75,13 @@ All notable changes to `threadteam` are recorded here. The format follows
   library changes survives at most until the next whole-team scope. Two cases keep
   it: a pool with participant pinning off, whose scopes touch no mask at all, and
   everything off Linux, where neither setter moves a thread (nothing changes
-  `available_parallelism` in a process). A mint alone never reads the mask, so a
-  scope can still be paced by the count the thread had: that is the cost, and the
-  count only paces member waits. Measured on the macOS arm host (`Pool` of 4, then
-  `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns per mint at
-  `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32 CPUs):
-  275.9 and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
+  `available_parallelism` in a process). A mint reads the mask only on a miss (the
+  first on a thread, the first after this crate moved it); every other mint takes the
+  count the thread had when it was minted, so a scope can still be paced by it: that
+  is the cost, and the count only paces member waits. Measured on the macOS arm host
+  (`Pool` of 4, then `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns
+  per mint at `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32
+  CPUs): 275.9 and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
   `the_cpu_count_is_memoised_until_this_crate_moves_the_thread`,
   `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows` and
   `a_pool_with_pinning_off_never_refreshes_the_count` (Linux).

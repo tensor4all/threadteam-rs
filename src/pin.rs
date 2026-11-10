@@ -122,9 +122,10 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// too; nothing changes it in practice, `available_parallelism` being a property of
 /// the process.
 ///
-/// A mint alone never reads the mask, and a token takes the count the thread had
-/// when it was minted, so a scope can be paced by a stale count if the mask
-/// changed while nothing was placed. That is the cost of not reading on every
+/// A mint reads the mask only on a miss, that is, the first mint on a thread and
+/// the first after this crate moved its mask. Every other mint takes the count the
+/// thread had when it was minted, so a scope can be paced by a stale count if the
+/// mask changed while nothing was placed. That is the cost of not reading on every
 /// mint, and the count paces member waits and decides nothing else.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]

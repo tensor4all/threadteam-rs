@@ -454,8 +454,12 @@ fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
         eprintln!("skipped: cannot restrict the calling thread to one CPU");
         return;
     }
-    // A narrower root scope runs no pin section, so it reads nothing and the
-    // memo keeps the old count however many of them run.
+    // A narrower root scope runs no pin section, so it reads nothing. With no
+    // placement recorded (this team never opened a whole-team scope) it pins
+    // nothing either, so the memo keeps the old count however many of them run.
+    // Once a placement exists the narrower scope pins its leader at the home CPU
+    // and gives it its mask back, and those two mask changes clear the memo (see
+    // the last case of this test).
     for _ in 0..3 {
         team.exec(2)
             .team(|_| {})
@@ -490,6 +494,27 @@ fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
     assert!(
         throttled.iter().all(|&b| b == THROTTLED_POLLS),
         "the pin section refreshed the memo: {throttled:?}"
+    );
+    drop(exec);
+    // A narrower scope does refresh the memo once the team has a placement: the
+    // narrower token pins its leader at the home CPU and gives it its mask back,
+    // and both are mask changes of ours. Four participants on the two CPUs that
+    // hold the home are oversubscribed, so a refreshed count shows as the
+    // throttled budget.
+    assert!(set_own_cpus(&all[..4]), "widening the calling thread");
+    team.exec(4)
+        .team(|_| {})
+        .expect("a whole-team scope records the placement");
+    drop(team.exec(4));
+    assert!(set_own_cpus(&all[..2]), "two CPUs that hold the home");
+    team.exec(2)
+        .team(|_| {})
+        .expect("a narrower scope pins its leader home");
+    let exec = team.exec(4);
+    let refreshed = member_budgets(&team);
+    assert!(
+        refreshed.iter().all(|&b| b == THROTTLED_POLLS),
+        "the home pin of the narrower scope cleared the memo: {refreshed:?}"
     );
     drop(exec);
     assert!(set_own_cpus(&all), "restoring the calling thread mask");

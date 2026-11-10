@@ -109,24 +109,21 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// of `Team::try_exec` before, 47 ns after (threadteam-rs#62). A caller that
 /// mints once per small operation used to pay a syscall every time.
 ///
-/// The memo is refreshed when this crate moves the mask of the calling thread
-/// ([`set_here`], [`set_here_to`]: a leader pin, a home pin, a member restoring
-/// its own mask, an unpin) and by [`note_count`] from the pin section of a root
-/// scope, which reads the mask in any case. Three places therefore keep the
-/// count the thread had until something else refreshes it:
+/// The memo is refreshed whenever this crate touches the mask of the calling
+/// thread: it is rewritten by [`note_count`] from the pin section of a root
+/// scope, which reads the mask in any case, and forgotten by [`set_here`] and
+/// [`set_here_to`], that is, by every leader pin, home pin (including the one a
+/// narrower root scope takes when the team has a placement), member restore and
+/// unpin. A count another library changed therefore survives only until the next
+/// of those on that thread: at most a whole-team scope, and often an earlier
+/// narrower one. Off Linux neither setter moves a thread, so there the count
+/// stands for the life of the thread; nothing changes it in practice,
+/// `available_parallelism` being a property of the process.
 ///
-/// * a root scope narrower than the team, which runs no pin section (exec
-///   `pin_scope` is entered only for a scope over every reserved member),
-/// * every scope of a pool with participant pinning off, which runs none
-///   either, and
-/// * everything off Linux, where neither setter moves a thread, so the memo
-///   lives as long as the thread. Nothing changes the value there in practice:
-///   `available_parallelism` is a property of the process.
-///
-/// So a mask another library changed between two mints is seen by the next
-/// whole-team scope that opens on that thread and by every mint after it. That
-/// is deliberate: reading the mask on every mint is what this costs, and the
-/// count paces member waits and decides nothing else.
+/// A mint alone never reads the mask, and a token takes the count the thread had
+/// when it was minted, so a scope can be paced by a stale count if the mask
+/// changed while nothing was placed. That is the cost of not reading on every
+/// mint, and the count paces member waits and decides nothing else.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(placed) = PLACED.with(core::cell::Cell::get) {

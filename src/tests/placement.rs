@@ -428,3 +428,50 @@ fn a_root_scope_places_under_the_pools_pin_strategy() {
         "the calling thread's mask after both scopes"
     );
 }
+
+/// threadteam-rs#62: the memo is refreshed by the pin section of a scope, not
+/// by a mint. On a thread another library restricts while nothing is placed,
+/// the mint before the next scope still uses the count the thread had, and
+/// that scope is paced by it; the pin section then reads the mask anyway, so
+/// every mint after that scope is paced by the restricted set.
+#[test]
+fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
+    use crate::park::THROTTLED_POLLS;
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs for a 4-participant team");
+        return;
+    }
+    let budget = 50_000;
+    let team = spinning_pool(4, budget).into_team(4).expect("an idle pool");
+    // One scope on the wide mask caches the count of that mask.
+    team.exec(4)
+        .team(|_| {})
+        .expect("a team token opens its scope");
+    // Restrict the calling thread behind the crate: one CPU for four
+    // participants.
+    if !set_own_cpus(&all[..1]) {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    }
+    let exec = team.exec(4);
+    let stale = member_budgets(&team);
+    assert!(
+        stale.iter().all(|&b| b == budget),
+        "a mint alone does not read the mask: {stale:?}"
+    );
+    drop(exec);
+    // The next scope reads the mask in its pin section and refreshes the memo,
+    // whether or not it places anyone.
+    team.exec(4)
+        .team(|_| {})
+        .expect("a team token opens its scope");
+    let exec = team.exec(4);
+    let throttled = member_budgets(&team);
+    assert!(
+        throttled.iter().all(|&b| b == THROTTLED_POLLS),
+        "every mint after the scope is paced by the restricted set: {throttled:?}"
+    );
+    drop(exec);
+    assert!(set_own_cpus(&all), "restoring the calling thread mask");
+}

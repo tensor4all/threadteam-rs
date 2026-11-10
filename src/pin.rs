@@ -107,10 +107,14 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// (`sched_getaffinity` on Linux, `sysconf` then `__sysctl` on macOS, ~216 ns
 /// there) and it was about 90% of minting a token, which a caller that mints
 /// once per small operation paid every time (threadteam-rs#62). The memo is
-/// forgotten by [`set_here`] and [`set_here_to`], that is, every time this
-/// crate moves the mask of the calling thread; a mask another library changes
-/// between two mints on the same thread is not observed until this crate moves
-/// the thread again.
+/// refreshed from two places: [`set_here`] and [`set_here_to`], that is,
+/// whenever this crate moves the mask of the calling thread, and
+/// [`note_count`] from the pin section of a root scope, which reads the mask
+/// in any case. So a mask another library changed between two mints is seen by
+/// the next scope that opens on that thread and by every mint after it; only
+/// the mint that precedes that scope, and the scope itself, keep the count the
+/// thread had. That is deliberate: reading the mask on every mint is what this
+/// costs.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(placed) = PLACED.with(core::cell::Cell::get) {
@@ -159,6 +163,20 @@ pub(crate) fn set_here(mask: &CpuMask) -> bool {
         AVAILABLE.with(|memo| memo.set(0));
     }
     moved
+}
+
+/// Records a CPU count that the calling thread just read for itself, so that
+/// the next mint does not read the mask again.
+///
+/// Called by the pin section of a root scope, which reads the calling thread
+/// mask anyway: that read is also the answer [`available`] would give on the
+/// same thread, so it replaces the memo (threadteam-rs#62). A mask another
+/// library changed while nothing was placed is therefore seen by the scope
+/// that opens next, and by every mint after it.
+pub(crate) fn note_count(n: usize) {
+    if n > 0 {
+        AVAILABLE.with(|memo| memo.set(n));
+    }
 }
 
 /// Pins the calling thread onto `cpu`, then forgets [`AVAILABLE`].

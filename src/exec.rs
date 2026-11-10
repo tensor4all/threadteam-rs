@@ -1187,8 +1187,13 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
     // The leader reads its own mask: that set is where the team is placed, and
     // the leader's mask is that set again once the scope has closed.
     let set = crate::pin::read_here()?;
-    if crate::pin::count(&set) < team.size().get() {
-        awake.pin_skips.fetch_add(1, Ordering::Relaxed);
+    let cpus = crate::pin::count(&set);
+    // This thread just read its own mask, which is the count a later mint on it
+    // would need: hand the read to the memo, so a mask another library changed is
+    // seen by every mint after this scope without a second kernel call
+    // (threadteam-rs#62).
+    crate::pin::note_count(cpus);
+    if cpus < team.size().get() {
         if let Some(placement) = placement {
             placement.store(0, Ordering::Relaxed);
         }

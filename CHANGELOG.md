@@ -68,13 +68,20 @@ All notable changes to `threadteam` are recorded here. The format follows
   called `sched_getaffinity` on Linux or `std::thread::available_parallelism`
   (`sysconf` then `__sysctl`, ~216 ns on macOS) on every mint, and about 90% of
   a mint was that read: a caller that mints once per small operation paid it
-  every time. The count is now memoised per thread and forgotten whenever this
-  crate moves the mask of that thread (`pin::set_here`, `pin::set_here_to`), so
-  a mask another library changes between two mints on one thread is not
-  observed until then. Measured on the macOS arm host (`Pool` of 4, then
-  `into_team`, 1e6 x `try_exec(4)` and drop): 213.6 and 217.8 ns per mint at
-  `b94ab94`, 47.8 and 47.6 ns with the memo. Regression test:
-  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread` (Linux).
+  every time. The count is now memoised per thread. The memo is forgotten when
+  this crate moves the mask of that thread (`pin::set_here`, `pin::set_here_to`)
+  and refreshed from the pin section of a root scope (`pin::note_count`), which
+  reads the mask in any case (a pool with participant pinning off runs no pin
+  section). A mask another library changes between two mints
+  is therefore seen by the next scope that opens on the thread and by every
+  mint after it; the mint before that scope, and the scope itself, keep the
+  count the thread had. Measured on the macOS arm host (`Pool` of 4, then
+  `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns per mint at
+  `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32 CPUs):
+  275.9 and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
+  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread` and
+  `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows`
+  (Linux).
 
 ## [0.5.1] - 2026-11-07
 

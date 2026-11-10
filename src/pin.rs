@@ -110,7 +110,9 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// refreshed from two places: [`set_here`] and [`set_here_to`], that is,
 /// whenever this crate moves the mask of the calling thread, and
 /// [`note_count`] from the pin section of a root scope, which reads the mask
-/// in any case. So a mask another library changed between two mints is seen by
+/// in any case (a pool with participant pinning off runs no pin section, so
+/// there only a move by this crate refreshes the memo). So a mask another
+/// library changed between two mints is seen by
 /// the next scope that opens on that thread and by every mint after it; only
 /// the mint that precedes that scope, and the scope itself, keep the count the
 /// thread had. That is deliberate: reading the mask on every mint is what this

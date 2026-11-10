@@ -118,9 +118,9 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// of those on that thread: at most a whole-team scope, and often an earlier
 /// narrower one. A pool with participant pinning off is the exception: no scope of
 /// this crate touches the mask then, so there the count stands until the thread
-/// ends. Off Linux neither setter moves a thread either, so the count stands there
-/// too; nothing changes it in practice, `available_parallelism` being a property of
-/// the process.
+/// ends. Off Linux there is no invalidation hook at all: `available_parallelism` is
+/// the boot CPU count on macOS, but a process affinity change made by other code on
+/// Windows (`SetProcessAffinityMask`) is not observed for the life of the thread.
 ///
 /// A mint reads the mask only on a miss, that is, the first mint on a thread and
 /// the first after this crate moved its mask. Every other mint takes the count the

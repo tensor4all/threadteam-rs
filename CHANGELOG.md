@@ -7,6 +7,8 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-10
+
 ### Added
 
 - `PinStrategy { Spread, Pack }`, `PoolBuilder::pin_strategy` and

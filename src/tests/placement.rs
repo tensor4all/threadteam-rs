@@ -444,10 +444,9 @@ fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
     }
     let budget = 50_000;
     let team = spinning_pool(4, budget).into_team(4).expect("an idle pool");
-    // One scope on the wide mask caches the count of that mask.
-    team.exec(4)
-        .team(|_| {})
-        .expect("a team token opens its scope");
+    // One mint on the wide mask caches the count of that mask. No scope, so
+    // nothing moves the thread and the memo keeps it.
+    drop(team.exec(4));
     // Restrict the calling thread behind the crate: one CPU for four
     // participants.
     if !set_own_cpus(&all[..1]) {

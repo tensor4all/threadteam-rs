@@ -63,6 +63,19 @@ All notable changes to `threadteam` are recorded here. The format follows
   on another thread places that thread for its sections too, inside its own
   mask.
 
+- **Minting a token no longer reads the CPU count from the kernel every time**
+  (#62). `Team::token` decides oversubscription from `pin::available()`, which
+  called `sched_getaffinity` on Linux or `std::thread::available_parallelism`
+  (`sysconf` then `__sysctl`, ~216 ns on macOS) on every mint, and about 90% of
+  a mint was that read: a caller that mints once per small operation paid it
+  every time. The count is now memoised per thread and forgotten whenever this
+  crate moves the mask of that thread (`pin::set_here`, `pin::set_here_to`), so
+  a mask another library changes between two mints on one thread is not
+  observed until then. Measured on the macOS arm host (`Pool` of 4, then
+  `into_team`, 1e6 x `try_exec(4)` and drop): 213.6 and 217.8 ns per mint at
+  `b94ab94`, 47.8 and 47.6 ns with the memo. Regression test:
+  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread` (Linux).
+
 ## [0.5.1] - 2026-11-07
 
 A `Team` created on 0.5.0 paced its own members by its leader's one-CPU mask.

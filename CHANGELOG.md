@@ -72,17 +72,18 @@ All notable changes to `threadteam` are recorded here. The format follows
   rewritten by `pin::note_count` from the pin section of a root scope, which reads
   the mask in any case, and forgotten by every mask this crate sets or restores on
   the thread (leader pin, home pin, member restore, unpin), so a count another
-  library changes survives at most until the next whole-team scope. Two cases keep
-  it: a pool with participant pinning off, whose scopes touch no mask and so never
-  refresh, and any platform but Linux, which has no invalidation hook here (a
-  process affinity change made by other code on Windows is not observed at all; on
-  macOS `available_parallelism` is the boot CPU count). A mint reads the mask only on
-  a miss, the first on a thread or the first after this crate moved it; every other
-  mint takes the count the thread had, so a scope can still be paced by a stale one.
-  That is the cost, and the count only paces member waits. Measured on the macOS arm
-  host (`Pool` of 4, then `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and
-  215.8 ns per mint at `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux
-  x86_64, 32 CPUs): 275.9 and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
+  library changes survives at most until the next whole-team scope of a team of two
+  or more. Three cases have no refresh path: a team of one participant, any scope of
+  a pool with participant pinning off, and any platform but Linux (a Windows
+  process-affinity change is not observed at all; on macOS `available_parallelism`
+  is the boot CPU count). A mint reads the mask only on a miss, the first on a thread
+  or the first after this crate moved it; every other mint takes the count the thread
+  had. That count decides the spin budget of a scope, the member waits and, through
+  the same flag, the joining leader and barrier waits; nothing else. That is the
+  cost of not reading on every mint. Measured on the macOS arm host (`Pool` of 4,
+  then `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns per mint at
+  `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32 CPUs): 275.9
+  and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
   `the_cpu_count_is_memoised_until_this_crate_moves_the_thread`,
   `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows` and
   `a_pool_with_pinning_off_never_refreshes_the_count` (Linux).

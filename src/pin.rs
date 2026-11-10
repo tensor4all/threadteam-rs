@@ -115,18 +115,21 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// [`set_here_to`], that is, by every leader pin, home pin (including the one a
 /// narrower root scope takes when the team has a placement), member restore and
 /// unpin. A count another library changed therefore survives only until the next
-/// of those on that thread: at most a whole-team scope, and often an earlier
-/// narrower one. A pool with participant pinning off is the exception: no scope of
-/// this crate touches the mask then, so there the count stands until the thread
-/// ends. Off Linux there is no invalidation hook at all: `available_parallelism` is
-/// the boot CPU count on macOS, but a process affinity change made by other code on
-/// Windows (`SetProcessAffinityMask`) is not observed for the life of the thread.
+/// of those on that thread: at most a whole-team scope of a team of two or more
+/// participants, and often an earlier, narrower one. Three cases have no refresh
+/// path at all, so there the count stands until the thread ends: a team of one
+/// participant (`pin_scope` needs `size() > 1`), any scope of a pool with
+/// participant pinning off, and any platform but Linux, which has no hook here
+/// (`available_parallelism` is the boot CPU count on macOS, and a process affinity
+/// change made by other code on Windows is not observed).
 ///
 /// A mint reads the mask only on a miss, that is, the first mint on a thread and
 /// the first after this crate moved its mask. Every other mint takes the count the
 /// thread had when it was minted, so a scope can be paced by a stale count if the
 /// mask changed while nothing was placed. That is the cost of not reading on every
-/// mint, and the count paces member waits and decides nothing else.
+/// mint. The count decides the spin budget of a scope: the member waits, and
+/// through the same flag the joining leaders and barrier participants
+/// (`awake::Section::waiter`). Nothing else.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(placed) = PLACED.with(core::cell::Cell::get) {

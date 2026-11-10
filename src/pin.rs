@@ -116,9 +116,11 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 /// narrower root scope takes when the team has a placement), member restore and
 /// unpin. A count another library changed therefore survives only until the next
 /// of those on that thread: at most a whole-team scope, and often an earlier
-/// narrower one. Off Linux neither setter moves a thread, so there the count
-/// stands for the life of the thread; nothing changes it in practice,
-/// `available_parallelism` being a property of the process.
+/// narrower one. A pool with participant pinning off is the exception: no scope of
+/// this crate touches the mask then, so there the count stands until the thread
+/// ends. Off Linux neither setter moves a thread either, so the count stands there
+/// too; nothing changes it in practice, `available_parallelism` being a property of
+/// the process.
 ///
 /// A mint alone never reads the mask, and a token takes the count the thread had
 /// when it was minted, so a scope can be paced by a stale count if the mask

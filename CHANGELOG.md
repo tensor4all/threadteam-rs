@@ -68,20 +68,22 @@ All notable changes to `threadteam` are recorded here. The format follows
   called `sched_getaffinity` on Linux or `std::thread::available_parallelism`
   (`sysconf` then `__sysctl`, ~216 ns on macOS) on every mint; the reporter put
   about 90% of a mint on that read, so a caller that mints once per small
-  operation paid a syscall every time. The count is now memoised per thread: it is
+  operation paid a syscall every time. The count is now memoised per thread. It is
   rewritten by `pin::note_count` from the pin section of a root scope, which reads
   the mask in any case, and forgotten by every mask this crate sets or restores on
-  the thread (leader pin, home pin, member restore, unpin). A count another library
-  changes therefore survives until the next of those, at most a whole-team scope;
-  off Linux neither setter moves a thread and `available_parallelism` does not
-  change under a process, so the count stands. A mint alone never reads the mask, so
-  a scope can still be paced by the count the thread had: that is the cost, and the
+  the thread (leader pin, home pin, member restore, unpin), so a count another
+  library changes survives at most until the next whole-team scope. Two cases keep
+  it: a pool with participant pinning off, whose scopes touch no mask at all, and
+  everything off Linux, where neither setter moves a thread (nothing changes
+  `available_parallelism` in a process). A mint alone never reads the mask, so a
+  scope can still be paced by the count the thread had: that is the cost, and the
   count only paces member waits. Measured on the macOS arm host (`Pool` of 4, then
   `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns per mint at
   `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32 CPUs):
   275.9 and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
-  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread` and
-  `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows` (Linux).
+  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread`,
+  `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows` and
+  `a_pool_with_pinning_off_never_refreshes_the_count` (Linux).
 
 ## [0.5.1] - 2026-11-07
 

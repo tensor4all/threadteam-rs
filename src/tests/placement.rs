@@ -519,3 +519,45 @@ fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
     drop(exec);
     assert!(set_own_cpus(&all), "restoring the calling thread mask");
 }
+
+/// threadteam-rs#62: with participant pinning off no scope of this crate touches
+/// the calling thread mask, so the memo keeps whatever count the thread had, even
+/// across whole-team scopes.
+#[test]
+fn a_pool_with_pinning_off_never_refreshes_the_count() {
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs for a 4-participant team");
+        return;
+    }
+    let budget = 50_000;
+    let pool = Pool::builder()
+        .threads(4)
+        .pin_participants(false)
+        .spin_polls(budget)
+        .acquire_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let team = pool.into_team(4).expect("an idle pool");
+    // One mint on the wide mask caches the count of that mask.
+    drop(team.exec(4));
+    if !set_own_cpus(&all[..1]) {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    }
+    // No scope runs a pin section, so nothing reads the mask: the count the thread
+    // had stays, and so does the budget it chose.
+    for _ in 0..3 {
+        team.exec(4)
+            .team(|_| {})
+            .expect("a team token opens its scope");
+        let exec = team.exec(4);
+        let kept = member_budgets(&team);
+        assert!(
+            kept.iter().all(|&b| b == budget),
+            "pinning off runs no pin section: {kept:?}"
+        );
+        drop(exec);
+    }
+    assert!(set_own_cpus(&all), "restoring the calling thread mask");
+}

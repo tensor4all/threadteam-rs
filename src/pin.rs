@@ -82,7 +82,7 @@ pub(crate) use sys::count;
 #[cfg(not(target_os = "linux"))]
 #[allow(unused_imports)]
 pub(crate) use sys::count;
-pub(crate) use sys::{contains, cpus, read_here, set_here, set_here_to, subset, CpuMask};
+pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 
 /// Number of CPUs the calling thread's team is spread over: the CPUs a root
 /// team scope entered on this thread may place its participants on.
@@ -102,6 +102,34 @@ pub(crate) use sys::{contains, cpus, read_here, set_here, set_here_to, subset, C
 /// On any other Linux thread it is the number of CPUs in its affinity mask,
 /// i.e. the same set the pin section places participants on. Elsewhere
 /// [`std::thread::available_parallelism`]. Zero is never returned.
+///
+/// The read is memoised per thread ([`AVAILABLE`]). It is a kernel call
+/// (`sched_getaffinity` on Linux, `sysconf` then `__sysctl` on macOS, ~216 ns
+/// there), and on the macOS host the mint cost this read almost entirely: 216 ns
+/// of `Team::try_exec` before, 47 ns after (threadteam-rs#62). A caller that
+/// mints once per small operation used to pay a syscall every time.
+///
+/// The memo is refreshed whenever this crate touches the mask of the calling
+/// thread: it is rewritten by [`note_count`] from the pin section of a root
+/// scope, which reads the mask in any case, and forgotten by [`set_here`] and
+/// [`set_here_to`], that is, by every leader pin, home pin (including the one a
+/// narrower root scope takes when the team has a placement), member restore and
+/// unpin. A count another library changed therefore survives only until the next
+/// of those on that thread: at most a whole-team scope of a team of two or more
+/// participants, and often an earlier, narrower one. Three cases have no refresh
+/// path at all, so there the count stands until the thread ends: a team of one
+/// participant (`pin_scope` needs `size() > 1`), any scope of a pool with
+/// participant pinning off, and any platform but Linux, which has no hook here
+/// (`available_parallelism` is the boot CPU count on macOS, and a process affinity
+/// change made by other code on Windows is not observed).
+///
+/// A mint reads the mask only on a miss, that is, the first mint on a thread and
+/// the first after this crate moved its mask. Every other mint takes the count the
+/// thread had when it was minted, so a scope can be paced by a stale count if the
+/// mask changed while nothing was placed. That is the cost of not reading on every
+/// mint. The count decides the spin budget of a scope: the member waits, and
+/// through the same flag the joining leaders and barrier participants
+/// (`awake::Section::waiter`). Nothing else.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(placed) = PLACED.with(core::cell::Cell::get) {
@@ -110,6 +138,21 @@ pub(crate) fn available() -> usize {
             return n;
         }
     }
+    AVAILABLE.with(|memo| {
+        let cached = memo.get();
+        if cached != 0 {
+            return cached;
+        }
+        let n = unplaced_count();
+        memo.set(n);
+        n
+    })
+}
+
+/// The CPU count of the calling thread with nothing placed on it: the CPUs of
+/// its affinity mask on Linux, [`std::thread::available_parallelism`]
+/// elsewhere. Zero is never returned.
+fn unplaced_count() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(set) = read_here() {
         let n = count(&set);
@@ -118,6 +161,46 @@ pub(crate) fn available() -> usize {
         }
     }
     std::thread::available_parallelism().map_or(1, |n| n.get())
+}
+
+thread_local! {
+    /// The value [`unplaced_count`] last returned on this thread; zero until
+    /// the first read. A `Cell` of a plain `usize`, so a mint neither allocates
+    /// nor registers a destructor (threadteam-rs#62).
+    static AVAILABLE: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+}
+
+/// Applies `mask` to the calling thread, then forgets [`AVAILABLE`]: the CPU
+/// set of the thread has just changed.
+pub(crate) fn set_here(mask: &CpuMask) -> bool {
+    let moved = sys::set_here(mask);
+    if moved {
+        AVAILABLE.with(|memo| memo.set(0));
+    }
+    moved
+}
+
+/// Records a CPU count that the calling thread just read for itself, so that
+/// the next mint does not read the mask again.
+///
+/// Called by the pin section of a root scope, which reads the calling thread
+/// mask anyway: that read is also the answer [`available`] would give on the
+/// same thread, so it replaces the memo (threadteam-rs#62). A mask another
+/// library changed while nothing was placed is therefore seen by the scope
+/// that opens next, and by every mint after it.
+pub(crate) fn note_count(n: usize) {
+    if n > 0 {
+        AVAILABLE.with(|memo| memo.set(n));
+    }
+}
+
+/// Pins the calling thread onto `cpu`, then forgets [`AVAILABLE`].
+pub(crate) fn set_here_to(cpu: usize) -> bool {
+    let moved = sys::set_here_to(cpu);
+    if moved {
+        AVAILABLE.with(|memo| memo.set(0));
+    }
+    moved
 }
 
 /// Whether a root scope with `participants` participants is oversubscribed: it
@@ -1052,5 +1135,35 @@ mod tests {
             width,
             "the set comes back when the placement ends"
         );
+    }
+
+    /// threadteam-rs#62: the CPU count is read once per thread, and a mask
+    /// change this crate makes forgets it. A mask changed behind the memo is
+    /// deliberately not observed until this crate moves the thread again.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_cpu_count_is_memoised_until_this_crate_moves_the_thread() {
+        let whole = match read_here() {
+            Some(mask) if count(&mask) >= 2 => mask,
+            _ => {
+                eprintln!("skipped: need at least 2 CPUs in the calling thread mask");
+                return;
+            }
+        };
+        let wide = count(&whole);
+        assert_eq!(available(), wide, "the first read answers the mask");
+        let mut first = [0u16; 1];
+        assert_eq!(cpus(&whole, &mut first), 1, "the mask holds a CPU");
+        let one = sys::mask_from(&first[..]);
+        assert!(sys::set_here(&one), "restricting the calling thread");
+        assert_eq!(
+            available(),
+            wide,
+            "no kernel read on the next mint: the memo answers"
+        );
+        assert!(set_here(&one), "a mask change this crate makes");
+        assert_eq!(available(), 1, "which forgets the memo");
+        assert!(set_here(&whole), "restoring the calling thread mask");
+        assert_eq!(available(), wide);
     }
 }

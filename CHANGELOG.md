@@ -63,6 +63,31 @@ All notable changes to `threadteam` are recorded here. The format follows
   on another thread places that thread for its sections too, inside its own
   mask.
 
+- **Minting a token no longer reads the CPU count from the kernel every time**
+  (#62). `Team::token` decides oversubscription from `pin::available()`, which
+  called `sched_getaffinity` on Linux or `std::thread::available_parallelism`
+  (`sysconf` then `__sysctl`, ~216 ns on macOS) on every mint; the reporter put
+  about 90% of a mint on that read, so a caller that mints once per small
+  operation paid a syscall every time. The count is now memoised per thread. It is
+  rewritten by `pin::note_count` from the pin section of a root scope, which reads
+  the mask in any case, and forgotten by every mask this crate sets or restores on
+  the thread (leader pin, home pin, member restore, unpin), so a count another
+  library changes survives at most until the next whole-team scope of a team of two
+  or more. Three cases have no refresh path: a team of one participant, any scope of
+  a pool with participant pinning off, and any platform but Linux (a Windows
+  process-affinity change is not observed at all; on macOS `available_parallelism`
+  is the boot CPU count). A mint reads the mask only on a miss, the first on a thread
+  or the first after this crate moved it; every other mint takes the count the thread
+  had. That count decides the spin budget of a scope, the member waits and, through
+  the same flag, the joining leader and barrier waits; nothing else. That is the
+  cost of not reading on every mint. Measured on the macOS arm host (`Pool` of 4,
+  then `into_team`, 1e6 x `try_exec(4)` and drop): 216.2 and 215.8 ns per mint at
+  `b94ab94`, 48.1 and 46.8 ns with the memo; on evo2 (Linux x86_64, 32 CPUs): 275.9
+  and 275.4 ns against 141.3 and 141.0 ns. Regression tests:
+  `the_cpu_count_is_memoised_until_this_crate_moves_the_thread`,
+  `a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows` and
+  `a_pool_with_pinning_off_never_refreshes_the_count` (Linux).
+
 ## [0.5.1] - 2026-11-07
 
 A `Team` created on 0.5.0 paced its own members by its leader's one-CPU mask.

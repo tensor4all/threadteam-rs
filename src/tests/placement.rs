@@ -428,3 +428,136 @@ fn a_root_scope_places_under_the_pools_pin_strategy() {
         "the calling thread's mask after both scopes"
     );
 }
+
+/// threadteam-rs#62: the memo is refreshed by the pin section of a whole-team
+/// scope, not by a mint and not by a narrower scope. On a thread another library
+/// restricts while nothing is placed, the mints before the next whole-team scope
+/// keep the count the thread had, and that scope is paced by it; its pin section
+/// then reads the mask anyway, so every mint after it is paced by the restricted
+/// set.
+#[test]
+fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
+    use crate::park::THROTTLED_POLLS;
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs for a 4-participant team");
+        return;
+    }
+    let budget = 50_000;
+    let team = spinning_pool(4, budget).into_team(4).expect("an idle pool");
+    // One mint on the wide mask caches the count of that mask. No scope, so
+    // nothing moves the thread and the memo keeps it.
+    drop(team.exec(4));
+    // Restrict the calling thread behind the crate: one CPU for four
+    // participants.
+    if !set_own_cpus(&all[..1]) {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    }
+    // A narrower root scope runs no pin section, so it reads nothing. With no
+    // placement recorded (this team never opened a whole-team scope) it pins
+    // nothing either, so the memo keeps the old count however many of them run.
+    // Once a placement exists the narrower scope pins its leader at the home CPU
+    // and gives it its mask back, and those two mask changes clear the memo (see
+    // the last case of this test).
+    for _ in 0..3 {
+        team.exec(2)
+            .team(|_| {})
+            .expect("a narrower team token opens its scope");
+    }
+    let exec = team.exec(4);
+    let stale = member_budgets(&team);
+    assert!(
+        stale.iter().all(|&b| b == budget),
+        "neither a mint nor a narrower scope reads the mask: {stale:?}"
+    );
+    drop(exec);
+    // The whole-team scope reads the mask in its pin section, but it is still
+    // paced by the count the thread had: the budgets are set at the mint.
+    let inside = std::sync::Mutex::new(None);
+    team.exec(4)
+        .team(|t| {
+            let awake = t.awake.expect("a pool");
+            let budgets: Vec<u32> = t.ids.iter().map(|&id| awake.slot_spin_budget(id)).collect();
+            *inside.lock().unwrap() = Some((t.over, budgets));
+        })
+        .expect("a team token opens its scope");
+    let (over, budgets) = inside.into_inner().unwrap().expect("the scope ran");
+    assert!(!over, "the scope itself keeps the stale decision");
+    assert!(
+        budgets.iter().all(|&b| b == budget),
+        "and the stale budget: {budgets:?}"
+    );
+    // Every mint after it is paced by the restricted set.
+    let exec = team.exec(4);
+    let throttled = member_budgets(&team);
+    assert!(
+        throttled.iter().all(|&b| b == THROTTLED_POLLS),
+        "the pin section refreshed the memo: {throttled:?}"
+    );
+    drop(exec);
+    // A narrower scope does refresh the memo once the team has a placement: the
+    // narrower token pins its leader at the home CPU and gives it its mask back,
+    // and both are mask changes of ours. Four participants on the two CPUs that
+    // hold the home are oversubscribed, so a refreshed count shows as the
+    // throttled budget.
+    assert!(set_own_cpus(&all[..4]), "widening the calling thread");
+    team.exec(4)
+        .team(|_| {})
+        .expect("a whole-team scope records the placement");
+    drop(team.exec(4));
+    assert!(set_own_cpus(&all[..2]), "two CPUs that hold the home");
+    team.exec(2)
+        .team(|_| {})
+        .expect("a narrower scope pins its leader home");
+    let exec = team.exec(4);
+    let refreshed = member_budgets(&team);
+    assert!(
+        refreshed.iter().all(|&b| b == THROTTLED_POLLS),
+        "the home pin of the narrower scope cleared the memo: {refreshed:?}"
+    );
+    drop(exec);
+    assert!(set_own_cpus(&all), "restoring the calling thread mask");
+}
+
+/// threadteam-rs#62: with participant pinning off no scope of this crate touches
+/// the calling thread mask, so the memo keeps whatever count the thread had, even
+/// across whole-team scopes.
+#[test]
+fn a_pool_with_pinning_off_never_refreshes_the_count() {
+    let all = own_cpus();
+    if all.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs for a 4-participant team");
+        return;
+    }
+    let budget = 50_000;
+    let pool = Pool::builder()
+        .threads(4)
+        .pin_participants(false)
+        .spin_polls(budget)
+        .acquire_timeout(Duration::from_secs(10))
+        .build()
+        .unwrap();
+    let team = pool.into_team(4).expect("an idle pool");
+    // One mint on the wide mask caches the count of that mask.
+    drop(team.exec(4));
+    if !set_own_cpus(&all[..1]) {
+        eprintln!("skipped: cannot restrict the calling thread to one CPU");
+        return;
+    }
+    // No scope runs a pin section, so nothing reads the mask: the count the thread
+    // had stays, and so does the budget it chose.
+    for _ in 0..3 {
+        team.exec(4)
+            .team(|_| {})
+            .expect("a team token opens its scope");
+        let exec = team.exec(4);
+        let kept = member_budgets(&team);
+        assert!(
+            kept.iter().all(|&b| b == budget),
+            "pinning off runs no pin section: {kept:?}"
+        );
+        drop(exec);
+    }
+    assert!(set_own_cpus(&all), "restoring the calling thread mask");
+}

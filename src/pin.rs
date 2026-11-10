@@ -105,18 +105,28 @@ pub(crate) use sys::{contains, cpus, read_here, subset, CpuMask};
 ///
 /// The read is memoised per thread ([`AVAILABLE`]). It is a kernel call
 /// (`sched_getaffinity` on Linux, `sysconf` then `__sysctl` on macOS, ~216 ns
-/// there) and it was about 90% of minting a token, which a caller that mints
-/// once per small operation paid every time (threadteam-rs#62). The memo is
-/// refreshed from two places: [`set_here`] and [`set_here_to`], that is,
-/// whenever this crate moves the mask of the calling thread, and
-/// [`note_count`] from the pin section of a root scope, which reads the mask
-/// in any case (a pool with participant pinning off runs no pin section, so
-/// there only a move by this crate refreshes the memo). So a mask another
-/// library changed between two mints is seen by
-/// the next scope that opens on that thread and by every mint after it; only
-/// the mint that precedes that scope, and the scope itself, keep the count the
-/// thread had. That is deliberate: reading the mask on every mint is what this
-/// costs.
+/// there), and on the macOS host the mint cost this read almost entirely: 216 ns
+/// of `Team::try_exec` before, 47 ns after (threadteam-rs#62). A caller that
+/// mints once per small operation used to pay a syscall every time.
+///
+/// The memo is refreshed when this crate moves the mask of the calling thread
+/// ([`set_here`], [`set_here_to`]: a leader pin, a home pin, a member restoring
+/// its own mask, an unpin) and by [`note_count`] from the pin section of a root
+/// scope, which reads the mask in any case. Three places therefore keep the
+/// count the thread had until something else refreshes it:
+///
+/// * a root scope narrower than the team, which runs no pin section (exec
+///   `pin_scope` is entered only for a scope over every reserved member),
+/// * every scope of a pool with participant pinning off, which runs none
+///   either, and
+/// * everything off Linux, where neither setter moves a thread, so the memo
+///   lives as long as the thread. Nothing changes the value there in practice:
+///   `available_parallelism` is a property of the process.
+///
+/// So a mask another library changed between two mints is seen by the next
+/// whole-team scope that opens on that thread and by every mint after it. That
+/// is deliberate: reading the mask on every mint is what this costs, and the
+/// count paces member waits and decides nothing else.
 pub(crate) fn available() -> usize {
     #[cfg(target_os = "linux")]
     if let Some(placed) = PLACED.with(core::cell::Cell::get) {

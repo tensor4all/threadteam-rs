@@ -429,11 +429,12 @@ fn a_root_scope_places_under_the_pools_pin_strategy() {
     );
 }
 
-/// threadteam-rs#62: the memo is refreshed by the pin section of a scope, not
-/// by a mint. On a thread another library restricts while nothing is placed,
-/// the mint before the next scope still uses the count the thread had, and
-/// that scope is paced by it; the pin section then reads the mask anyway, so
-/// every mint after that scope is paced by the restricted set.
+/// threadteam-rs#62: the memo is refreshed by the pin section of a whole-team
+/// scope, not by a mint and not by a narrower scope. On a thread another library
+/// restricts while nothing is placed, the mints before the next whole-team scope
+/// keep the count the thread had, and that scope is paced by it; its pin section
+/// then reads the mask anyway, so every mint after it is paced by the restricted
+/// set.
 #[test]
 fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
     use crate::park::THROTTLED_POLLS;
@@ -453,23 +454,42 @@ fn a_mask_changed_by_another_library_is_seen_by_the_scope_that_follows() {
         eprintln!("skipped: cannot restrict the calling thread to one CPU");
         return;
     }
+    // A narrower root scope runs no pin section, so it reads nothing and the
+    // memo keeps the old count however many of them run.
+    for _ in 0..3 {
+        team.exec(2)
+            .team(|_| {})
+            .expect("a narrower team token opens its scope");
+    }
     let exec = team.exec(4);
     let stale = member_budgets(&team);
     assert!(
         stale.iter().all(|&b| b == budget),
-        "a mint alone does not read the mask: {stale:?}"
+        "neither a mint nor a narrower scope reads the mask: {stale:?}"
     );
     drop(exec);
-    // The next scope reads the mask in its pin section and refreshes the memo,
-    // whether or not it places anyone.
+    // The whole-team scope reads the mask in its pin section, but it is still
+    // paced by the count the thread had: the budgets are set at the mint.
+    let inside = std::sync::Mutex::new(None);
     team.exec(4)
-        .team(|_| {})
+        .team(|t| {
+            let awake = t.awake.expect("a pool");
+            let budgets: Vec<u32> = t.ids.iter().map(|&id| awake.slot_spin_budget(id)).collect();
+            *inside.lock().unwrap() = Some((t.over, budgets));
+        })
         .expect("a team token opens its scope");
+    let (over, budgets) = inside.into_inner().unwrap().expect("the scope ran");
+    assert!(!over, "the scope itself keeps the stale decision");
+    assert!(
+        budgets.iter().all(|&b| b == budget),
+        "and the stale budget: {budgets:?}"
+    );
+    // Every mint after it is paced by the restricted set.
     let exec = team.exec(4);
     let throttled = member_budgets(&team);
     assert!(
         throttled.iter().all(|&b| b == THROTTLED_POLLS),
-        "every mint after the scope is paced by the restricted set: {throttled:?}"
+        "the pin section refreshed the memo: {throttled:?}"
     );
     drop(exec);
     assert!(set_own_cpus(&all), "restoring the calling thread mask");

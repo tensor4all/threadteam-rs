@@ -610,6 +610,49 @@ needs the ledger and `Participant::size` to exclude the empty shares to keep "a 
 than k tasks of real work". the `x86_64-avx512` row now holds the post-fix row (0.6, 0.7, 0.9), re-measured by the Linux
 campaign.
 
+#### Multi-node AVX-512: what the class row does not model (threadteam-rs#68)
+
+The row above was measured on one L3 domain. A 96-core Xeon 9242 (4 NUMA nodes of 24 cores, exclusive, nothing
+else running) measured the same quantity — `team/load10us-minus-10us`, back-to-back sections, `spin_polls(u32::MAX)`,
+one pool per process, threadteam 0.5.1 — at the widths where a team first crosses a node:
+
+| width | 2 | 4 | 8 | 16 | 24 | 32 | 48 | 64 | 96 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| model D(w), ns | 600 | 700 | 980 | 1960 | 2940 | 3920 | 5880 | 7840 | 11760 |
+| measured, ns (two runs) | 595/660 | 901/1162 | 1381/1521 | 3048/2640 | 4176/3488 | 11551/9416 | 16896/13897 | 25236/28924 | 45758/42822 |
+| measured / model | 1.0–1.1 | 1.3–1.7 | 1.4–1.6 | 1.3–1.6 | 1.2–1.4 | 2.4–2.9 | 2.4–2.9 | 3.2–3.7 | 3.6–3.9 |
+
+Read: to width 24 (one node) the row is within 1.6x; from 32, the first width that spans two nodes, the model is
+2.4–3.9x optimistic. `WidthCosts` has one linear segment above its last anchor, so a single row cannot represent
+that step, and `pays` admits sections slower than serial on this topology.
+
+The built-in row is not changed from this one host: the class covers single-node AVX-512 machines too, where the
+same 32-wide anchor would overprice a section by about 3x, and one topology cannot separate the width term from the
+node term. A pool owner on a multi-node host installs the measured curve itself:
+
+```rust
+use std::time::Duration;
+use threadteam::{DispatchCosts, DispatchKind, Pool, WidthCosts};
+
+let team = WidthCosts::from_anchors(&[
+    (2, Duration::from_nanos(628)),
+    (4, Duration::from_nanos(1032)),
+    (8, Duration::from_nanos(1451)),
+    (16, Duration::from_nanos(2844)),
+    (24, Duration::from_nanos(3832)),
+    (32, Duration::from_nanos(10484)),
+    (48, Duration::from_nanos(15397)),
+    (64, Duration::from_nanos(27080)),
+    (96, Duration::from_nanos(44290)),
+])
+.unwrap();
+let costs = DispatchCosts::host_default().with(DispatchKind::Team, team);
+let pool = Pool::builder().dispatch_costs(costs).build().unwrap();
+```
+
+The parked rows of the same run (a section after a 50 ms sleep) are 68–374 us at widths 2–96. Those are a separate
+quantity, not part of the steady-state values (see the `DispatchCosts` doc comment), and are not promoted here.
+
 ### 3.7 Zen2 team row (x86_64-avx2, threadteam-rs#6)
 
 `for_class(HostClass::X86_64Avx2)` carries a measured team row with ten anchors. Host `broccoli`: AMD EPYC 7702P

@@ -428,10 +428,10 @@ impl Awake {
             backoff(&mut spins);
         }
         let n = acq.close();
-        for pos in 0..n {
+        for slot in acq.ids.iter().take(n) {
             let mut spins = 0;
             loop {
-                let id = acq.ids[pos].load(Ordering::Acquire);
+                let id = slot.load(Ordering::Acquire);
                 if id != usize::MAX {
                     ids.push(id);
                     break;

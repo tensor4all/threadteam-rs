@@ -500,3 +500,84 @@ fn the_measured_die_split_at_392_kib_stays_serial() {
     );
     assert_eq!(w.get(), 1);
 }
+
+/// threadteam-rs#68: the rows this crate builds carry no multi-node term, so
+/// every node count is priced exactly as `at`, the single-node row.
+#[test]
+fn the_default_rows_price_every_node_count_as_one_node() {
+    let classes = [
+        HostClass::X86_64Avx512,
+        HostClass::X86_64Avx2,
+        HostClass::X86_64Scalar,
+        HostClass::Aarch64Apple,
+        HostClass::Aarch64,
+        HostClass::Generic,
+    ];
+    for class in classes {
+        let row = *DispatchCosts::for_class(class).team_row();
+        assert!(!row.has_multi_node(), "{class:?}");
+        for w in 2..=128 {
+            for n in 1..=4 {
+                assert_eq!(
+                    row.at_nodes(nz(w), nz(n)),
+                    row.at(nz(w)),
+                    "{class:?} w={w} n={n}"
+                );
+            }
+        }
+    }
+    // Today's x86_64-avx512 team row, exactly, on one node and on four.
+    let row = *DispatchCosts::for_class(HostClass::X86_64Avx512).team_row();
+    for (w, ns) in [
+        (2, 600),
+        (4, 700),
+        (6, 900),
+        (8, 980),
+        (32, 3920),
+        (96, 11_760),
+    ] {
+        for n in [1, 4] {
+            assert_eq!(
+                row.at_nodes(nz(w), nz(n)),
+                Duration::from_nanos(ns),
+                "w={w} n={n}"
+            );
+        }
+    }
+    assert_eq!(
+        WidthCosts::flat(us(1)).with_multi_node(Duration::ZERO, Duration::ZERO),
+        WidthCosts::flat(us(1))
+    );
+}
+
+/// threadteam-rs#68 shape on the 4-node Xeon 9242 fixture: the single-node
+/// anchors 8/16/24 = 3.30/4.63/5.90 us and the term fitted from 4-node minus
+/// 1-node at the same widths (1.31 us + 221 ns per participant). Two and four
+/// nodes take the same step; one node is the row.
+#[test]
+fn a_multi_node_term_is_one_step_with_its_own_slope() {
+    let ns = Duration::from_nanos;
+    let row = WidthCosts::from_anchors(&[(8, ns(3300)), (16, ns(4630)), (24, ns(5900))])
+        .unwrap()
+        .with_multi_node(ns(1310), ns(221));
+    assert!(row.has_multi_node());
+    for w in [2, 8, 16, 24, 32, 48, 96] {
+        assert_eq!(row.at_nodes(nz(w), nz(1)), row.at(nz(w)), "w={w}");
+        let term = ns(1310 + 221 * w as u64);
+        assert_eq!(row.at_nodes(nz(w), nz(2)), row.at(nz(w)) + term, "w={w}");
+        assert_eq!(
+            row.at_nodes(nz(w), nz(4)),
+            row.at_nodes(nz(w), nz(2)),
+            "w={w}"
+        );
+    }
+    assert_eq!(row.at_nodes(nz(8), nz(2)), ns(6378));
+    assert_eq!(row.at_nodes(nz(24), nz(4)), ns(12_514));
+    // Above the last anchor the row extrapolates as before, the term on top.
+    assert_eq!(row.at_nodes(nz(48), nz(2)), ns(11_800 + 1310 + 221 * 48));
+    // The cheap rejection stays a lower bound.
+    assert_eq!(row.min(), ns(3300));
+    // Saturates instead of wrapping.
+    let huge = WidthCosts::flat(us(1)).with_multi_node(Duration::MAX, Duration::MAX);
+    assert_eq!(huge.at_nodes(nz(64), nz(2)), Duration::from_nanos(u64::MAX));
+}

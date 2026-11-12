@@ -112,6 +112,31 @@ pub(crate) struct TeamAuth<'p> {
     /// on a child that a member leads, whose leader must keep the CPU its own
     /// share was given.
     pub(crate) placement: Option<&'p AtomicUsize>,
+    /// The NUMA node of the leader of a token whose `placement` is `None` (a
+    /// child that a member leads): that member's recorded node, captured when
+    /// the child is made (`pin::NO_NODE` if unknown). A token with a
+    /// `placement` reads its leader's node from the home instead, which a later
+    /// whole-team scope may move.
+    pub(crate) lead_node: u16,
+}
+
+impl TeamAuth<'_> {
+    /// The node of this token's leader ([`TeamAuth::lead_node`]).
+    pub(crate) fn lead(&self) -> u16 {
+        match self.placement {
+            Some(home) => home
+                .load(Ordering::Relaxed)
+                .checked_sub(1)
+                .map_or(crate::pin::NO_NODE, crate::pin::node_of),
+            None => self.lead_node,
+        }
+    }
+
+    /// The node count this token's sections are priced at
+    /// ([`Awake::team_nodes`](crate::awake::Awake::team_nodes)).
+    fn nodes(&self) -> NonZeroUsize {
+        self.awake.team_nodes(|| self.lead(), self.ids)
+    }
 }
 
 impl Exec<'static> {
@@ -214,6 +239,16 @@ impl<'p> Exec<'p> {
     ///   [`DispatchKind::InPool`];
     /// * a plain token whose caller is outside the pool: [`DispatchKind::Outside`].
     ///
+    /// A team token whose row has a multi-node term
+    /// ([`WidthCosts::with_multi_node`](crate::WidthCosts::with_multi_node)) is
+    /// priced at the NUMA nodes its leader and members were pinned onto by the
+    /// last root scope that placed the team (under the pool's
+    /// [`PinStrategy`](crate::PinStrategy), inside the caller's mask): two or
+    /// more nodes add the term at every width. A team this crate did not place
+    /// (pinning off or skipped, a platform without CPU sets, a host that reports
+    /// no nodes) and a plain token are priced at one node. With no term
+    /// installed, the default, nothing is read.
+    ///
     /// The numbers come from the pool's [`DispatchCosts`](crate::DispatchCosts) (see
     /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)). The
     /// call allocates nothing and reads no thread-local state of this crate.
@@ -231,12 +266,18 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().dispatch_cost(two), Duration::MAX);
     /// ```
     pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
+        self.dispatch_cost_on(width, self.nodes())
+    }
+
+    /// [`dispatch_cost`](Self::dispatch_cost) with the node count of a team
+    /// token already read, so a search over widths reads it once.
+    fn dispatch_cost_on(&self, width: NonZeroUsize, nodes: NonZeroUsize) -> Duration {
         let width = width.min(self.budget);
         if width.get() < 2 {
             return Duration::MAX;
         }
         match (self.team, self.pool) {
-            (Some(t), _) => t.awake.costs.cost(DispatchKind::Team, width),
+            (Some(t), _) => t.awake.costs.team_row().at_nodes(width, nodes),
             (None, Some(pool)) => {
                 let kind = if sched::in_pool(pool) {
                     DispatchKind::InPool
@@ -247,6 +288,12 @@ impl<'p> Exec<'p> {
             }
             (None, None) => Duration::MAX,
         }
+    }
+
+    /// The node count [`dispatch_cost`](Self::dispatch_cost) prices this token
+    /// at: 1 for a plain token.
+    fn nodes(&self) -> NonZeroUsize {
+        self.team.map_or(NonZeroUsize::MIN, |t| t.nodes())
     }
 
     /// Whether a region of serial time `estimate` that opens `sections` parallel
@@ -280,7 +327,10 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for(Duration::from_secs(1), 1).get(), 1);
     /// ```
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
-        width_for_by(estimate, sections, self.budget, |k| self.dispatch_cost(k))
+        let nodes = self.nodes();
+        width_for_by(estimate, sections, self.budget, |k| {
+            self.dispatch_cost_on(k, nodes)
+        })
     }
 
     /// [`width_for`](Self::width_for) with the transfer term of a section whose
@@ -307,10 +357,11 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for_split(split).get(), 1);
     /// ```
     pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
+        let nodes = self.nodes();
         width_for_split_by(
             split,
             self.budget,
-            |k| self.dispatch_cost(k),
+            |k| self.dispatch_cost_on(k, nodes),
             TransferRate::host_default(),
         )
     }
@@ -635,7 +686,7 @@ impl<'p> Exec<'p> {
         let this = &self;
         let body = |k: usize, team_ids: Option<&[usize]>| {
             let _live = this.track.task();
-            let share = plan.child(k).1;
+            let (start, share) = plan.child(k);
             let child = || Exec {
                 pool: this.pool,
                 // Every share of a validated plan is at least one.
@@ -648,6 +699,16 @@ impl<'p> Exec<'p> {
                     // others are led by members, which must not move onto the
                     // team leader's CPU because their share was not given it.
                     placement: if k > 0 { None } else { t.placement },
+                    // Child `k > 0` is led by the member `split_raw` hands it,
+                    // slot `ids[start - 1]`; its node is read only with a
+                    // multi-node term (unknown otherwise, and never priced).
+                    lead_node: match start.checked_sub(1) {
+                        Some(lead) if k > 0 && t.awake.costs.team_row().has_multi_node() => t
+                            .ids
+                            .get(lead)
+                            .map_or(crate::pin::NO_NODE, |&id| t.awake.node(id)),
+                        _ => t.lead_node,
+                    },
                     ..t
                 }),
                 _leader: None,
@@ -1013,6 +1074,13 @@ impl<'p> Exec<'p> {
                 policy: t.policy.with(over),
                 track: self.track.alias(),
                 over: t.over,
+                // Only with a multi-node term: the home's node is a topology
+                // lookup, which a pool without one may not have loaded.
+                lead_node: if t.awake.costs.team_row().has_multi_node() {
+                    t.lead()
+                } else {
+                    crate::pin::NO_NODE
+                },
             };
             // Only the root token minted by a `Team` opens a root scope; a
             // child, a reborrow or a sub-team re-pins nothing of its own.
@@ -1078,6 +1146,7 @@ impl<'p> Exec<'p> {
                     policy: policy.with(over),
                     track: self.track.alias(),
                     over: false,
+                    lead_node: crate::pin::NO_NODE,
                 }));
             }
         };
@@ -1098,6 +1167,8 @@ impl<'p> Exec<'p> {
             policy,
             track: self.track.alias(),
             over: oversubscribed,
+            // Set by `pin_scope` when it places the team.
+            lead_node: crate::pin::NO_NODE,
         };
         // The pin (or unpin) section is also the acknowledgement; without
         // pinning the participants acknowledge as before. The guard gives the
@@ -1186,14 +1257,29 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
     let awake = team.awake.filter(|awake| awake.pin)?;
     // The leader reads its own mask: that set is where the team is placed, and
     // the leader's mask is that set again once the scope has closed.
-    let set = crate::pin::read_here()?;
+    let Some(set) = crate::pin::read_here() else {
+        // Nothing is placed; the members are wherever an earlier reservation
+        // left them, which is not this team's placement.
+        if awake.costs.team_row().has_multi_node() {
+            awake.record_nodes(team.ids, None);
+        }
+        return None;
+    };
     let cpus = crate::pin::count(&set);
     // This thread just read its own mask, which is the count a later mint on it
     // would need: hand the read to the memo, so a mask another library changed is
     // seen by every mint after this scope without a second kernel call
     // (threadteam-rs#62).
     crate::pin::note_count(cpus);
+    // The nodes the members are pinned onto, for the multi-node term of the
+    // team row (`WidthCosts::with_multi_node`); recorded only when one is
+    // installed, so the default path does nothing more.
+    let nodes = awake.costs.team_row().has_multi_node();
     if cpus < team.size().get() {
+        if nodes {
+            awake.record_nodes(team.ids, None);
+            team.lead_node = crate::pin::NO_NODE;
+        }
         awake.pin_skips.fetch_add(1, Ordering::Relaxed);
         if let Some(placement) = placement {
             placement.store(0, Ordering::Relaxed);
@@ -1212,6 +1298,12 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
         .and_then(|home| crate::pin::LeaderPin::enter(&set, home));
     if let Some(placement) = placement {
         placement.store(crate::pin::home_of(&order), Ordering::Relaxed);
+    }
+    if nodes {
+        awake.record_nodes(team.ids, Some(&order));
+        team.lead_node = order
+            .get(0)
+            .map_or(crate::pin::NO_NODE, crate::pin::node_of);
     }
     team.pin_section(&order);
     Some(ScopePin(leader))

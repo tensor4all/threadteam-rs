@@ -2,7 +2,7 @@
 
 use crate::awake::{Awake, Geometry, JoinGuard, Section};
 use crate::cost::{
-    pays_at, width_for_by, width_for_split_by, DispatchCosts, DispatchKind, SplitCost, TransferRate,
+    pays_at, width_for_by, width_for_split_by, DispatchCosts, SplitCost, TransferRate,
 };
 use crate::error::Error;
 use crate::policy::{WaitOverride, WaitPolicy};
@@ -200,6 +200,11 @@ pub struct TeamExec<'team> {
     /// every [`Section`] so that nested sections of an oversubscribed root
     /// know it too.
     pub(crate) over: bool,
+    /// The NUMA node of this authority's leader, `pin::NO_NODE` if unknown: the
+    /// placement's `P[0]` for a root scope, the leading member's recorded node
+    /// for a split child. Fixed for the authority's life, during which no
+    /// whole-team scope of the same team can run.
+    pub(crate) lead_node: u16,
 }
 
 /// How the members of a split are divided.
@@ -243,7 +248,9 @@ impl<'team> TeamExec<'team> {
     }
 
     /// The cost of one section of `width` participants on this team: the steady
-    /// state of [`DispatchKind::Team`]. [`Duration::MAX`] for a team of one or
+    /// state of [`DispatchKind::Team`](crate::DispatchKind::Team), at the node
+    /// count of the team's placement (see [`Exec::dispatch_cost`](crate::Exec::dispatch_cost)).
+    /// [`Duration::MAX`] for a team of one or
     /// `width < 2`; `width` is clamped to the size.
     ///
     /// # Examples
@@ -257,11 +264,24 @@ impl<'team> TeamExec<'team> {
     /// }).unwrap();
     /// ```
     pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
+        self.dispatch_cost_on(width, self.nodes())
+    }
+
+    /// [`dispatch_cost`](Self::dispatch_cost) at a node count already read.
+    fn dispatch_cost_on(&self, width: NonZeroUsize, nodes: NonZeroUsize) -> Duration {
         let width = width.min(self.size());
         match self.awake {
-            Some(awake) if width.get() >= 2 => awake.costs.cost(DispatchKind::Team, width),
+            Some(awake) if width.get() >= 2 => awake.costs.team_row().at_nodes(width, nodes),
             _ => Duration::MAX,
         }
+    }
+
+    /// The node count this team's sections are priced at: that of its
+    /// placement when the team row has a multi-node term, else 1.
+    fn nodes(&self) -> NonZeroUsize {
+        self.awake.map_or(NonZeroUsize::MIN, |a| {
+            a.team_nodes(|| self.lead_node, self.ids)
+        })
     }
 
     /// The [`DispatchCosts`] of the pool this team belongs to
@@ -289,15 +309,19 @@ impl<'team> TeamExec<'team> {
 
     /// [`Exec::width_for`](crate::Exec::width_for) for this team.
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
-        width_for_by(estimate, sections, self.size(), |k| self.dispatch_cost(k))
+        let nodes = self.nodes();
+        width_for_by(estimate, sections, self.size(), |k| {
+            self.dispatch_cost_on(k, nodes)
+        })
     }
 
     /// [`Exec::width_for_split`](crate::Exec::width_for_split) for this team.
     pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
+        let nodes = self.nodes();
         width_for_split_by(
             split,
             self.size(),
-            |k| self.dispatch_cost(k),
+            |k| self.dispatch_cost_on(k, nodes),
             TransferRate::host_default(),
         )
     }
@@ -349,6 +373,7 @@ impl<'team> TeamExec<'team> {
             policy: self.policy,
             track: self.track.alias(),
             over: self.over,
+            lead_node: self.lead_node,
         }
     }
 
@@ -619,14 +644,28 @@ impl<'team> TeamExec<'team> {
         let track = &self.track;
         let _released = track.release();
         let (awake, ids, policy, over) = (self.awake, self.ids, self.policy, self.over);
+        let lead_node = self.lead_node;
         split_raw(awake, ids, plan, over, |c, child_ids| {
             let _live = track.task();
+            // Child `c > 0` is led by slot `ids[start - 1]` (`split_raw`); its
+            // node is read only with a multi-node term.
+            let lead_node = match (c, awake) {
+                (0, _) | (_, None) => lead_node,
+                (_, Some(awake)) if !awake.costs.team_row().has_multi_node() => crate::pin::NO_NODE,
+                (_, Some(awake)) => plan
+                    .child(c)
+                    .0
+                    .checked_sub(1)
+                    .and_then(|lead| ids.get(lead))
+                    .map_or(crate::pin::NO_NODE, |&id| awake.node(id)),
+            };
             let child = TeamExec {
                 awake,
                 ids: child_ids,
                 policy,
                 track: track.child(),
                 over,
+                lead_node,
             };
             f(c, child);
         });

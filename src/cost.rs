@@ -79,6 +79,11 @@ pub struct WidthCosts {
     /// The number of anchors. The slots past it are zeroed by construction, so
     /// the derived `PartialEq` compares only the anchors.
     len: u8,
+    /// The multi-node term, `step + per_participant * w` nanoseconds, charged on
+    /// top of the row when a section spans two or more NUMA nodes; zero unless
+    /// installed with [`with_multi_node`](Self::with_multi_node).
+    node_step: u64,
+    node_per_participant: u64,
 }
 
 /// The capacity of a row: enough for a measurement every power of two from 2 to
@@ -193,7 +198,60 @@ impl WidthCosts {
             widths,
             ns,
             len: anchors.len() as u8,
+            node_step: 0,
+            node_per_participant: 0,
         }
+    }
+
+    /// This row with a multi-node term: a section whose participants span two
+    /// or more NUMA nodes costs `step + per_participant * width` on top of the
+    /// row. One step for every node count from two up; the row itself stays the
+    /// single-node cost. The rows this crate builds carry no term (both zero).
+    ///
+    /// The node count is that of the placement this crate made: a team token
+    /// counts the nodes its pinned participants are on (see
+    /// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost)); an unplaced team and
+    /// a plain token count one node.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::num::NonZeroUsize;
+    /// use std::time::Duration;
+    /// use threadteam::WidthCosts;
+    ///
+    /// let us = Duration::from_micros;
+    /// let n = |k| NonZeroUsize::new(k).unwrap();
+    /// let row = WidthCosts::flat(us(1)).with_multi_node(us(2), Duration::from_nanos(100));
+    /// assert_eq!(row.at_nodes(n(4), n(1)), us(1));
+    /// assert_eq!(row.at_nodes(n(4), n(2)), Duration::from_nanos(3400));
+    /// assert_eq!(row.at_nodes(n(4), n(4)), Duration::from_nanos(3400));
+    /// ```
+    #[must_use]
+    pub const fn with_multi_node(self, step: Duration, per_participant: Duration) -> Self {
+        WidthCosts {
+            node_step: to_ns(step),
+            node_per_participant: to_ns(per_participant),
+            ..self
+        }
+    }
+
+    /// Whether a multi-node term is installed: only then is a node count worth
+    /// reading.
+    #[inline]
+    pub(crate) fn has_multi_node(&self) -> bool {
+        self.node_step != 0 || self.node_per_participant != 0
+    }
+
+    /// [`ns_at`](Self::ns_at) on `nodes` NUMA nodes.
+    #[inline]
+    pub(crate) fn ns_at_nodes(&self, width: NonZeroUsize, nodes: NonZeroUsize) -> u64 {
+        let row = self.ns_at(width);
+        if nodes.get() < 2 {
+            return row;
+        }
+        let slope = self.node_per_participant.saturating_mul(width.get() as u64);
+        row.saturating_add(self.node_step).saturating_add(slope)
     }
 
     /// Nanoseconds of a section of `width` participants: a forward scan over at
@@ -227,15 +285,25 @@ impl WidthCosts {
         }
     }
 
-    /// The cost of a section of `width` participants, by the model above.
+    /// The cost of a section of `width` participants on one NUMA node, by the
+    /// model above: [`at_nodes(width, 1)`](Self::at_nodes).
     #[inline]
     pub fn at(&self, width: NonZeroUsize) -> Duration {
         Duration::from_nanos(self.ns_at(width))
     }
 
-    /// The cheapest cost over all widths: the minimum over the anchors (an
-    /// interpolated value lies between its two anchors, and the extrapolation
-    /// never falls below the last anchor). A region whose serial estimate is below `PAYS * min()` pays at no
+    /// The cost of a section of `width` participants spanning `nodes` NUMA
+    /// nodes: [`at`](Self::at), plus the multi-node term of
+    /// [`with_multi_node`](Self::with_multi_node) when `nodes >= 2`.
+    #[inline]
+    pub fn at_nodes(&self, width: NonZeroUsize, nodes: NonZeroUsize) -> Duration {
+        Duration::from_nanos(self.ns_at_nodes(width, nodes))
+    }
+
+    /// The cheapest cost over all widths and node counts: the minimum over the
+    /// anchors (an interpolated value lies between its two anchors, the
+    /// extrapolation never falls below the last anchor, and the multi-node term
+    /// is never negative). A region whose serial estimate is below `PAYS * min()` pays at no
     /// width, which is the cheap rejection before a per-width search.
     #[inline]
     pub fn min(&self) -> Duration {
@@ -449,6 +517,10 @@ impl DispatchCosts {
     /// Above the largest anchor of a row the cost grows with the width
     /// ([`WidthCosts`]); [`WidthCosts::from_anchors`] replaces that
     /// extrapolation where a host has measured anchors beyond width 6.
+    ///
+    /// No row carries a multi-node term ([`WidthCosts::with_multi_node`]): the
+    /// rows are single-node costs, and a pool owner on a multi-node host installs
+    /// a measured term (`docs/design/thresholds.md`, threadteam-rs#68).
     pub fn for_class(class: HostClass) -> Self {
         match class {
             HostClass::X86_64Avx512 => DispatchCosts {
@@ -491,6 +563,13 @@ impl DispatchCosts {
         self
     }
 
+    /// The team row, for the token paths that add the node count of their
+    /// placement ([`WidthCosts::with_multi_node`]).
+    #[inline]
+    pub(crate) fn team_row(&self) -> &WidthCosts {
+        &self.team
+    }
+
     /// The cheapest cost of `kind` over all widths ([`WidthCosts::min`]): a
     /// region below `PAYS * min_cost(kind)` pays at no width of that kind.
     pub fn min_cost(&self, kind: DispatchKind) -> Duration {
@@ -501,10 +580,12 @@ impl DispatchCosts {
         }
     }
 
-    /// The cost of one section of `width` participants on a token of `kind`.
-    /// Measured anchors keep their values, widths between two anchors are
-    /// interpolated, and widths above the largest anchor of the row grow with
-    /// the width ([`WidthCosts`]).
+    /// The cost of one section of `width` participants on a token of `kind`, on
+    /// one NUMA node ([`WidthCosts::at`]). Measured anchors keep their values,
+    /// widths between two anchors are interpolated, and widths above the largest
+    /// anchor of the row grow with the width ([`WidthCosts`]). The team tokens add
+    /// the multi-node term of their placement themselves
+    /// ([`Exec::dispatch_cost`](crate::Exec::dispatch_cost)).
     #[inline]
     pub fn cost(&self, kind: DispatchKind, width: NonZeroUsize) -> Duration {
         match kind {

@@ -650,6 +650,52 @@ let costs = DispatchCosts::host_default().with(DispatchKind::Team, team);
 let pool = Pool::builder().dispatch_costs(costs).build().unwrap();
 ```
 
+A later run on the same host held the width fixed and varied the nodes the team spans with the process mask
+(threadteam `5820d2d7`, `spin_polls(u32::MAX)`, same quantity, µs):
+
+| width | 1 node | 2 nodes | 4 nodes |
+| --- | --- | --- | --- |
+| 8 | 3.30 | 5.90 | 6.41 |
+| 16 | 4.63 | 8.40 | 9.42 |
+| 24 | 5.90 | 10.21 | 12.55 |
+| 32 | | 13.62 | 14.00 |
+| 48 | | 19.38 | 21.09 |
+
+The step is the first node crossing: 1.7–1.8x from one node to two at a fixed width, only 3–23% more from two to
+four. So the row stays the single-node cost and a **multi-node term** goes on top:
+`D(w, n) = row(w)` on one node, `row(w) + step + per_participant * w` on two or more
+(`WidthCosts::with_multi_node`). The term is zero in every built-in row; one host gives the shape, not a default.
+
+A team token is priced at the nodes its own placement spans: the root scope that pins the team records the node of
+each member's CPU (`PinStrategy::Spread` or `Pack`, inside the caller's mask), and the token counts the nodes of its
+leader and members. A team this crate did not place (pinning off or skipped, no CPU sets, no node lists from the
+kernel) and a plain token are priced at one node. With no term installed nothing is recorded or read.
+
+The count is over the **whole token**, not over the participants a given section reaches, so a narrow section on a
+wide token can be priced above its real span, slope included. On four nodes `{0,1}`, `{2,3}`, `{4,5}`, `{6,7}` an
+8-wide Spread placement is `P = [0,2,4,6,1,3,5,7]`; `fork(2)` dispatches its two leaders on `P[0] = 0` and
+`P[4] = 1`, both on node 0, but the token's members span four nodes, so width 2 is charged the full term. With a
+1 us row, a 2 us step and 100 ns per participant that is 3.2 us instead of 1 us, and `pays(6 us, 1, 2)` is false
+instead of true. This is the intended coarse model; a count specific to the dispatch plan is not part of it.
+
+On that host, the single-node anchors and the term fitted from the 4-node minus 1-node rows at widths 8, 16 and 24
+(3.11, 4.79, 6.65 µs: 1.31 µs + 221 ns per participant) install as:
+
+```rust
+use std::time::Duration;
+use threadteam::{DispatchCosts, DispatchKind, Pool, WidthCosts};
+
+let ns = Duration::from_nanos;
+let team = WidthCosts::from_anchors(&[(8, ns(3300)), (16, ns(4630)), (24, ns(5900))])
+    .unwrap()
+    .with_multi_node(ns(1310), ns(221));
+let costs = DispatchCosts::host_default().with(DispatchKind::Team, team);
+let pool = Pool::builder().dispatch_costs(costs).build().unwrap();
+```
+
+It prices a 4-node team at 23.7 µs at width 48 against the measured 21.1; a team inside one node keeps the
+single-node row. The anchors-only override above stays valid for a pool that always spans the nodes.
+
 The parked rows of the same run (a section after a 50 ms sleep) are 68–374 us at widths 2–96. Those are a separate
 quantity, not part of the steady-state values (see the `DispatchCosts` doc comment), and are not promoted here.
 

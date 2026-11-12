@@ -33,7 +33,10 @@
 use crate::error::Refused;
 use crate::park::Parker;
 use crate::policy::WaitPolicy;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::num::NonZeroUsize;
+use core::sync::atomic::{
+    AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::any::Any;
 use std::time::Duration;
 
@@ -147,6 +150,14 @@ pub(crate) struct Awake {
     /// Root scopes of a pinning pool that placed nobody because the caller's
     /// set had fewer CPUs than the team had participants (`Pool::pin_skips`).
     pub(crate) pin_skips: AtomicU64,
+    /// The NUMA node each slot's member was pinned onto by the last root scope
+    /// that placed it, `pin::NO_NODE` when unknown. Written only when the team
+    /// row has a multi-node term, read only to price a section (Relaxed: a
+    /// pricing hint, not synchronization; a stale value only misprices).
+    nodes: Box<[AtomicU16]>,
+    /// Reads of `nodes`, so a test can check the default path makes none.
+    #[cfg(test)]
+    pub(crate) node_reads: AtomicU64,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
     #[cfg(feature = "trace")]
@@ -179,9 +190,55 @@ impl Awake {
             pin,
             pin_strategy,
             pin_skips: AtomicU64::new(0),
+            nodes: (0..width)
+                .map(|_| AtomicU16::new(crate::pin::NO_NODE))
+                .collect(),
+            #[cfg(test)]
+            node_reads: AtomicU64::new(0),
             acquire_timeout,
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),
+        }
+    }
+
+    /// Records the node of each member's CPU in a placement: member `k >= 1`, on
+    /// slot `ids[k - 1]`, is on `placement.get(k)`. `None` forgets them: the
+    /// members are not on CPUs this crate chose.
+    pub(crate) fn record_nodes(&self, ids: &[usize], placement: Option<&crate::pin::Placement>) {
+        for (k, &id) in ids.iter().enumerate() {
+            let node = placement
+                .and_then(|p| p.get(k + 1))
+                .map_or(crate::pin::NO_NODE, crate::pin::node_of);
+            if let Some(slot) = self.nodes.get(id) {
+                slot.store(node, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// The node recorded for slot `id` ([`record_nodes`](Self::record_nodes)).
+    pub(crate) fn node(&self, id: usize) -> u16 {
+        #[cfg(test)]
+        self.node_reads.fetch_add(1, Ordering::Relaxed);
+        self.nodes
+            .get(id)
+            .map_or(crate::pin::NO_NODE, |n| n.load(Ordering::Relaxed))
+    }
+
+    /// The node count a team token led from node `lead()` with the members `ids`
+    /// is priced at: 2 when their recorded nodes span two or more, else 1 (the
+    /// multi-node term distinguishes nothing more). 1 without reading anything
+    /// when the team row has no multi-node term, so the default costs one branch.
+    pub(crate) fn team_nodes(&self, lead: impl FnOnce() -> u16, ids: &[usize]) -> NonZeroUsize {
+        if !self.costs.team_row().has_multi_node() {
+            return NonZeroUsize::MIN;
+        }
+        let span = crate::pin::spans_nodes(
+            core::iter::once(lead()).chain(ids.iter().map(|&id| self.node(id))),
+        );
+        if span {
+            NonZeroUsize::MIN.saturating_add(1)
+        } else {
+            NonZeroUsize::MIN
         }
     }
 

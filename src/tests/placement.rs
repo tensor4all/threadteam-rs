@@ -429,6 +429,101 @@ fn a_root_scope_places_under_the_pools_pin_strategy() {
     );
 }
 
+/// threadteam-rs#68: a team token is priced at the NUMA nodes its placement
+/// put the leader and the members on, on a synthetic two-node map of this
+/// host's own CPUs, `{S0, S1}` and `{S2, ...}` (`into_team` already places the
+/// team). Unpinned, or with no term installed, it is the single-node row.
+#[test]
+fn a_placed_team_is_priced_at_the_nodes_its_placement_spans() {
+    use crate::{DispatchCosts, DispatchKind, WidthCosts};
+    use std::num::NonZeroUsize;
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!(
+            "skipped: needs 4 allowed CPUs to build two synthetic nodes, this process has {}",
+            set.len()
+        );
+        return;
+    }
+    // Every other CPU of the mask on the second node too: a CPU in no node
+    // would be a group of its own and take a place in the Spread order.
+    let nodes = vec![set[..2].to_vec(), set[2..].to_vec()];
+    let topology: &'static crate::pin::Topology =
+        Box::leak(Box::new(crate::pin::Topology::from_nodes(&nodes)));
+    crate::pin::set_test_topology(Some(topology));
+    let _host = HostTopology;
+
+    let nz = |n: usize| NonZeroUsize::new(n).unwrap();
+    let one = Duration::from_micros(1);
+    // At width w: 1 us on one node, 1 us + 2 us + 100 ns * w on two.
+    let spanning = |w: u64| Duration::from_nanos(3000 + 100 * w);
+    let row =
+        WidthCosts::flat(one).with_multi_node(Duration::from_micros(2), Duration::from_nanos(100));
+    let with_term = DispatchCosts::host_default().with(DispatchKind::Team, row);
+    let without = DispatchCosts::host_default().with(DispatchKind::Team, WidthCosts::flat(one));
+
+    // (in a whole-team scope, a token after it, the two `fork(2)` children)
+    let priced = |costs: DispatchCosts, strategy: PinStrategy, pin: bool, n: usize| {
+        let pool = Pool::builder()
+            .threads(n)
+            .pin_participants(pin)
+            .pin_strategy(strategy)
+            .dispatch_costs(costs)
+            .idle_spin(Duration::ZERO)
+            .acquire_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let team = pool.into_team(n).expect("an idle pool");
+        let inside = team
+            .exec(n)
+            .team(|t| t.dispatch_cost(nz(n)))
+            .expect("carried members");
+        assert_eq!(
+            team.pool().pin_skips(),
+            0,
+            "nothing skipped for {strategy:?}"
+        );
+        let after = team.exec(n).dispatch_cost(nz(n));
+        let children = std::sync::Mutex::new(Vec::new());
+        if n == 4 {
+            team.exec(n).fork(2, |k, child| {
+                children
+                    .lock()
+                    .unwrap()
+                    .push((k, child.dispatch_cost(nz(2))));
+            });
+        }
+        let mut children = children.into_inner().unwrap();
+        children.sort();
+        let children: Vec<_> = children.into_iter().map(|(_, d)| d).collect();
+        (inside, after, children)
+    };
+
+    // Spread over four: P = S0, S2, S1, S3 spans both nodes, and so does each
+    // `fork(2)` child (leader P[0] with member P[1]; leader P[2] with P[3]).
+    let (inside, after, children) = priced(with_term, PinStrategy::Spread, true, 4);
+    assert_eq!((inside, after), (spanning(4), spanning(4)));
+    assert_eq!(children, [spanning(2), spanning(2)]);
+    // Pack over four: P = S0..S3 spans both nodes, but each child is inside one:
+    // child 1 is led by the member on S2, not by the team's leader on S0.
+    let (inside, after, children) = priced(with_term, PinStrategy::Pack, true, 4);
+    assert_eq!((inside, after), (spanning(4), spanning(4)));
+    assert_eq!(children, [one, one]);
+    // Two participants: Spread crosses to S2, Pack stays on S0 and S1.
+    let (inside, after, _) = priced(with_term, PinStrategy::Spread, true, 2);
+    assert_eq!((inside, after), (spanning(2), spanning(2)));
+    let (inside, after, _) = priced(with_term, PinStrategy::Pack, true, 2);
+    assert_eq!((inside, after), (one, one));
+    // Not placed by this crate: one node, whatever the scheduler does.
+    let (inside, after, children) = priced(with_term, PinStrategy::Spread, false, 4);
+    assert_eq!((inside, after), (one, one));
+    assert_eq!(children, [one, one]);
+    // No term installed: the row, whatever the placement.
+    let (inside, after, children) = priced(without, PinStrategy::Spread, true, 4);
+    assert_eq!((inside, after), (one, one));
+    assert_eq!(children, [one, one]);
+}
+
 /// threadteam-rs#62: the memo is refreshed by the pin section of a whole-team
 /// scope, not by a mint and not by a narrower scope. On a thread another library
 /// restricts while nothing is placed, the mints before the next whole-team scope

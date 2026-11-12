@@ -333,6 +333,35 @@ impl Topology {
     }
 }
 
+/// The node of a CPU no placement of this crate put a participant on, or whose
+/// node the host does not report: skipped when the nodes of a team are counted.
+pub(crate) const NO_NODE: u16 = u16::MAX;
+
+/// The NUMA node of `cpu` in the host's topology ([`host_topology`]), or
+/// [`NO_NODE`].
+pub(crate) fn node_of(cpu: usize) -> u16 {
+    host_topology().node_of.get(cpu).copied().unwrap_or(NO_NODE)
+}
+
+/// Whether the known nodes among `nodes` (the nodes of a section's leader and
+/// members) are two or more: the only distinction the multi-node term of a
+/// dispatch cost makes. [`NO_NODE`] entries are skipped; stops at the first
+/// node that differs from the first known one.
+pub(crate) fn spans_nodes(nodes: impl IntoIterator<Item = u16>) -> bool {
+    let mut first = NO_NODE;
+    for node in nodes {
+        if node == NO_NODE {
+            continue;
+        }
+        if first == NO_NODE {
+            first = node;
+        } else if node != first {
+            return true;
+        }
+    }
+    false
+}
+
 /// The host's NUMA topology, read once per process from
 /// `/sys/devices/system/node/node*/cpulist`. Empty (every CPU in one group,
 /// so [`PinStrategy::Spread`] places as [`PinStrategy::Pack`]) off Linux and
@@ -895,6 +924,18 @@ mod tests {
         let len = order(mask, &topology, strategy, &mut out);
         out.truncate(len);
         out
+    }
+
+    #[test]
+    fn spans_nodes_counts_only_known_nodes() {
+        assert!(!spans_nodes([]));
+        assert!(!spans_nodes([0, 0, 0]));
+        assert!(spans_nodes([0, 0, 1]));
+        // The leader alone on another node.
+        assert!(spans_nodes([1, 0, 0]));
+        assert!(!spans_nodes([NO_NODE, NO_NODE]));
+        assert!(!spans_nodes([NO_NODE, 2, NO_NODE, 2]));
+        assert!(spans_nodes([NO_NODE, 2, NO_NODE, 3]));
     }
 
     fn two_nodes() -> Vec<Vec<usize>> {

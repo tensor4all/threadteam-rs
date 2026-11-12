@@ -876,9 +876,13 @@ impl PoolBuilder {
         if self.threads == Some(0) {
             return Err(Error::ZeroThreads);
         }
-        if self.pin_participants && self.pin_strategy == PinStrategy::Spread {
+        if self.pin_participants
+            && (self.pin_strategy == PinStrategy::Spread || self.costs.team_row().has_multi_node())
+        {
             // Read the NUMA topology now (once per process), so a root scope
-            // never touches sysfs or allocates for it.
+            // never touches sysfs or allocates for it: a spreading pool places
+            // by it, and a pool whose team row has a multi-node term records
+            // the members' nodes by it.
             let _ = crate::pin::host_topology();
         }
         self.build_checked()

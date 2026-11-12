@@ -365,6 +365,8 @@ impl Team {
             // The team's placement, shared: a whole-team scope of this token
             // may replace it, and every token reads it at dispatch.
             placement: Some(&self.placement),
+            // Read from `placement` while it is set.
+            lead_node: crate::pin::NO_NODE,
         };
         Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
     }

@@ -7,6 +7,15 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `WidthCosts::with_multi_node(step, per_participant)` and `WidthCosts::at_nodes(width, nodes)`: an installable
+  multi-node term (#68). A section whose participants span two or more NUMA nodes costs
+  `step + per_participant * width` on top of the row; the row stays the single-node cost. A team token is priced
+  at the nodes its own placement put its leader and members on; an unplaced team and a plain token at one node.
+  Every built-in row has no term, so no cost changes; `docs/design/thresholds.md` gives a measured 4-node term as
+  an override.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

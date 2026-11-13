@@ -16,6 +16,14 @@ All notable changes to `threadteam` are recorded here. The format follows
   Every built-in row has no term, so no cost changes; `docs/design/thresholds.md` gives a measured 4-node term as
   an override.
 
+### Fixed
+
+- **A mint no longer writes the reserved members' spin budget when the value is unchanged**
+  (#67). The field shares its cache line with `gen`, which waiting members poll, so the store
+  invalidated one line per member per mint: at width 96 with spinning members a mint cost 15.2 µs
+  against 0.2 µs at width 1 (the reporter's Xeon 9242 measurement). The value changes only when
+  the oversubscription decision flips, so the store is skipped in the common case.
+
 ## [0.6.0] - 2026-11-10
 
 ### Added

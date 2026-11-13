@@ -91,6 +91,7 @@ The last member of a section therefore pays one extra uncontended read-modify-wr
   - libomp keeps 200 ms (`KMP_BLOCKTIME`); 0.1.3 kept 200 ms of wall time for members and never slept in joins.
 - **No calibration.** Converting a time to polls at pool build was considered and dropped (pre-review): a calibration taken while the CPU is contended yields too few polls, and a bare PAUSE loop is not the real poll anyway. The count is approximate in time, as libgomp's is.
 - **Throttled budget.** 100 polls (libgomp's value) when the root scope is statically oversubscribed. That is the only throttle in the code; see the next section for the detection that was designed and dropped.
+- **One write only when it changes.** A leader sets a member's budget at root-scope entry, and stores only when the value differs from the slot's. The slot's line also carries `gen`, which a waiting member polls, so an unconditional store invalidated one line per member per mint and a mint grew with the team width (threadteam-rs#67). The value changes only when the oversubscription decision flips; a member still reads it once per wait episode, when it starts waiting.
 
 ### Scheduling pressure: no detection in the code
 

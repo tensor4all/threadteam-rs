@@ -342,6 +342,42 @@ fn a_team_created_on_too_few_cpus_is_still_paced() {
     });
 }
 
+/// threadteam-rs#67: a mint stores the members' spin budget only when the value
+/// changes. The field shares its line with `gen`, which a waiting member polls,
+/// so an unconditional store cost one remote line write per member per mint and a
+/// mint grew with the team width.
+#[test]
+fn a_mint_does_not_rewrite_an_unchanged_spin_budget() {
+    let budget = 50_000;
+    on_two_cpus(|| {
+        let team = spinning_pool(2, budget).into_team(2).expect("an idle pool");
+        let awake = &team.pool().awake;
+        // `into_team` reserved the member and acknowledged on the pool's budget;
+        // every mint after it repeats the same value.
+        let ids = team.reservation_ids().to_vec();
+        assert!(!ids.is_empty());
+        let before = awake.spin_budget_writes();
+        for _ in 0..10 {
+            drop(team.exec(2));
+        }
+        assert_eq!(
+            awake.spin_budget_writes(),
+            before,
+            "ten mints of an unchanged budget stored to the members' slots"
+        );
+        // A changed value is still written, once per slot.
+        awake.set_spin_budget(&ids, budget + 1);
+        assert_eq!(
+            awake.spin_budget_writes(),
+            before + ids.len() as u64,
+            "a changed budget must reach every member"
+        );
+        assert!(ids
+            .iter()
+            .all(|&id| awake.slot_spin_budget(id) == budget + 1));
+    });
+}
+
 /// Puts the host's topology back when the test ends, also on unwind.
 struct HostTopology;
 

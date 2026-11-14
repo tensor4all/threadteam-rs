@@ -749,10 +749,10 @@ impl SplitCost {
 /// One row per [`HostClass`], measured with `benches/resident_split.rs`: the
 /// moved bytes (`resident_bytes * (k - 1) / k`) over the busy time of the
 /// slowest member at `k >= 4` on one die keeps one rate per host while the
-/// source is resident. An unmeasured class takes the slowest measured row,
-/// [`per_kib(41)`](Self::per_kib) (about 25 GB/s aggregate), so the transfer is
-/// never under-charged on a host that has not been calibrated; a pool owner
-/// that measured its own host overrides it with [`per_kib`](Self::per_kib).
+/// source is resident. An unmeasured class takes the slowest installed class
+/// row, [`per_kib(43)`](Self::per_kib) (about 24 GB/s aggregate), so a host this
+/// crate has not calibrated is charged at least the measured one-die rate; a
+/// pool owner that measured its own host overrides it with [`per_kib`](Self::per_kib).
 ///
 /// # Examples
 ///
@@ -772,7 +772,7 @@ pub struct TransferRate {
 impl TransferRate {
     /// A row measured on one host, in nanoseconds per KiB of moved bytes.
     ///
-    /// One KiB at 100 GB/s is 10.2 ns; at 25 GB/s, 41 ns.
+    /// One KiB at 100 GB/s is 10.2 ns; at 24 GB/s, 43 ns.
     pub const fn per_kib(ns_per_kib: u64) -> Self {
         Self { ns_per_kib }
     }
@@ -783,11 +783,18 @@ impl TransferRate {
     ///   2026-11-03 with `benches/resident_split.rs` (hot, mode `D`, widths 4
     ///   and 8, 384 KiB to 4 MiB: 5.8 to 8.4 ns/KiB, the widest point of the
     ///   smallest size being the slowest).
-    /// * [`HostClass::X86_64Avx512`]: 41 ns/KiB, from the same bench on a
-    ///   2 x Xeon Platinum 9242, one die, source hot at 392 KiB: the pullers
-    ///   drain the moved bytes at 20 to 26 GB/s whatever their number
-    ///   (threadteam-rs#27).
-    /// * Every other class: that 41 ns/KiB default, see [`Self`].
+    /// * [`HostClass::X86_64Avx512`]: 43 ns/KiB, from the same bench on a
+    ///   2 x Xeon Platinum 9242 (Cascade Lake-AP), one die, hot, mode `D`,
+    ///   `k = 4..24`, 256 KiB to 1 MiB: 39.3 to 46.8 ns/KiB over the 24 one-die
+    ///   cells, flat in `k`; the `--physcpubind=0-47 --membind=0` rows (40 to
+    ///   47) are a second one-die sample, since placement puts member `j` on
+    ///   `S[j]`
+    ///   (threadteam-rs#27). With the leader on one node and the members on
+    ///   another the rate is about 70 ns/KiB, recorded in
+    ///   `docs/design/thresholds.md` section 3.8; it is not the class row
+    ///   because this table is keyed by host class, not by the team's node
+    ///   spread.
+    /// * Every other class: that 43 ns/KiB default, see [`Self`].
     pub fn for_class(class: HostClass) -> Self {
         match class {
             HostClass::Aarch64Apple => Self::per_kib(8),
@@ -795,7 +802,7 @@ impl TransferRate {
             | HostClass::X86_64Avx2
             | HostClass::X86_64Scalar
             | HostClass::Aarch64
-            | HostClass::Generic => Self::per_kib(41),
+            | HostClass::Generic => Self::per_kib(43),
         }
     }
 
@@ -851,13 +858,13 @@ impl TransferRate {
 /// let budget = NonZeroUsize::new(6).unwrap();
 /// let dispatch = |_| Duration::from_micros(2);
 /// let est = Duration::from_millis(1);
-/// // 1 GiB the caller has just written: at 41 ns/KiB the transfer alone is
-/// // 42 ms, so no width pays for itself.
+/// // 1 GiB the caller has just written: at 43 ns/KiB the transfer alone is
+/// // 45 ms, so no width pays for itself.
 /// let split = SplitCost { estimate: est, sections: 1, resident_bytes: 1 << 30 };
-/// assert_eq!(width_for_split_by(split, budget, dispatch, TransferRate::per_kib(41)).get(), 1);
+/// assert_eq!(width_for_split_by(split, budget, dispatch, TransferRate::per_kib(43)).get(), 1);
 /// // The same region from cold data has nothing to move.
 /// assert_eq!(
-///     width_for_split_by(split.with_resident_bytes(0), budget, dispatch, TransferRate::per_kib(41)),
+///     width_for_split_by(split.with_resident_bytes(0), budget, dispatch, TransferRate::per_kib(43)),
 ///     width_for_by(est, 1, budget, dispatch),
 /// );
 /// ```

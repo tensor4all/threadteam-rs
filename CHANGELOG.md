@@ -7,6 +7,16 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+
+- **The resident-transfer row is the measured one.** `TransferRate::for_class` charges 43 ns/KiB on
+  `x86_64-avx512` (was the provisional 41) and on every unmeasured class, as the slowest installed class row. The
+  rate is
+  the adopted in-tree `benches/resident_split.rs` row on a 2 x Xeon Platinum 9242, one die, hot, mode `D`,
+  `k = 4..24`, 256 KiB–1 MiB: range 39.3–46.8 ns/KiB over the 24 one-die cells (threadteam-rs#27); the cross-die rate (about 70) is recorded
+  in `docs/design/thresholds.md` §3.8 but is not installable, because the row is keyed by host class and not by the
+  team's node spread. Width decisions for caller-resident sections get slightly stricter; no API change.
+
 ### Added
 
 - `WidthCosts::with_multi_node(step, per_participant)` and `WidthCosts::at_nodes(width, nodes)`: an installable

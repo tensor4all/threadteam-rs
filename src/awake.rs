@@ -85,7 +85,8 @@ struct Slot {
     idle_spin_ns: AtomicU64,
     idle_yield: AtomicBool,
     /// Spin budget, in polls, of this reserved member's waits for work (see
-    /// `docs/design/waiting.md`); written by the leader at root-scope entry.
+    /// `docs/design/waiting.md`); written by the leader at root-scope entry, and
+    /// only when the value changes ([`Awake::set_spin_budget`]).
     spin_budget: AtomicU32,
     /// Set by the leader while the member's thread is lent to Rayon
     /// (`Exec::external` on a team token).
@@ -158,6 +159,10 @@ pub(crate) struct Awake {
     /// Reads of `nodes`, so a test can check the default path makes none.
     #[cfg(test)]
     pub(crate) node_reads: AtomicU64,
+    /// Stores into a member slot's `spin_budget`, so a test can check that a mint
+    /// of an unchanged value makes none.
+    #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+    pub(crate) spin_budget_writes: AtomicU64,
     #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
     pub(crate) acquire_timeout: Duration,
     #[cfg(feature = "trace")]
@@ -195,6 +200,8 @@ impl Awake {
                 .collect(),
             #[cfg(test)]
             node_reads: AtomicU64::new(0),
+            #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+            spin_budget_writes: AtomicU64::new(0),
             acquire_timeout,
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),
@@ -279,6 +286,13 @@ impl Awake {
         self.slots[id].spin_budget.load(Ordering::Relaxed)
     }
 
+    /// Stores into member slots' `spin_budget` so far (tests); a mint of an
+    /// unchanged value makes none.
+    #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+    pub(crate) fn spin_budget_writes(&self) -> u64 {
+        self.spin_budget_writes.load(Ordering::Relaxed)
+    }
+
     /// Sets the spin budget of the given reserved members' waits for work.
     ///
     /// A root team scope writes it once at entry ([`Self::spin_budget`] of
@@ -286,7 +300,16 @@ impl Awake {
     /// scope it was reserved for.
     pub(crate) fn set_spin_budget(&self, ids: &[usize], polls: u32) {
         for &id in ids {
-            self.slots[id].spin_budget.store(polls, Ordering::Relaxed);
+            let slot = &self.slots[id];
+            // The slot's line also carries `gen`, which a waiting member polls, so
+            // an unchanged store would invalidate one line per member per mint
+            // (threadteam-rs#67).
+            if slot.spin_budget.load(Ordering::Relaxed) == polls {
+                continue;
+            }
+            slot.spin_budget.store(polls, Ordering::Relaxed);
+            #[cfg(all(test, feature = "parallel", target_os = "linux"))]
+            self.spin_budget_writes.fetch_add(1, Ordering::Relaxed);
         }
     }
 

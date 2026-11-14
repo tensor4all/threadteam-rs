@@ -186,6 +186,10 @@ it on the base and on the head of the change, on a quiet host and on a many-core
 | `gaps` | 10 sections of 5 µs, the caller sleeps 0 / 100 µs / 1 ms / 10 ms between calls | the first section (wake latency) and the call |
 | `acquire` | 50 sections of 20 µs: the team held (a token per call), the pool held (members acquired per call), a new pool per call | per call; for a new pool also the total from build to drop |
 | `nested` | 100 splits of the team into pairs, each pair one 20 µs section | per call |
+| `mint` | one `team.exec(k)` minted and dropped, no section opened, for `k = w` and `k = 1` on the same team | per call (µs); a mint's width term is the difference of the two rows |
+
+`all` (the default) includes `mint`, so a run without `--scenario` emits its rows too, beside the
+rows of the other scenarios in the same CSV.
 
 Each scenario runs at width = all CPUs of the affinity set and at three quarters of them, on
 threadteam and on a Rayon `scope`; `benches/omp/wait_omp.c` runs `sections` and `gaps` on libgomp

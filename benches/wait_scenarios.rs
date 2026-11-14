@@ -11,6 +11,9 @@
 //! * `sections`: a call is 200 sections of 5, 20 or 50 µs, on a team held across calls;
 //! * `gaps`: a call is 10 sections of 5 µs, the caller sleeps 0 / 100 µs / 1 ms / 10 ms between
 //!   calls; reports the first section of each call (wake latency + 5 µs) and the whole call;
+//! * `mint`: a call is one `team.exec(k)` minted and dropped, with no section opened, for `k = w`
+//!   and for `k = 1` on the same team; the extra a mint of width `w` costs is the difference of
+//!   the two rows (threadteam-rs#67). Not run for `--impl rayon` (a pool has no reserved slots);
 //! * `acquire`: a call is 50 sections of 20 µs, with the team held and a token minted per call
 //!   (`held_team`, as tenferro's `CpuEngine`), with the pool held and the members acquired per
 //!   call (`held_pool`, `Exec::new(..).team(..)`), and with a new pool per call (`fresh_pool`, as
@@ -18,6 +21,9 @@
 //!   `build`, `acquire`, `release` and `drop` time those phases one by one);
 //! * `nested`: a call is 100 splits of the team into pairs, each pair running one 20 µs
 //!   section: many child leaders join at once (they share one sleeping place in the pool).
+//!
+//! `all` (the default) includes `mint`, so a run without `--scenario` emits its rows as well; the
+//! rows of one scenario append to a CSV beside those of the others.
 //!
 //! Every scenario runs at the widths given by `--widths` (default: all CPUs of the affinity set,
 //! and three quarters of them), on threadteam and, as a reference, on a Rayon `scope` of the same
@@ -27,7 +33,8 @@
 //! Foreign load (`--load K:P`): `K` child processes of this binary, each busy `P` % of every 10 ms
 //! period, unpinned, for the whole run. They stand for another user's processes on a shared host.
 //!
-//! Options: `--scenario sections|gaps|acquire|nested|all`, `--widths 64,48`, `--impl threadteam,rayon`,
+//! Options: `--scenario sections|gaps|mint|acquire|nested|all`, `--widths 64,48`,
+//! `--impl threadteam,rayon`,
 //! `--load K:P`, `--calls N` (default 200; `gaps` and `acquire` use N/2), `--csv <file>`,
 //! `--label <text>` (the version or commit, written to the CSV), `--spin-polls N` (the pool's
 //! spin budget, this version only). Under each threadteam row a `waits per call` line counts join
@@ -500,6 +507,35 @@ fn main() {
                     ideal_us: (splits as u64 * work) as f64,
                 });
                 waits_line(waits_between(c0, snap(&held)), calls / 2);
+            }
+        }
+
+        if want("mint") {
+            // threadteam-rs#67: a mint that opens no section. `exec(1)` on the same
+            // team is the width-1 reference, so a mint's width term is the
+            // difference of the two rows.
+            if let Some(t) = &held {
+                let c0 = snap(&held);
+                let arms: &[usize] = if w == 1 { &[1] } else { &[w, 1] };
+                for &k in arms {
+                    let v = (0..calls)
+                        .map(|_| {
+                            let t0 = Instant::now();
+                            drop(t.exec(k));
+                            t0.elapsed().as_secs_f64() * 1e6
+                        })
+                        .collect();
+                    out.row(Row {
+                        scenario: "mint",
+                        imp: "threadteam",
+                        width: w,
+                        param: format!("token={k}"),
+                        metric: "mint",
+                        s: stats(v),
+                        ideal_us: 0.0,
+                    });
+                }
+                waits_line(waits_between(c0, snap(&held)), calls * arms.len());
             }
         }
 

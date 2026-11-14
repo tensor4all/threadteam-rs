@@ -761,9 +761,35 @@ from the slowest member at
 | k = 8 | 8.4 | 5.8 | 5.8 |
 
 ns/KiB of moved bytes. The row is `8 ns/KiB` (about 146 GB/s, the slowest `k >= 4` point rounded up), and the raw
-CSV is `thresholds-data/raw/resident-split-m5max-20261103.csv`. Where a class has no measurement the row is the
-slowest measured one, 41 ns/KiB (about 25 GB/s), so the term is never under-charged; a pool owner overrides it with
-`TransferRate::per_kib`.
+CSV is `thresholds-data/raw/resident-split-m5max-20261103.csv`.
+
+On the 2 x Xeon Platinum 9242 the in-tree bench at 0.5.1 (head `51bbe445`, `--features parallel`, hot, mode `D`,
+three fresh processes per binding, 2026-11-07) gives `members_max_med / ((k - 1) / k * bytes)` in ns/KiB. The
+per-cell medians are in the [2026-11-07 comment on threadteam-rs#27](https://github.com/tensor4all/threadteam-rs/issues/27#issuecomment-6700863619);
+the bench output behind that table is not checked in, unlike the M5 CSV above.
+
+| placement | 256 KiB | 392 KiB | 1 MiB |
+| --- | --- | --- | --- |
+| one die (`--cpunodebind=0 --membind=0`), k = 4..24 | 41–45 | 42–46 | 39–45 |
+| one die, `--physcpubind=0-47 --membind=0` replicate, k = 4..24 | 44–46 | 43–47 | 40–47 |
+| leader on node 0, members on node 1 (`--physcpubind=0,24-47 --membind=0`), k = 4..8 | 68–78 | 70–77 | 73–75 |
+
+The row is **43 ns/KiB** (about 24 GB/s) for `x86_64-avx512`: range 39.3–46.8 ns/KiB over the 24 one-die cells,
+flat in `k` over 256 KiB–1 MiB and `k = 4..24`. The `--physcpubind=0-47 --membind=0` cells are a second one-die replicate
+(40–47), not a cross-die row: with placement on, member `j` sits on `S[j]`, so every `k <= 24` stays on node 0.
+With the leader on node 0 and the members on node 1 the same bench gives about **70 ns/KiB**: 68–78 at `k = 4..8`
+at all three sizes, and at 1 MiB the four cells are 75.1, 73.2 (`k = 4`, `8`) and 70.3, 59.5 (`k = 16`, `24`),
+so 59–75 over `k = 4..24`. The 256/392 KiB cells at `k = 16/24` there fall to 22–50, below the one-die rate,
+where each member's share is only 10.7 KiB (`256 KiB / 24`) to 24.5 KiB (`392 KiB / 16`); they are unexplained,
+are left out of the row, and are not fitted. 4 MiB is not resident on this host (13–17 ns/KiB at `k >= 8`) and is
+excluded.
+
+`TransferRate` is keyed by `HostClass`, not by the team's node spread, so the code carries the one-die 43:
+`X86_64Avx512` is 43 ns/KiB, and every class without a measurement is 43 too, as the slowest installed class row, so a
+host this crate has not calibrated is charged at least the measured one-die rate; a pool owner overrides either
+with `TransferRate::per_kib`. The cross-die 70 is recorded here only. Installing it needs a key that knows whether
+the members sit on the leader's node, and that is the placement result, which `width_for` does not see; it is a
+separate change, not a second row in the same table.
 
 What the model is not:
 

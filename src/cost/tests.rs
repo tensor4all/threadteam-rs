@@ -393,9 +393,9 @@ fn falling_interpolation_truncates_toward_zero() {
 
 #[test]
 fn a_transfer_charge_is_one_drain_at_the_row_rate() {
-    let rate = TransferRate::per_kib(41);
-    // 1 MiB at 41 ns/KiB is 41 * 1024 ns.
-    assert_eq!(rate.time(1 << 20), Duration::from_nanos(41 * 1024));
+    let rate = TransferRate::per_kib(43);
+    // 1 MiB at 43 ns/KiB is 43 * 1024 ns.
+    assert_eq!(rate.time(1 << 20), Duration::from_nanos(43 * 1024));
     assert_eq!(rate.ns_of_bytes(0), 0);
     // Saturation, not wrap.
     assert_eq!(
@@ -403,17 +403,22 @@ fn a_transfer_charge_is_one_drain_at_the_row_rate() {
         Duration::from_nanos(u64::MAX)
     );
     // The measured rows: the M5 is charged less per KiB than a die of the
-    // measured Xeon, and an unmeasured class takes the slowest of them.
-    assert!(TransferRate::for_class(HostClass::Aarch64Apple).ns_per_kib() < 41);
+    // measured Xeon, and an unmeasured class takes the slowest installed class
+    // row.
+    assert!(TransferRate::for_class(HostClass::Aarch64Apple).ns_per_kib() < 43);
+    assert_eq!(
+        TransferRate::for_class(HostClass::X86_64Avx512),
+        TransferRate::per_kib(43)
+    );
     assert_eq!(
         TransferRate::for_class(HostClass::Generic),
-        TransferRate::per_kib(41)
+        TransferRate::per_kib(43)
     );
 }
 
 #[test]
 fn zero_resident_bytes_is_exactly_the_width_model() {
-    let rate = TransferRate::per_kib(41);
+    let rate = TransferRate::per_kib(43);
     let costs = DispatchCosts::for_class(HostClass::Aarch64Apple);
     for est_us in [1u64, 7, 40, 1_000, 20_000] {
         let est = us(est_us);
@@ -434,9 +439,9 @@ fn zero_resident_bytes_is_exactly_the_width_model() {
 
 #[test]
 fn a_resident_source_makes_a_region_stay_serial() {
-    // A 2 ms region over 64 MiB it has just written: the drain is 2.6 ms at
+    // A 2 ms region over 64 MiB it has just written: the drain is 2.8 ms at
     // the default row, more than the region costs on one thread.
-    let rate = TransferRate::per_kib(41);
+    let rate = TransferRate::per_kib(43);
     let est = Duration::from_millis(2);
     let cold = width_for_by(est, 1, nz(32), |_| Duration::ZERO);
     let hot = width_for_split_by(

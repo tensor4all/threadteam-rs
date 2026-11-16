@@ -1073,7 +1073,8 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   `PoolBuilder::dispatch_costs` overrides it.
 * `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
   `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,
-  sections)` (and `width_for_by` for a consumer's own cost function) returns the
+  sections)` (and `width_for_by` / `width_profile_by` for a consumer's own cost function; the
+  latter gives every ceiling in one pass) returns the
   width in `1..=budget` that minimises `sections * D(k) + estimate / k` among the
   widths that pay, or 1.
 * `sections` is the number of dispatches the region really performs. It is a

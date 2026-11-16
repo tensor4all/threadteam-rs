@@ -586,3 +586,74 @@ fn a_multi_node_term_is_one_step_with_its_own_slope() {
     let huge = WidthCosts::flat(us(1)).with_multi_node(Duration::MAX, Duration::MAX);
     assert_eq!(huge.at_nodes(nz(64), nz(2)), Duration::from_nanos(u64::MAX));
 }
+
+/// threadteam-rs#74: the profile is `width_for_by` at every ceiling, for the
+/// cost shapes the rule has to survive.
+#[test]
+fn width_profile_matches_width_for_by_at_every_ceiling() {
+    fn check<C: Fn(NonZeroUsize) -> Duration + Copy>(cost: C) {
+        for &budget in &[1usize, 2, 7, 64, 96] {
+            for &sections in &[0u32, 1, 3] {
+                for &estimate in &[us(0), us(5), us(50), us(200), us(1_000_000)] {
+                    let mut out = vec![NonZeroUsize::MIN; budget];
+                    width_profile_by(estimate, sections, nz(budget), cost, &mut out);
+                    for ceiling in 1..=budget {
+                        assert_eq!(
+                            out[ceiling - 1],
+                            width_for_by(estimate, sections, nz(ceiling), cost),
+                            "budget={budget} sections={sections} estimate={estimate:?} ceiling={ceiling}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    check(|_| us(2));
+    check(|k| us(1) * k.get() as u32);
+    check(|k| if k.get() == 3 { Duration::MAX } else { us(4) });
+    let measured = DispatchCosts::for_class(HostClass::Aarch64Apple);
+    check(|k| measured.cost(DispatchKind::Team, k));
+    let non_monotone = WidthCosts::new([us(1), us(5), us(0)]);
+    check(|k| non_monotone.at(k));
+}
+
+/// The strict-improvement tie rule holds at every ceiling: the equal larger
+/// width never displaces the smaller one.
+#[test]
+fn width_profile_keeps_the_smaller_width_on_a_tie() {
+    // 10 us + 60 us / 2 = 20 us + 60 us / 3 = 40 us, and both pay.
+    let cost = |k: NonZeroUsize| match k.get() {
+        2 => us(10),
+        3 => us(20),
+        _ => Duration::MAX,
+    };
+    let mut out = [NonZeroUsize::MIN; 4];
+    width_profile_by(us(60), 1, nz(4), cost, &mut out);
+    assert_eq!(out[0].get(), 1);
+    assert_eq!(out[1].get(), 2);
+    assert_eq!(out[2].get(), 2);
+    assert_eq!(out[3].get(), 2);
+}
+
+/// One pass: `cost` runs once per width above 1, whatever the budget.
+#[test]
+fn width_profile_calls_the_cost_once_per_width() {
+    use std::cell::Cell;
+
+    let calls = Cell::new(0usize);
+    let cost = |_: NonZeroUsize| {
+        calls.set(calls.get() + 1);
+        us(2)
+    };
+    let mut out = [NonZeroUsize::MIN; 96];
+    width_profile_by(us(1_000_000), 1, nz(96), cost, &mut out);
+    assert_eq!(calls.get(), 95);
+}
+
+#[test]
+#[should_panic(expected = "one slot per ceiling")]
+fn width_profile_rejects_a_length_mismatch() {
+    let mut out = [NonZeroUsize::MIN; 3];
+    width_profile_by(us(10), 1, nz(4), |_| us(1), &mut out);
+}

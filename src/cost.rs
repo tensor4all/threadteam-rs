@@ -666,29 +666,103 @@ pub fn width_for_by(
     budget: NonZeroUsize,
     cost: impl Fn(NonZeroUsize) -> Duration,
 ) -> NonZeroUsize {
-    let est_ns = to_ns(estimate);
-    let est = est_ns as f64;
-    let mut best = NonZeroUsize::MIN;
-    let mut best_obj = est;
+    let mut scan = WidthScan::new(estimate, sections);
     for k in 2..=budget.get() {
-        let Some(width) = NonZeroUsize::new(k) else {
-            continue;
-        };
-        let d = cost(width);
-        if d == Duration::MAX {
-            continue;
-        }
-        let d_ns = to_ns(d);
-        if sections != 0 && !pays_ns(est_ns, sections, d_ns) {
-            continue;
-        }
-        let obj = f64::from(sections) * d_ns as f64 + est / k as f64;
-        if obj < best_obj {
-            best = width;
-            best_obj = obj;
+        if let Some(width) = NonZeroUsize::new(k) {
+            scan.step(width, &cost);
         }
     }
-    best
+    scan.best
+}
+
+/// For every ceiling `b` in `1..=budget`, the width [`width_for_by`] returns
+/// with that ceiling: `out[b - 1] == width_for_by(estimate, sections, b, cost)`.
+/// One pass over `2..=budget`; `cost` is called at most once per width, and the
+/// function allocates nothing.
+///
+/// A caller that needs the width at every ceiling (for example the speedup
+/// profile of each job in a moldable placement) would otherwise call
+/// [`width_for_by`] once per ceiling and pay Θ(budget²). The answer at ceiling
+/// `b` is the running argmin of the same scan after step `b`.
+///
+/// # Panics
+///
+/// If `out.len() != budget.get()`.
+///
+/// # Examples
+///
+/// ```
+/// use std::num::NonZeroUsize;
+/// use std::time::Duration;
+/// use threadteam::width_profile_by;
+///
+/// let budget = NonZeroUsize::new(4).unwrap();
+/// let flat = |_| Duration::from_micros(2);
+/// let mut out = [NonZeroUsize::MIN; 4];
+/// width_profile_by(Duration::from_millis(1), 1, budget, flat, &mut out);
+/// assert_eq!(out.map(|w| w.get()), [1, 2, 3, 4]);
+/// ```
+pub fn width_profile_by(
+    estimate: Duration,
+    sections: u32,
+    budget: NonZeroUsize,
+    cost: impl Fn(NonZeroUsize) -> Duration,
+    out: &mut [NonZeroUsize],
+) {
+    assert_eq!(
+        out.len(),
+        budget.get(),
+        "the profile needs one slot per ceiling"
+    );
+    let mut scan = WidthScan::new(estimate, sections);
+    out[0] = scan.best;
+    for k in 2..=budget.get() {
+        if let Some(width) = NonZeroUsize::new(k) {
+            scan.step(width, &cost);
+            out[k - 1] = scan.best;
+        }
+    }
+}
+
+/// The running argmin of the width rule. [`WidthScan::step`] is the single
+/// authority for the objective and the `pays` filter; [`width_for_by`] and
+/// [`width_profile_by`] differ only in when they read the running value.
+struct WidthScan {
+    est_ns: u64,
+    est: f64,
+    sections: u32,
+    best: NonZeroUsize,
+    best_obj: f64,
+}
+
+impl WidthScan {
+    fn new(estimate: Duration, sections: u32) -> Self {
+        let est_ns = to_ns(estimate);
+        Self {
+            est_ns,
+            est: est_ns as f64,
+            sections,
+            best: NonZeroUsize::MIN,
+            best_obj: est_ns as f64,
+        }
+    }
+
+    #[inline]
+    fn step<C: Fn(NonZeroUsize) -> Duration>(&mut self, width: NonZeroUsize, cost: &C) {
+        let d = cost(width);
+        if d == Duration::MAX {
+            return;
+        }
+        let d_ns = to_ns(d);
+        if self.sections != 0 && !pays_ns(self.est_ns, self.sections, d_ns) {
+            return;
+        }
+        let obj = f64::from(self.sections) * d_ns as f64 + self.est / width.get() as f64;
+        if obj < self.best_obj {
+            self.best = width;
+            self.best_obj = obj;
+        }
+    }
 }
 
 /// How far the shares of a parallel section have to reach for their input.

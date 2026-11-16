@@ -19,6 +19,10 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ### Added
 
+- `width_profile_by(estimate, sections, budget, cost, out)`: the width `width_for_by` returns at
+  every ceiling `1..=budget`, in one pass and without allocating (#74). `out[b - 1]` equals
+  `width_for_by` at ceiling `b`, including the `pays` filter, the `Duration::MAX` skip,
+  `sections == 0` and the strict-improvement tie rule; `out.len()` must equal `budget`.
 - `WidthCosts::with_multi_node(step, per_participant)` and `WidthCosts::at_nodes(width, nodes)`: an installable
   multi-node term (#68). A section whose participants span two or more NUMA nodes costs
   `step + per_participant * width` on top of the row; the row stays the single-node cost. A team token is priced

@@ -947,6 +947,24 @@ impl<'p> Exec<'p> {
     /// its own responsibility. Without the `parallel` feature, `f` runs inline
     /// and receives a width of one.
     ///
+    /// # Width
+    ///
+    /// When the pool is entered (a budget above one on a pooled token), `f` runs
+    /// inside the pool's private scheduler, and that scheduler keeps the pool's
+    /// width. Plain Rayon code inside `f` then runs on [`Pool::width`] workers
+    /// whatever the budget is — `par_iter`, `rayon::join`, `rayon::scope`,
+    /// `rayon::broadcast` — and `rayon::current_num_threads()` reports the pool's
+    /// width (`tests/parallel.rs::external_does_not_narrow_rayon_to_the_budget`).
+    ///
+    /// Budget conservation inside `f` is the called library's responsibility:
+    /// pass the width to the library's own knob (`faer::Par::rayon(width)`,
+    /// `OMP_NUM_THREADS`, a vendor `set_num_threads`) and let the library divide
+    /// it. threadteam does not narrow the scheduler inside `f`, and it does not
+    /// count what a library schedules there. Giving `f` a Rayon view of its own
+    /// width needs a runtime per CPU set (own team threads plus a separate Rayon
+    /// pool, handed over at a park): the own-threads line, threadteam-rs#79 and
+    /// #20, not this branch.
+    ///
     /// # Placement
     ///
     /// The token's reserved members are **lent** for the call: each restores its

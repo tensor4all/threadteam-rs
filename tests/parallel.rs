@@ -194,6 +194,37 @@ fn external_hands_the_budget_and_runs_on_the_pool() {
     assert_eq!(Exec::serial().external(|width| width.get()), 1);
 }
 
+/// The documented contract of tensor4all/threadteam-rs#79: `external` on a
+/// budget above one enters the pool's private scheduler, so plain Rayon inside
+/// `f` sees the pool's width and not the token's budget, and threadteam narrows
+/// nothing inside `f`; a budget of one enters no pool and runs `f` inline.
+///
+/// When the own-threads line lands (threadteam-rs#79, #20) this test changes with
+/// the contract; it exists so that it cannot change silently.
+#[test]
+fn external_does_not_narrow_rayon_to_the_budget() {
+    let pool = named("ext-width", 8);
+    assert_eq!(pool.width().get(), 8);
+    let (budget, threads, name) = Exec::new(&pool, 2)
+        .unwrap()
+        .external(|budget| (budget.get(), rayon::current_num_threads(), current_name()));
+    assert_eq!(budget, 2, "the token's budget");
+    assert_eq!(threads, 8, "the pool's width, not the budget");
+    assert!(
+        name.starts_with("ext-width-"),
+        "ran outside the pool: {name}"
+    );
+
+    // The other side of the boundary: a budget of one enters no pool, so `f`
+    // runs inline on the caller and Rayon inside it is whatever is ambient.
+    let caller = current_name();
+    let (budget, inline_name) = Exec::new(&pool, 1)
+        .unwrap()
+        .external(|budget| (budget.get(), current_name()));
+    assert_eq!(budget, 1);
+    assert_eq!(inline_name, caller, "a budget of one entered the pool");
+}
+
 #[test]
 fn external_from_a_worker_of_the_pool_runs_in_place() {
     let pool = named("ext-in", 2);

@@ -250,7 +250,15 @@ thread run one of its children, which is one of the tasks already counted.
   threadteam-rs#54).
 - **External width**: `external` hands over the budget unchanged. A library
   that rounds or splits it does so itself (t4a-faer's `join_raw` splits a width
-  into halves that add up to it).
+  into halves that add up to it). A token with a budget above one enters the
+  pool, and that scheduler keeps `pool.width()`: plain Rayon code inside `f`
+  (`par_iter`, `join`, `scope`, `broadcast`) runs at the pool's width, not at the
+  budget, so a library that does not narrow runs wider than its token
+  (threadteam-rs#79). A budget of one, and a serial token, run `f` inline on the
+  calling thread and enter no pool, so Rayon inside `f` is the ambient one there.
+  Budget conservation inside `f` belongs to the library; a Rayon view of the
+  budget's width needs the per-CPU-set runtime hand-off of the own-threads line
+  (threadteam-rs#79, #20).
 - **Plans** never store `Exec`; replay takes it per call.
 - **Without the `parallel` feature** the same types and signatures exist;
   every pool has width 1 and every entry runs inline.
@@ -263,6 +271,7 @@ thread run one of its children, which is one of the tasks already counted.
 | Tokens cannot be duplicated | compile-fail doctest: `Exec: Clone` and `Exec: Copy` do not hold |
 | Splits conserve slots | unit test (property): shares of `fork` / `for_ranges` add up to the budget, each share at least one |
 | Concurrency per root token at most its budget | test-feature ledger in `threadteam` (live tasks, max) asserted in every consumer test; faer measured at the kernel boundary |
+| `external` on an entered pool (budget above one) runs `f` at the pool's width, not the budget; a budget of one runs it inline | test: `tests/parallel.rs::external_does_not_narrow_rayon_to_the_budget`, both sides |
 | No implicit global pool | `build_global().is_err()` test in each consumer, own process |
 | Serial runs on the calling thread | `std::thread::current().id()` test |
 | Same-pool re-entry does not install | entry counter (test-only) |

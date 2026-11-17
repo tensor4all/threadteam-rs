@@ -7,8 +7,8 @@ authors = ["Satoshi Terasaki", "Hiroshi Shinaoka"]
 repository = "https://github.com/tensor4all/threadteam-rs"
 readme = "README.md"
 documentation = "https://docs.rs/threadteam"
-description = "Scoped CPU thread-team placement token: a Pool and a non-Clone Exec with fork, for_ranges, external and broadcast; no Rayon type in the public API."
-keywords = ["threading", "parallel", "scheduler", "placement", "thread-pool"]
+description = "OpenMP-style thread teams and CPU placement for HPC in Rust: barrier-capable teams, participant pinning, libgomp-style waits and cost-based widths behind a splittable, non-Clone Exec token; no scheduler type in the public API."
+keywords = ["hpc", "openmp", "parallel", "thread-pool", "affinity"]
 categories = ["concurrency", "science"]
 
 [features]

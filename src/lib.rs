@@ -1,6 +1,13 @@
-//! Splittable CPU placement token for the tensor4all CPU stack.
+//! OpenMP-style thread teams and CPU placement for HPC code in Rust.
 //!
-//! `threadteam` is the single place that starts tasks. Kernels never see a
+//! `threadteam` gives a numerical library or application explicit control over
+//! how many threads run, where they run and how they wait: teams whose
+//! participants run concurrently and meet at barriers, participant pinning,
+//! libgomp-style waits and a per-call width chosen from measured dispatch
+//! costs. It is the CPU execution layer of the tensor4all stack but does not
+//! depend on it.
+//!
+//! The token's owner is the single place that starts tasks. Kernels never see a
 //! scheduler type: they take an [`Exec`], a token for `budget` slots of a
 //! [`Pool`], and split it with [`Exec::fork`], [`Exec::for_ranges`],
 //! [`Exec::broadcast`] or [`Exec::external`].

@@ -1,10 +1,20 @@
 # threadteam
 
-Splittable CPU placement token for the tensor4all CPU stack. `threadteam` is the one place
-that starts tasks: kernels take an `Exec` token and split it, and no scheduler
-type appears in any public signature.
+OpenMP-style thread teams and CPU placement for HPC code in Rust. `threadteam`
+gives a numerical library or application the controls that OpenMP gives C and
+Fortran code: teams whose participants run at the same time and meet at
+barriers, participant pinning inside the process's CPU set, libgomp-style
+spin / yield / sleep waits, and a per-call parallel width chosen from measured
+dispatch costs. All of it sits behind one splittable token: kernels take an
+`Exec` and split it, the token's owner decides how many threads run and where,
+and no scheduler type appears in any public signature.
 
-Used by strided-rs, tcontract-rs, cpueinsum-rs, tlinalg-rs and tenferro-rs.
+`threadteam` does not depend on any particular application stack. It is the
+CPU execution layer of the tensor4all stack (strided-rs, tcontract-rs,
+cpueinsum-rs, tlinalg-rs and tenferro-rs), which is where its design and
+measurements come from, and it is meant for any Rust code that needs explicit
+control over its threads.
+
 Design records: [`docs/design/placement.md`](docs/design/placement.md) (the token),
 [`docs/design/waiting.md`](docs/design/waiting.md) (how the workers wait).
 

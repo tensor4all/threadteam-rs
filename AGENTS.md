@@ -13,10 +13,12 @@ applies whenever code is written while referencing third-party code.
 
 ## Project overview
 
-`threadteam` is a single-crate repository: a scoped CPU thread-team placement
-token (`Pool`, non-`Clone` `Exec` with `fork` / `for_ranges` / `external` /
-`broadcast`). It is **the only crate in the tensor4all stack that starts
-tasks**. strided-rs, tcontract-rs, cpueinsum-rs, tlinalg-rs and tenferro-rs
+`threadteam` is a single-crate repository: a general HPC framework for
+OpenMP-style thread teams and CPU placement in Rust, exposed as a scoped
+placement token (`Pool`, non-`Clone` `Exec` with `fork` / `for_ranges` /
+`external` / `broadcast`). Write its public docs and API for any HPC
+consumer, not for one stack. Within the tensor4all stack it is **the only
+crate that starts tasks**. strided-rs, tcontract-rs, cpueinsum-rs, tlinalg-rs and tenferro-rs
 take an `Exec` and split it; none of them depends on Rayon directly. The code is
 original; there is no third-party provenance beyond the licenses.
 

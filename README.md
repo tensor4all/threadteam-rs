@@ -1,3 +1,8 @@
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/tensor4all/tensor4all-meta/main/branding/threadteam/svg/threadteam-wordmark-dark.svg">
+  <img alt="threadteam" src="https://raw.githubusercontent.com/tensor4all/tensor4all-meta/main/branding/threadteam/svg/threadteam-wordmark.svg" height="64">
+</picture>
+
 # threadteam
 
 OpenMP-style thread teams and CPU placement for HPC code in Rust. `threadteam`

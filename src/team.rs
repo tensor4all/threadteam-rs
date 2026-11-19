@@ -94,9 +94,11 @@ impl Participant<'_> {
 ///   ([`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)),
 ///   member `k` of a root scope (participant `k >= 1`) runs on the `k`-th CPU of
 ///   the calling thread's set, and restores its own mask afterwards. The leader
-///   is pinned to the first CPU of that set for the scope — for a section of a
-///   `Team` token that opens no scope, for that section — and widened to the
-///   whole set for a vendor call by [`external`](Self::external).
+///   is pinned to the first CPU of that set: for the scope of a plain token, and
+///   for the whole life of a [`Team`](crate::Team) token, whose first section or
+///   scope takes it and whose drop gives the set back (threadteam-rs#77). A
+///   vendor call goes through [`external`](Self::external), which widens the
+///   leader to the whole set for that call.
 /// * A panic in any participant propagates to the leader after every
 ///   dispatched share has finished; the reservation is released.
 ///
@@ -513,8 +515,9 @@ impl<'team> TeamExec<'team> {
     /// (participant `k >= 1`) pins itself onto `placement.get(k)`. The caller
     /// has checked that the placement has a CPU for every participant; nothing
     /// wraps. The leader, participant 0, is not pinned here: `pin_scope` has
-    /// already pinned it to `placement.get(0)` (`S[0]`), the CPU no member
-    /// takes, for the life of the scope (see [`PoolBuilder::pin_participants`]).
+    /// already pinned it to `placement.get(0)` (`S[0]`), the CPU no member takes,
+    /// for the scope of a plain token or, for a [`Team`](crate::Team) token, for
+    /// the token's life (see [`PoolBuilder::pin_participants`]).
     ///
     /// One section of the existing machinery, so all participants are on their
     /// own threads; it also serves as the rendezvous that precedes any user

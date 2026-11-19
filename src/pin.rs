@@ -4,23 +4,34 @@
 //! on (the default), the leader of a root team scope reads its own affinity mask
 //! `S` and places the team inside it, never outside it:
 //!
-//! * **The leader is pinned to `S[0]` for one section at a time**, never for
-//!   the life of a `Team`. One `sched_setaffinity` at scope entry
-//!   ([`LeaderPin::enter`]) and one at scope exit (its drop, which also runs on
-//!   unwind) restore `S`; a team token that dispatches a section without
-//!   opening a scope pins its leader for that section and no longer
-//!   ([`home_pin`], whose home is `S[0]` of the set the team recorded at
-//!   `into_team`). Between sections the thread keeps `S`, so a vendor library
-//!   that creates its thread team from the thread that calls it, or a plain
-//!   thread started there, does not inherit a one-CPU mask (tenferro-rs
-//!   `PERFORMANCE_TIPS.md`). Inside a section, or a scope, the leader's half of
-//!   that rule is [`widened`], behind `TeamExec::external`: it sets the mask to
-//!   `S` for the duration of one call and puts `{S[0]}` back when the call
-//!   returns or unwinds. A team scope entered inside that call places this
+//! * **The leader is pinned to `S[0]` for the life of a team token.** The first
+//!   outermost entry of the token, a section (`fork`, `for_ranges`,
+//!   `broadcast`) or a scope (`team`), narrows the leader to the home `S[0]` of
+//!   the set the team recorded at `into_team` ([`home_pin`], [`hold`]) and
+//!   records the placement under the token's [`Owner`]; dropping the token gives
+//!   the calling thread `S` back ([`release`]). One `sched_setaffinity` when the
+//!   pin is taken, one when it ends, and the sections in between find `{S[0]}`
+//!   already in place: they read the mask, compare it with the home and skip both
+//!   calls when it is equal (threadteam-rs#77: this used to cost two
+//!   `sched_setaffinity` per section, +2.3 µs to +2.8 µs against 0.5.1, plus a
+//!   leader that landed on a member's CPU between sections). A root scope of a
+//!   plain pool token, which mints no token of a `Team`, still pins its leader
+//!   for the scope alone ([`LeaderPin::enter`], one call at entry and one at its
+//!   drop, which also runs on unwind). Inside a section, or a scope, the leader's
+//!   half of that rule is [`widened`], behind `TeamExec::external`: it sets the
+//!   mask to `S` for the duration of one call and puts `{S[0]}` back when the
+//!   call returns or unwinds. A team scope entered inside that call places this
 //!   thread again, on the nested team's own home, and the placement before it
 //!   comes back when *its* scope ends ([`home_pin`]: a placed thread refuses a
 //!   mask that has left the placement, not every second placement), so two
 //!   independent pools nest (threadteam-rs#54).
+//!
+//!   Because the pin lives as long as the token, a thread started from the
+//!   leader while the token lives inherits `{S[0]}`, not `S`; a caller that
+//!   builds a vendor thread pool from the thread it leads must take it through
+//!   [`widened`] (`TeamExec::external`) or drop the token first. `into_team` pins
+//!   nothing, so the creating thread keeps `S` for the vendor code that builds a
+//!   pool right there (threadteam-rs#52, tenferro-rs `PERFORMANCE_TIPS.md`).
 //! * **Member `k >= 1` pins itself onto `P[k]`**, the `k`-th CPU of the
 //!   placement order [`order`] gives `S` under the pool's [`PinStrategy`], so
 //!   the members take `n - 1` CPUs of `S` other than `S[0]`, one CPU each.
@@ -587,6 +598,29 @@ impl Placement {
 struct Placed {
     wide: CpuMask,
     home: usize,
+    /// Whose pin this is: `0` for a pin a root scope took for itself and gives
+    /// back when it ends, otherwise the [`Owner`] of the team token that holds
+    /// it until it drops.
+    owner: Owner,
+}
+
+/// Whose leader pin a placement is: `NO_OWNER` for a root scope's own pin, or
+/// the id a [`Team`](crate::Team) token minted for itself, which its sections
+/// pin under and which gives the pin back when the token drops.
+///
+/// Ids come from one process-wide counter, so a token of one team never
+/// releases the placement of a token of another.
+pub(crate) type Owner = u64;
+
+/// A pin no team token holds: a root scope's own.
+pub(crate) const NO_OWNER: Owner = 0;
+
+/// A fresh [`Owner`] for one team token.
+pub(crate) fn next_owner() -> Owner {
+    static NEXT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    // `Relaxed` is enough: the id only has to be unique, and a thread reads and
+    // releases its own.
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 thread_local! {
@@ -594,6 +628,11 @@ thread_local! {
     /// placed. `const` initialised and `Copy`, so neither access allocates nor
     /// registers a destructor.
     static PLACED: core::cell::Cell<Option<Placed>> = const { core::cell::Cell::new(None) };
+    /// How many leader pins this thread has taken (`leader_pins`, tests only).
+    /// Per thread like `PLACED`: the tests run in one process, and only the
+    /// leader's own pins are counted.
+    #[cfg(test)]
+    static LEADER_PINS: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
 }
 
 /// The calling thread, the leader of a placed root scope, pinned to `S[0]`.
@@ -610,12 +649,107 @@ impl LeaderPin {
     /// `None` when the kernel refuses the pin: the thread keeps `S`, the scope
     /// places its members anyway and nothing is restored at exit.
     pub(crate) fn enter(wide: &CpuMask, home: usize) -> Option<LeaderPin> {
-        if !set_here_to(home) {
+        let prev = PLACED.with(|p| p.get());
+        if !place(wide, home, NO_OWNER) {
             return None;
         }
-        let prev = PLACED.with(|p| p.replace(Some(Placed { wide: *wide, home })));
         Some(LeaderPin { wide: *wide, prev })
     }
+}
+
+/// Narrows the calling thread onto `home` and records the placement `wide` under
+/// `owner`, which gives it back with [`release`] when the token that holds it
+/// drops. `false` when the kernel refuses the pin: the thread keeps the mask it
+/// had and nothing is recorded.
+fn place(wide: &CpuMask, home: usize, owner: Owner) -> bool {
+    if !set_here_to(home) {
+        return false;
+    }
+    #[cfg(test)]
+    LEADER_PINS.with(|n| n.set(n.get() + 1));
+    PLACED.with(|p| {
+        p.set(Some(Placed {
+            wide: *wide,
+            home,
+            owner,
+        }))
+    });
+    true
+}
+
+/// Places the calling thread on `home` of the placement `wide` for `owner`: held
+/// until the token drops when this thread has no other placement recorded, for
+/// this scope only when it has one (an enclosing scope or `external` call owns
+/// the mask and puts it back, so the token must not replace its record). `Some`
+/// is the guard of that temporary pin; `None` means the token's pin is in force,
+/// or the kernel refused.
+pub(crate) fn place_leader(wide: &CpuMask, home: usize, owner: Owner) -> Option<LeaderPin> {
+    if owner != NO_OWNER && PLACED.with(|p| p.get()).is_none() {
+        let _ = place(wide, home, owner);
+        None
+    } else {
+        LeaderPin::enter(wide, home)
+    }
+}
+
+/// Gives `owner`'s placement back: the calling thread is widened to `S` again.
+/// Nothing happens when the calling thread holds no placement for `owner`: a
+/// token dropped on a thread that never pinned it (the record is per thread, so
+/// a token entered on one thread and dropped on another leaves the entering
+/// thread on `{S[0]}`, as 0.5's `TeamPin` did), or a token whose sections ran
+/// under an enclosing placement (an `external` call, a nested scope) and took a
+/// temporary guard instead of this one.
+///
+/// A token's pin is only taken when this thread holds no other placement (see
+/// `place_leader`), so releasing it leaves the thread unplaced, as the token found
+/// it.
+pub(crate) fn release(owner: Owner) {
+    if owner == NO_OWNER {
+        return;
+    }
+    let Some(placed) = PLACED.with(|p| p.get()) else {
+        return;
+    };
+    if placed.owner != owner {
+        return;
+    }
+    // Best effort: a refused restore (a cpuset that shrank) leaves the thread on
+    // `S[0]`, the mask it already had.
+    let _ = set_here(&placed.wide);
+    PLACED.with(|p| p.set(None));
+}
+
+/// How many leader pins the calling thread has taken so far: one per placement
+/// it narrowed itself for (`LeaderPin::enter`, `place`), so a test can tell a
+/// placement that is still held from one re-taken at every section. Test-only;
+/// the counter is a thread-local `Cell` and nothing on a scope's path reads it.
+#[cfg(test)]
+#[cfg_attr(
+    not(all(feature = "parallel", target_os = "linux")),
+    allow(dead_code) // only the placement test (`parallel`, Linux) counts
+)]
+pub(crate) fn leader_pins() -> usize {
+    LEADER_PINS.with(core::cell::Cell::get)
+}
+
+/// The set `owner`'s team token leads in when this thread already runs on that
+/// token's home: `S` of the placement it holds, which the mask it now runs on
+/// (`{S[0]}`) no longer shows. `None` for any other thread, owner or placement, so
+/// the caller reads its own mask as before.
+///
+/// This is what lets a root scope opened by the token's own leader
+/// (`exec::pin_scope`) place the members in `S` instead of reading a one-CPU mask
+/// and giving up: the token holds the leader home, and the placement still knows
+/// the whole set. It is deliberately not answered for a scope of another pool or
+/// another team, whose leader this thread is not: those place nobody on a one-CPU
+/// mask, as before.
+pub(crate) fn placed_set(here: &CpuMask, owner: Owner) -> Option<CpuMask> {
+    if owner == NO_OWNER {
+        return None;
+    }
+    let placed = PLACED.with(|p| p.get())?;
+    (placed.owner == owner && count(here) == 1 && contains(here, placed.home))
+        .then_some(placed.wide)
 }
 
 impl Drop for LeaderPin {
@@ -642,18 +776,28 @@ pub(crate) fn home_of(placement: &Placement) -> Home {
     placement.get(0).map_or(0, |cpu| cpu + 1)
 }
 
-/// Pins the calling thread onto `home` for one section or scope and gives it its
-/// own mask `S` back when the returned guard drops (also on unwind).
+/// Pins the calling thread onto `home` and keeps it there: the set `S` the thread
+/// has is recorded under `owner` ([`hold`]), which gives it back ([`release`]) when
+/// the team token drops. `Some` when this call pinned the thread for this section
+/// only, because a placement was already recorded on it: the caller holds that
+/// guard for the section, as before. The token's own pin is silent.
 ///
-/// The leader of a [`Team`](crate::Team) token calls this before every section
-/// it dispatches without opening a team scope: it then opens the section on the
-/// one CPU no member takes, and is not confined to it afterwards. `None`, and
-/// nothing changed, when the team placed nothing (`home` is `0`), when its own
-/// mask is one CPU (a pinned member whose CPU it must keep, and also a leader an
-/// enclosing placement already confined to one CPU) or does not hold `home` (a
-/// caller that narrowed itself away from it: a leader is never moved outside the
-/// mask its caller gave it), when the current mask has left the placement this
-/// thread already has (see below), or when the kernel refuses.
+/// A team token calls this before every outermost section it dispatches without
+/// opening a team scope (`fork`, `for_ranges`, `broadcast`) and before a
+/// reborrowed scope, and keeps no guard of its own: the token holds the pin for
+/// its whole life, so the leader stays off the CPUs its members hold between
+/// sections instead of landing on one of them, and the next section finds it
+/// already home. That cheap path costs one kernel call, the read that proves it:
+/// the caller may have moved the thread under the token, so the mask is compared
+/// with `{home}` rather than assumed, and both `sched_setaffinity` calls are
+/// skipped when they agree (threadteam-rs#77).
+///
+/// Nothing changes when the team placed nothing (`home` is `0`), when the mask is
+/// one CPU (a pinned member whose CPU it must keep, or a leader this thread has
+/// already placed), when the mask does not hold `home` (a caller that narrowed
+/// itself away from it: a leader is never moved outside the mask its caller gave
+/// it), when the mask has left the placement this thread already has (see below),
+/// or when the kernel refuses.
 ///
 /// A thread this crate placed is *not* a reason to decline by itself. A placed
 /// leader runs on `{S[0]}`; [`widened`] puts `S` back for the duration of one
@@ -664,10 +808,16 @@ pub(crate) fn home_of(placement: &Placement) -> Home {
 /// belongs to it (`here ⊆ placed.wide`). A mask that reaches outside that
 /// placement is a widening of the caller's own doing, and placing the thread
 /// there would move it out of the set its caller gave it, so it is refused.
-pub(crate) fn home_pin(home: Home) -> Option<LeaderPin> {
+pub(crate) fn home_pin(home: Home, owner: Owner) -> Option<LeaderPin> {
     let home = home.checked_sub(1)?;
     let here = read_here()?;
-    if count(&here) < 2 || !contains(&here, home) {
+    if count(&here) == 1 {
+        // Already home: the pin this thread holds is in force, and no
+        // `sched_setaffinity` is needed to keep it. A one-CPU mask that is not
+        // home belongs to a pinned member, whose CPU it must keep.
+        return None;
+    }
+    if !contains(&here, home) {
         return None;
     }
     if let Some(placed) = PLACED.with(|p| p.get()) {
@@ -675,7 +825,7 @@ pub(crate) fn home_pin(home: Home) -> Option<LeaderPin> {
             return None;
         }
     }
-    LeaderPin::enter(&here, home)
+    place_leader(&here, home, owner)
 }
 
 /// Runs `f` with the calling thread's mask widened to `S` when it leads a
@@ -1161,7 +1311,7 @@ mod tests {
         );
 
         assert!(
-            home_pin(home + 1).is_none(),
+            home_pin(home + 1, next_owner()).is_none(),
             "a second placement in the same scope is refused"
         );
         assert_eq!(
@@ -1176,6 +1326,51 @@ mod tests {
             width,
             "the set comes back when the placement ends"
         );
+    }
+
+    /// A pin a team token holds answers for that token only: a scope of another
+    /// team, or of a plain pool token, reads the one-CPU mask and places nobody
+    /// instead of mapping its members onto the CPUs this team is using
+    /// (threadteam-rs#77).
+    #[test]
+    fn a_held_pin_answers_only_for_the_token_that_holds_it() {
+        let Some(wide) = read_here() else {
+            return; // not Linux, or no affinity support: nothing to place
+        };
+        if count(&wide) < 2 {
+            return; // one allowed CPU: the placement is skipped by design
+        }
+        let home = Placement::of(&wide, PinStrategy::Pack, 1)
+            .get(0)
+            .expect("a CPU in a non-empty mask");
+        let owner = next_owner();
+        if !super::place(&wide, home, owner) {
+            eprintln!("skipped: the kernel refused to pin this thread");
+            return;
+        }
+        let here = read_here().expect("a mask to read");
+        assert_eq!(count(&here), 1, "the pin narrowed this thread");
+        assert_eq!(
+            placed_set(&here, owner).map(|set| count(&set)),
+            Some(count(&wide)),
+            "its own token gets the set it leads in"
+        );
+        for (owner, why) in [
+            (next_owner(), "a token of another team"),
+            (NO_OWNER, "a plain pool token"),
+        ] {
+            assert!(
+                placed_set(&here, owner).is_none(),
+                "{why} is told nothing and places nobody"
+            );
+        }
+        release(owner);
+        assert_eq!(
+            count(&read_here().expect("a mask to read")),
+            count(&wide),
+            "the token gives the set back"
+        );
+        assert!(placed_set(&wide, owner).is_none(), "and records nothing");
     }
 
     /// threadteam-rs#62: the CPU count is read once per thread, and a mask

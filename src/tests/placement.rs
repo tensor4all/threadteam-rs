@@ -4,6 +4,7 @@
 
 use crate::awake::{Geometry, Section};
 use crate::{Exec, PinStrategy, Pool};
+use core::num::NonZeroUsize;
 use std::time::Duration;
 
 fn own_cpus() -> Vec<usize> {
@@ -691,4 +692,145 @@ fn a_pool_with_pinning_off_never_refreshes_the_count() {
         drop(exec);
     }
     assert!(set_own_cpus(&all), "restoring the calling thread mask");
+}
+
+/// threadteam-rs#77: an outermost section of a team token finds the leader
+/// already placed on the CPU no member takes, and pins nothing. The check counts
+/// the placements this thread made (`pin::leader_pins`), so a section that re-pins
+/// the leader shows up however the mask happens to look: the leader is home either
+/// way, and only the syscalls tell "held" from "taken again and given back".
+///
+/// The second half is what keeps the count honest: a token minted per section
+/// holds its own pin, so the counter does move there.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_outermost_section_does_not_re_pin_the_leader() {
+    let set = own_cpus();
+    if set.len() < 3 {
+        eprintln!("skipped: need at least 3 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let team = pool(width).into_team(width).expect("an idle pool");
+    let home = vec![set[0]];
+    let mut exec = team.exec(width);
+    let before = crate::pin::leader_pins();
+    for _ in 0..8 {
+        // Every outermost entry a token dispatches without opening a scope.
+        exec.reborrow()
+            .for_ranges(width, NonZeroUsize::MIN, |_r| {});
+        exec.reborrow().fork(width, |_, _| {});
+        let _ = exec.reborrow().broadcast(|_i| {});
+        assert_eq!(
+            own_cpus(),
+            home,
+            "the leader stays on the CPU no member takes"
+        );
+    }
+    assert_eq!(
+        crate::pin::leader_pins() - before,
+        1,
+        "one pin for the token, none for its sections"
+    );
+    assert_eq!(own_cpus(), home, "the pin is in force between sections");
+    drop(exec);
+    assert_eq!(own_cpus(), set, "the token gives the caller its set back");
+
+    let per_token = crate::pin::leader_pins();
+    for _ in 0..8 {
+        team.exec(width)
+            .for_ranges(width, NonZeroUsize::MIN, |_r| {});
+    }
+    assert_eq!(
+        crate::pin::leader_pins() - per_token,
+        8,
+        "a token minted per section holds a pin of its own"
+    );
+    assert_eq!(own_cpus(), set, "and gives it back with the token");
+}
+
+/// threadteam-rs#77: a token whose leader already holds the pin still places its
+/// members when it opens a whole-team root scope. The leader runs on `{S[0]}` and
+/// cannot read `S` from its own mask, so `exec::pin_scope` takes the set from the
+/// placement the token holds (`pin::placed_set`); without that the scope would
+/// read one CPU, place nobody and count a skip.
+#[test]
+fn a_scope_of_a_placed_token_still_places_its_members() {
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let width = set.len().min(4);
+    let team = pool(width).into_team(width).expect("an idle pool");
+    let mut exec = team.exec(width);
+    // The token's pin, taken by an outermost section.
+    exec.reborrow()
+        .for_ranges(width, NonZeroUsize::MIN, |_r| {});
+    assert_eq!(own_cpus(), vec![set[0]], "the leader is home");
+    let skips = team.pool().pin_skips();
+    let seen = std::sync::Mutex::new(Vec::new());
+    exec.team(|mut team| {
+        team.reborrow().run_with(|p| {
+            seen.lock().unwrap().push((p.index(), own_cpus()));
+        });
+    })
+    .expect("the token opens its scope");
+    assert_eq!(
+        team.pool().pin_skips(),
+        skips,
+        "the scope places the members from the set the token holds"
+    );
+    let mut rows = seen.into_inner().unwrap();
+    rows.sort_by_key(|&(index, _)| index);
+    assert_eq!(rows.len(), width, "every participant ran a share");
+    assert_eq!(rows[0].1, vec![set[0]], "the leader stays home");
+    let members: Vec<usize> = rows[1..].iter().map(|(_, mask)| mask[0]).collect();
+    let mut sorted = members.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        sorted.len(),
+        width - 1,
+        "each member on its own CPU: {members:?}"
+    );
+    assert!(
+        !members.contains(&set[0]),
+        "and none of them on the leader's CPU: {members:?}"
+    );
+    assert_eq!(own_cpus(), vec![set[0]], "the pin survives the scope");
+    drop(exec);
+    assert_eq!(own_cpus(), set, "the token gives the caller its set back");
+}
+
+/// threadteam-rs#77: a root scope of *another* pool entered while this thread
+/// holds a team token's leader pin still reads the one-CPU mask and places
+/// nobody, as it did before. `pin::placed_set` answers only for the token that
+/// holds the pin: another pool's members would otherwise be mapped onto the CPUs
+/// of a team that is still using them.
+#[test]
+fn a_root_scope_of_another_pool_places_nobody_on_a_held_leader() {
+    let set = own_cpus();
+    if set.len() < 4 {
+        eprintln!("skipped: need at least 4 allowed CPUs");
+        return;
+    }
+    let team = pool(2).into_team(2).expect("an idle pool");
+    let mut exec = team.exec(2);
+    exec.reborrow().for_ranges(2, NonZeroUsize::MIN, |_r| {});
+    assert_eq!(own_cpus(), vec![set[0]], "the token's leader is home");
+    let other = pool(3);
+    let skips = other.pin_skips();
+    Exec::new(&other, 3)
+        .expect("a token of another pool")
+        .team(|_| {})
+        .expect("a root scope of another pool opens");
+    assert_eq!(
+        other.pin_skips(),
+        skips + 1,
+        "a one-CPU leader places no member of another pool"
+    );
+    assert_eq!(own_cpus(), vec![set[0]], "and the token's pin is untouched");
+    drop(exec);
+    assert_eq!(own_cpus(), set, "the token gives the caller its set back");
 }

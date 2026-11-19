@@ -585,14 +585,14 @@ of the samples showed leader and member runnable on one CPU, only 1 % had the
 leader on `S[0]`, and the calls ran 5-38x slower than unpinned.
 
 **The rule: the leader is pinned to `S[0]` for the life of the team scope**, and
-for one section when a token of a `Team` dispatches one without opening a scope
-(see "A `Team`'s leader" below). One
-`sched_setaffinity` at scope entry (or at section entry), one at its exit (a
-guard, so also on unwind), and nothing in between for a `TeamExec` dispatch: no
-per-section check, no move and restore around it. A *token* section dispatched
-inside the scope is the exception the next subsection describes: with a nonzero
-`home` it calls `home_pin`, which reads the mask and declines, so it pays the read
-and no write.
+for the life of a `Team` *token* when one dispatches sections without opening a
+scope (see "A `Team`'s leader" below). One `sched_setaffinity` when the pin is
+taken, one when it ends (a guard, so also on unwind), and nothing in between for
+a `TeamExec` dispatch: no per-section check, no move and restore around it. An
+outermost *token* entry dispatched while the token's pin is in force is the
+exception the next subsection describes: it calls `home_pin`, which reads the
+mask, finds `{S[0]}` and declines, so it pays one `sched_getaffinity` and no
+write.
 Members keep one CPU of `S` each, `P[k]` for `k >= 1` (which CPUs is the
 `PinStrategy` below; `P[0]` is always `S[0]`). Arm B above is this rule for a
 scope.
@@ -821,8 +821,9 @@ How it works:
 
 The members' pins are owned by the authority over them and set and cleared by
 the sections that pin and unpin them; the leader's pin is not part of that
-placement, it belongs to one root scope, or to one section of a `Team` token
-that opens none, and is held by a guard in that scope's or section's frame.
+placement, it belongs to one root scope, or to the `Team` token whose sections
+open none, and is held by a guard in that scope's frame or by the token itself
+(`pin::Owner`, `pin::release`).
 
 * **Scoped acquisition** (`Exec::team` on a plain token): the members are
   reserved, and pinned, for the scope only; they restore their masks when the
@@ -830,11 +831,10 @@ that opens none, and is held by a guard in that scope's or section's frame.
 * **Persistent `Team`** (`Pool::into_team`): the members stay reserved, and
   pinned, from the pin section of a root scope (the first one is the
   acknowledgement scope of `into_team`) until an unpin section or the end of
-  the `Team`. The leader is pinned to `S[0]` during each such root scope and
-  has `S` again when it closes; a section that a token of the team dispatches
-  without a scope pins it for that section and gives `S` back when the section
-  returns (see "A `Team`'s leader"). Between scopes and between sections the
-  leader, and the thread that called `into_team`, keep their own mask.
+  the `Team`. The leader is pinned to `S[0]` from the first entry a token of the
+  team dispatches, scope or section, until that token drops, and has `S` back
+  then (see "A `Team`'s leader"); `into_team` itself pins nothing, and the thread
+  that called it keeps its own mask until it mints a token.
 * **Only a root scope over the whole team changes the placement.** A root
   token from `Team::exec(budget)` with a smaller budget (or narrowed by
   `limit`) carries only the first `budget - 1` members. Letting it pin or unpin
@@ -852,9 +852,8 @@ that opens none, and is held by a guard in that scope's or section's frame.
   spread over" is still `|S|`, and oversubscription is the second question.
   `pin::available` answers `|S|` on a thread this crate placed (it reads the
   thread's `PLACED` record), and `Team::token` and `Exec::team_with` measure
-  oversubscription between placements, where the surprise cannot happen: the
-  leader of a `Team` is no longer pinned between sections, so the caller's own
-  mask is the team's set. 0.5.0 answered 1 on the team-pinned thread, so every
+  oversubscription on the mask of the thread that enters them, which for a
+  `Team` token is the caller's own set (a mint pins nothing, threadteam-rs#77). 0.5.0 answered 1 on the team-pinned thread, so every
   token a `Team` minted there was marked oversubscribed and its members ran with
   `THROTTLED_POLLS` (threadteam-rs#33). A team whose `S` is genuinely too small
   places no leader, so it is still paced by its mask.
@@ -874,48 +873,48 @@ again. That is the path reported in #33 (`fork_sized` at width 96 on a 96-CPU
 two-socket host: 7 of 16 processes at about 11 ms per call instead of about 5.8
 ms, leaders off `S[0]`).
 
-**The rule: the leader's pin belongs to the section** (tensor4all/threadteam-rs#52).
-`into_team` pins nothing: the caller gets its own mask back the moment the
-acknowledgement scope ends, and the team's tokens place their leader only for
-the section (or reborrowed scope) they dispatch. The team keeps one record of
-where its members are, `pin::Home` — `S[0]` of the set the last whole-team root
-scope placed them in, `0` for none — written by that scope and read by every
-section. A team token the calling thread leads opens every section it dispatches
-outside a scope (`fork`, `fork_sized`, `for_ranges`, `broadcast`) with one
-`sched_setaffinity` onto `home` and one back to its own mask at the end of the
-section, also on unwind (`pin::home_pin`, a guard); a section inside a team
-scope is already covered by the scope's pin and is not pinned again, because the
-mask this thread reads there is the one CPU it was placed on and a mask of one CPU
-is never narrowed. So the leader is on `S[0]` while a section runs, which is what
-#33 is about, at one `sched_getaffinity` and two `sched_setaffinity` calls per
-outermost section (2.1 us on an empty 8-way section). A token section
-(`Exec::fork`, `for_ranges`, `broadcast`, a reborrowed team scope) with a nonzero
-`home` inside a placed scope reads the mask and is refused by it, so it pays that
-one `sched_getaffinity` and no `sched_setaffinity`. The read is what buys the
-refusal, not a memory of the enclosing scope — and it comes after the `home`
-test, so a team whose placement is `0` (pinning off, or a scope that placed
-nobody) pays neither. A `TeamExec` section
-(`run`, `run_with`) dispatches without calling `home_pin` at all, so it pays no
-affinity call either way. A token section inside `TeamExec::external` reads `S`
-back and is pinned in full, on the nested team's home (threadteam-rs#54). The scope itself pays one pin (`LeaderPin` for a
-whole-team scope, `home_pin` for one that is narrower). The
-leader is placed for a scope that is not the root token's too (a reborrow, which
-carries no leader guard of its own: faer's `with_team` shape), and for a child
-that was handed out without a dispatch of its own (`fork_sized` with one share
-runs inline). Three things are never placed by `home_pin`, which is what a token
-section or a reborrowed scope uses: a thread whose own mask has one CPU or does
-not hold `home` (a reserved member pinned to `S[k]`, a caller that narrowed
-itself away from `S[0]`; a leader is never moved outside the mask its caller gave
-it), a child that a member leads (its share was not given the leader's CPU), and a
-thread whose mask has left the placement it already has — a caller that widened
-itself out of `S` — which is refused rather than moved outside that placement.
-Being placed is not itself a reason to decline: a team scope entered inside
-`TeamExec::external` places this thread on the nested team's home and puts the
-enclosing placement back when it ends (threadteam-rs#54). A whole-team root scope
-is not described by this list either: it places through `pin_scope`, which reads
-the caller's mask as the scope's own set and enters `LeaderPin` with it, and then
-attempts `home_pin` (`src/exec.rs:1045`, `:1055`) — a no-op there, since the
-mask is already the one CPU the scope pinned, and it costs the read.
+**The rule: the leader's pin belongs to the token** (tensor4all/threadteam-rs#52,
+#77). `into_team` pins nothing: the caller gets its own mask back the moment the
+acknowledgement scope ends, and a team token pins its leader from its first
+outermost entry until the token drops. The team keeps one record of where its
+members are, `pin::Home` — `S[0]` of the set the last whole-team root scope placed
+them in, `0` for none — written by that scope and read by every entry. A team
+token the calling thread leads takes the pin on its first outermost section
+(`fork`, `fork_sized`, `for_ranges`, `broadcast`) or scope: one
+`sched_setaffinity` onto `home`, recorded under the token's `pin::Owner`, and one
+back to its own mask when the token drops, also on unwind (`pin::hold`,
+`pin::release`, run by the token's `LeaderGuard`). The entries in between read the
+mask, find `{S[0]}` and skip both calls (`pin::home_pin`); a section inside a team
+scope is already covered and pays the read alone. So the leader is on `S[0]` while
+every section runs, which is what #33 is about, at one `sched_getaffinity` per
+outermost entry instead of the `sched_getaffinity` plus two `sched_setaffinity` of
+0.6.0 (measured: 2772 ns to 2779 ns an empty `reborrow().team(..)` on evo_vpn,
+209 ns here; see below). A token section with a nonzero `home` inside a placed
+scope reads the mask and is refused by it, so it pays that one `sched_getaffinity`
+and no `sched_setaffinity`. The read is what buys the refusal, not a memory of the
+enclosing scope — and it comes after the `home` test, so a team whose placement is
+`0` (pinning off, or a scope that placed nobody) pays neither. A `TeamExec`
+section (`run`, `run_with`) dispatches without calling `home_pin` at all, so it
+pays no affinity call either way. A token section inside `TeamExec::external`
+reads `S` back and is pinned in full, on the nested team's home
+(threadteam-rs#54); that pin is taken for the section only, since the enclosing
+`external` call owns the mask and puts `{S[0]}` back. The leader is placed for a
+scope that is not the root token's too (a reborrow, which carries no leader guard
+of its own: faer's `with_team` shape), and for a child that was handed out without
+a dispatch of its own (`fork_sized` with one share runs inline). Three things are
+never placed by `home_pin`, which is what a token section or a reborrowed scope
+uses: a thread whose own mask has one CPU or does not hold `home` (a reserved
+member pinned to `S[k]`, a caller that narrowed itself away from `S[0]`; a leader
+is never moved outside the mask its caller gave it), a child that a member leads
+(its share was not given the leader's CPU), and a thread whose mask has left the
+placement it already has — a caller that widened itself out of `S` — which is
+refused rather than moved outside that placement. Being placed is not itself a
+reason to decline: a team scope entered inside `TeamExec::external` places this
+thread on the nested team's home and puts the enclosing placement back when it
+ends (threadteam-rs#54). A whole-team root scope places through `pin_scope`,
+which reads the caller's mask as the scope's own set, or takes `S` from the
+placement record when this thread's own token already holds the leader there
+(`pin::placed_set`), and places the members.
 
 Why not the `Team`-held pin of #45: it keeps the calling thread on `{S[0]}` for
 the life of the team, and the caller's thread is not ours. `tenferro`'s
@@ -923,10 +922,26 @@ the life of the team, and the caller's thread is not ours. `tenferro`'s
 engine, keeps the `Team` for the engine's life, and constructs its vendor
 backend from that same thread, so a lazily created MKL/OpenBLAS thread pool, any
 plain `std::thread::spawn`, and a second `Pool` built there all inherited a
-one-CPU mask (measured on evo2, 32 CPUs, width 8, see #52). Why not the same pin
-held by the token instead: a token is not the unit that needs the pin either,
-and a guard that is entered on one thread and dropped on another has to restore
-nothing on the second one, which the section guard cannot get wrong.
+one-CPU mask (measured on evo2, 32 CPUs, width 8, see #52). That is why the pin
+is not the `Team`'s.
+
+**The token is the unit that needs it (threadteam-rs#77).** A token cannot
+outlive its `Team` (it borrows it), and the caller decides how long a token
+lives, so the token is the longest-lived authority whose pin does not hold the
+creating thread past `into_team`. 0.6.0 pinned per section instead, which cost
+one `sched_getaffinity` and two `sched_setaffinity` per outermost entry and left
+the leader wide in between, where it landed on a member's CPU: 2772-2779 ns for
+an empty `reborrow().team(|_| ())` and 3286-3809 ns for an empty
+`reborrow().for_ranges(..)` on evo_vpn (8 allowed CPUs, one L3 domain, boost 0),
+against 6 ns and 448-1107 ns on 0.5.1. Holding the pin for the token brings those
+back to 209 ns and 626-1141 ns, one `sched_getaffinity` per entry and no write,
+and keeps the leader off the members' CPUs between sections. A token minted per
+call (`team.exec(w)` per operation) still pays one narrow and one widen per
+token: that shape asks for the caller's own mask back between tokens (#52), and
+its empty section measures 3729-4351 ns, as 0.6.0's did. A token that is entered
+on one thread and dropped on another releases nothing, as in 0.5, because the
+placement record and the mask are per thread; the drop only restores when the
+record's `Owner` is the token's own (a `Team` is `Send`, so this is reachable).
 
 The record belongs to the team. A `Team` is `Send` and `Sync`: a token used on
 another thread places that thread for its sections too, from the same record,

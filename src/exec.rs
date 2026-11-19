@@ -118,6 +118,13 @@ pub(crate) struct TeamAuth<'p> {
     /// `placement` reads its leader's node from the home instead, which a later
     /// whole-team scope may move.
     pub(crate) lead_node: u16,
+    /// The owner the leader's pin is recorded under (`pin::Owner`): the id of the
+    /// root token this one descends from, whose drop gives the calling thread its
+    /// own set back (`pin::release`), or `pin::NO_OWNER` on a team of one
+    /// participant. Carried by `reborrow`, `limit` and `fork` children, so the
+    /// sections of all of them hold and keep the one pin of the token
+    /// (threadteam-rs#77).
+    pub(crate) owner: crate::pin::Owner,
 }
 
 impl TeamAuth<'_> {
@@ -727,11 +734,11 @@ impl<'p> Exec<'p> {
         };
         match (self.team, self.pool) {
             (Some(t), _) if tasks > 1 => {
-                // A team token places itself on the CPU no member takes for the
-                // section, and has its own mask back when it ends (see
-                // `pin::home_pin`). Share 0 runs on the calling thread, the
-                // leader; the others are led by members.
-                let _home = crate::pin::home_pin(placement_home(t));
+                // The token's leader is pinned on the CPU no member takes for
+                // the section, and stays there between sections; this call finds
+                // it there (see `pin::home_pin`). Share 0 runs on the calling
+                // thread, the leader; the others are led by members.
+                let _home = crate::pin::home_pin(placement_home(t), t.owner);
                 split_raw(Some(t.awake), t.ids, plan, t.over, |k, ids| {
                     body(k, Some(ids));
                 });
@@ -789,7 +796,7 @@ impl<'p> Exec<'p> {
         };
         match (self.team, self.pool) {
             (Some(t), _) if tasks > 1 => {
-                let _home = crate::pin::home_pin(placement_home(t));
+                let _home = crate::pin::home_pin(placement_home(t), t.owner);
                 spread_raw(Some(t.awake), t.ids, tasks, t.over, body);
             }
             (None, Some(pool)) if tasks > 1 => sched::run_tasks(pool, tasks, track, body),
@@ -858,7 +865,7 @@ impl<'p> Exec<'p> {
             let _released = self.track.release();
             let track = &self.track;
             let _home = if self.budget.get() > 1 {
-                crate::pin::home_pin(placement_home(t))
+                crate::pin::home_pin(placement_home(t), t.owner)
             } else {
                 None
             };
@@ -1028,9 +1035,11 @@ impl<'p> Exec<'p> {
     /// affinity mask, which decides two things. With
     /// [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants) on
     /// (the default) it places every member on its own CPU of that mask and pins
-    /// the leader to the first CPU of the mask until the scope ends (a vendor
-    /// call from the leader goes through [`TeamExec::external`], which widens it
-    /// for that call). A scoped acquisition is placed for the scope; a root
+    /// the leader to the first CPU of the mask, for the scope of a plain token
+    /// and for the whole life of a [`Team`](crate::Team) token, whose first
+    /// entry takes that pin and whose drop gives the set back (a vendor call
+    /// from the leader goes through [`TeamExec::external`], which widens it for
+    /// that call). A scoped acquisition is placed for the scope; a root
     /// token of a [`Team`](crate::Team) with the whole team's budget places the
     /// team's members until a later such scope re-places or unpins them or the
     /// `Team` ends. A root token of a
@@ -1128,7 +1137,7 @@ impl<'p> Exec<'p> {
                 // scope that ran no section (pinning off, no CPU set) leaves the
                 // placement as it was.
                 let _pin = if t.ids.len() == t.reserved && team.size().get() > 1 {
-                    pin_scope(&mut team, t.placement)
+                    pin_scope(&mut team, t.placement, t.owner)
                 } else {
                     None
                 };
@@ -1138,7 +1147,7 @@ impl<'p> Exec<'p> {
                 // pinned to (threadteam-rs#53). A no-op after `pin_scope` placed
                 // the leader, which left this thread's `PLACED` record set.
                 let _home = if team.size().get() > 1 {
-                    crate::pin::home_pin(placement_home(t))
+                    crate::pin::home_pin(placement_home(t), t.owner)
                 } else {
                     None
                 };
@@ -1146,9 +1155,9 @@ impl<'p> Exec<'p> {
             }
             // A reborrow or a child of the root token: this scope places no
             // members (the whole-team scope that set the placement did), but the
-            // leader still runs its shares here and is placed for the scope.
+            // leader still runs its shares here and goes home first.
             let _home = if team.size().get() > 1 {
-                crate::pin::home_pin(placement_home(t))
+                crate::pin::home_pin(placement_home(t), t.owner)
             } else {
                 None
             };
@@ -1192,7 +1201,7 @@ impl<'p> Exec<'p> {
         // pinning the participants acknowledge as before. The guard gives the
         // leader its mask back when the scope ends or unwinds.
         let pin = if team.size().get() > 1 {
-            pin_scope(&mut team, None)
+            pin_scope(&mut team, None, crate::pin::NO_OWNER)
         } else {
             None
         };
@@ -1264,18 +1273,27 @@ struct ScopePin(#[allow(dead_code)] Option<crate::pin::LeaderPin>);
 ///
 /// The placement is the team's (`placement`, the [`Team`](crate::Team)'s
 /// `pin::Home`): this scope writes it, so a later section or reborrowed scope of
-/// any token of the team puts its leader on the CPU no member takes.
+/// any token of the team puts its leader on the CPU no member takes. The leader's
+/// pin is the token's (`owner`), not this scope's, except for a plain pool token,
+/// which has none and pins its leader for the scope.
 ///
 /// `None` when participant pinning is off for this pool, when the platform has
 /// no CPU set (off Linux), or when the calling thread's mask could not be read:
 /// then nothing ran and the caller acknowledges as usual. `Some` when a section
 /// ran (pin or unpin), which also served as the acknowledgement; keep the guard
 /// alive for the scope.
-fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option<ScopePin> {
+fn pin_scope(
+    team: &mut TeamExec<'_>,
+    placement: Option<&AtomicUsize>,
+    owner: crate::pin::Owner,
+) -> Option<ScopePin> {
     let awake = team.awake.filter(|awake| awake.pin)?;
     // The leader reads its own mask: that set is where the team is placed, and
-    // the leader's mask is that set again once the scope has closed.
-    let Some(set) = crate::pin::read_here() else {
+    // the leader's mask is that set again once the scope has closed. A leader a
+    // token has already pinned runs on `{S[0]}` and would place nobody from it;
+    // placement it holds still knows `S` (`pin::placed_set`), and the scope then
+    // only places the members (threadteam-rs#77).
+    let Some(here) = crate::pin::read_here() else {
         // Nothing is placed; the members are wherever an earlier reservation
         // left them, which is not this team's placement.
         if awake.costs.team_row().has_multi_node() {
@@ -1283,6 +1301,7 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
         }
         return None;
     };
+    let (set, held) = crate::pin::placed_set(&here, owner).map_or((here, false), |s| (s, true));
     let cpus = crate::pin::count(&set);
     // This thread just read its own mask, which is the count a later mint on it
     // would need: hand the read to the memo, so a mask another library changed is
@@ -1311,9 +1330,14 @@ fn pin_scope(team: &mut TeamExec<'_>, placement: Option<&AtomicUsize>) -> Option
     // scope opens with the leader home too, and recorded for the sections and
     // reborrowed scopes that follow.
     let order = crate::pin::Placement::of(&set, awake.pin_strategy, team.size().get());
-    let leader = order
-        .get(0)
-        .and_then(|home| crate::pin::LeaderPin::enter(&set, home));
+    // The leader's pin belongs to the token, not to the scope: it is either
+    // already home (`held`) or placed now, under the token's owner, which gives
+    // `S` back when the token drops. A scope of a plain pool token has no owner
+    // and pins its leader for itself, as before.
+    let leader = match order.get(0) {
+        Some(home) if !held => crate::pin::place_leader(&set, home, owner),
+        _ => None,
+    };
     if let Some(placement) = placement {
         placement.store(crate::pin::home_of(&order), Ordering::Relaxed);
     }

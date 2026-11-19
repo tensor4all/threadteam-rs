@@ -426,11 +426,12 @@ fn leader_share(exec: Exec<'_>) -> (Option<usize>, Vec<usize>) {
 
 /// The thread that creates a `Team` keeps its own CPU set (#52): every token it
 /// mints dispatches with the leader on `{S[0]}` without opening a team scope
-/// (`fork_sized`, `for_ranges`, any budget), but only for the section, so
-/// `into_team`, the time between tokens and the team's drop all leave the
-/// caller's mask as they found it.
+/// (`fork_sized`, `for_ranges`, any budget), and **holds that pin until it
+/// drops**, so the leader stays off the CPUs its members hold between sections
+/// (threadteam-rs#77). `into_team`, and the caller after the token is dropped,
+/// see their whole set.
 #[test]
-fn a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer() {
+fn a_team_token_holds_its_leaders_pin_until_it_drops() {
     let _w = watchdog();
     let set = own_cpus();
     if set.len() < 3 {
@@ -447,11 +448,14 @@ fn a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer() {
     for round in 0..10 {
         let budget = if round % 2 == 0 { width } else { 2 };
         let mut exec = team.exec(budget);
+        // The token's pin: the leader is home from the first section on, and
+        // stays there between sections, which is what keeps it off the CPUs the
+        // members are pinned to (threadteam-rs#77).
         for call in 0..3 {
             let (cpu, mask) = leader_share(exec.reborrow());
             assert_eq!(mask, home, "round {round}, call {call}: the leader's share");
             assert_eq!(cpu, Some(set[0]), "round {round}, call {call}: its CPU");
-            assert_eq!(own_cpus(), before, "round {round}, call {call}: after it");
+            assert_eq!(own_cpus(), home, "round {round}, call {call}: still placed");
         }
         // The masks the ranges ran under: the leader's chunk must be on home,
         // which is what `home_pin` in `Exec::for_ranges` is for. Without the
@@ -465,7 +469,13 @@ fn a_team_places_its_leader_for_the_sections_it_dispatches_and_no_longer() {
             masks.contains(&home),
             "round {round}: for_ranges ran the leader off {home:?}: {masks:?}"
         );
-        assert_eq!(own_cpus(), before, "round {round}: between tokens");
+        // `for_ranges` consumed the token, so its drop just gave the caller its
+        // own set back.
+        assert_eq!(
+            own_cpus(),
+            before,
+            "round {round}: the caller after the token"
+        );
     }
     assert_eq!(team.pool().pin_skips(), 0);
     drop(team);
@@ -665,10 +675,14 @@ fn a_reborrowed_team_token_places_its_leader_for_the_scope() {
         .expect("a reborrowed team token opens its scope");
     assert_eq!(
         seen.into_inner().unwrap(),
-        Some(home),
+        Some(home.clone()),
         "the leader's mask in its share"
     );
-    assert_eq!(own_cpus(), before, "the caller's mask after the scope");
+    // A scope of a reborrowed token does not end the leader's pin either: the
+    // token holds it (threadteam-rs#77).
+    assert_eq!(own_cpus(), home, "the leader's mask after the scope");
+    drop(exec);
+    assert_eq!(own_cpus(), before, "the caller's mask after the token");
 }
 
 /// A child token that was handed out without a dispatch of its own
@@ -1863,10 +1877,12 @@ fn the_default_spread_strategy_keeps_the_leader_and_member_invariants() {
             assert_eq!(own_cpus(), home, "round {round}: and puts S[0] back");
         })
         .expect("a team token opens its scope");
-        assert_eq!(own_cpus(), before, "round {round}: S after the scope");
+        assert_eq!(own_cpus(), home, "round {round}: the leader's pin after it");
         let (_, mask) = leader_share(exec.reborrow());
         assert_eq!(mask, home, "round {round}: the leader for one section");
-        assert_eq!(own_cpus(), before, "round {round}: S between sections");
+        assert_eq!(own_cpus(), home, "round {round}: the pin between sections");
+        drop(exec);
+        assert_eq!(own_cpus(), before, "round {round}: S after the token");
     }
     let pool = team.into_pool();
     assert_eq!(own_cpus(), before, "the leader's mask after the team");

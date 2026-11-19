@@ -219,7 +219,8 @@ impl Pool {
     }
 
     /// Whether the pool places the participants of a root team scope (see
-    /// [`PoolBuilder::pin_participants`]); the leader is pinned to `S[0]` for the scope.
+    /// [`PoolBuilder::pin_participants`]); the leader is pinned to `S[0]`, for the
+    /// scope of a plain token and for the life of a [`Team`](crate::Team) token.
     ///
     /// # Examples
     ///
@@ -677,10 +678,14 @@ impl PoolBuilder {
     /// [`Team`](crate::Team)) reads **its own** affinity mask `S` with
     /// `sched_getaffinity`, then:
     ///
-    /// * the leader pins itself onto `S[0]` for the life of the scope: one
-    ///   `sched_setaffinity` at scope entry and one at scope exit (which also
-    ///   runs on unwind) giving it `S` back, and nothing in between: no check
-    ///   and no move before a section;
+    /// * the leader pins itself onto `S[0]`: one `sched_setaffinity` at scope
+    ///   entry and one at scope exit (which also runs on unwind) giving it `S`
+    ///   back for a plain pool token, and for the whole life of a
+    ///   [`Team`](crate::Team) token, whose first entry takes that pin and whose
+    ///   drop gives `S` back. Inside the scope nothing checks and nothing moves
+    ///   the leader before a section — and neither does a section of a token
+    ///   that already holds the pin, which reads the mask, finds `{S[0]}` and
+    ///   skips both writes (threadteam-rs#77);
     /// * every member pins itself with `sched_setaffinity` onto one CPU of `S`
     ///   other than `S[0]`, no two on one CPU. Which CPUs is the
     ///   [`pin_strategy`](Self::pin_strategy): by default round-robin over the
@@ -698,8 +703,8 @@ impl PoolBuilder {
     /// 1.7 ms on one thread), so a team that cannot be placed is not placed
     /// badly.
     ///
-    /// **The leader is pinned for a scope or a section, and widened for vendor
-    /// calls.** A vendor library
+    /// **The leader is pinned for a scope, or for the life of a team token, and
+    /// widened for vendor calls.** A vendor library
     /// (OpenMP, OpenBLAS, a LAPACK provider) creates its thread team from the
     /// thread that calls it, and a team created from a one-CPU thread silently
     /// confines the whole provider team to that CPU — measured at 3-20x slower
@@ -710,9 +715,10 @@ impl PoolBuilder {
     /// region; a refused syscall leaves the thread as it was). A member that
     /// makes such a call uses [`Exec::external`](crate::Exec::external), which
     /// restores the member's own mask. A scope with no vendor call pays nothing.
-    /// A leader outside a scope and between the sections of a
-    /// [`Team`](crate::Team) token has its whole mask, so a vendor call there
-    /// needs no widening.
+    /// A plain pool token's leader has its whole mask outside a scope, so a
+    /// vendor call there needs no widening; the leader of a live
+    /// [`Team`](crate::Team) token is on `{S[0]}` between its sections as well and
+    /// does need it (or the token dropped first, threadteam-rs#77).
     ///
     /// A member saves its previous mask in its own slot and restores it
     /// *itself* before it stops being reserved: before it returns to Rayon, and

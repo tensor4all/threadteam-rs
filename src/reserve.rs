@@ -19,13 +19,26 @@ struct Gate {
 }
 
 /// Held by the root token of a [`Team`]; dropping the token hands the
-/// leadership to the next waiting thread.
-pub(crate) struct LeaderGuard<'t>(&'t Gate);
+/// leadership to the next waiting thread, and gives the calling thread the CPU
+/// set its leader pin took from it (`pin::release`) if the token's sections took
+/// one.
+pub(crate) struct LeaderGuard<'t> {
+    gate: &'t Gate,
+    owner: crate::pin::Owner,
+}
 
 impl Drop for LeaderGuard<'_> {
     fn drop(&mut self) {
-        *self.0.owner.lock().unwrap_or_else(PoisonError::into_inner) = None;
-        self.0.free.notify_one();
+        // On this thread: the pin is recorded in a thread-local placed by the
+        // token's own leader. A token dropped on another thread releases nothing,
+        // as no section of it pinned that thread.
+        crate::pin::release(self.owner);
+        *self
+            .gate
+            .owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = None;
+        self.gate.free.notify_one();
     }
 }
 
@@ -43,16 +56,17 @@ impl Drop for LeaderGuard<'_> {
 /// * The thread that creates the team leads it: with
 ///   [`PoolBuilder::pin_participants`](crate::PoolBuilder::pin_participants)
 ///   on (Linux), and when its CPU set `S` has a CPU for every participant,
-///   every section a token of this thread dispatches without opening a scope
-///   (`fork`, `for_ranges`, `broadcast`) and every scope that is not the root
-///   token's own opens with the leader on `S[0]`, the CPU no member takes, and
-///   the leader has its own mask back when the section or scope ends.
+///   the leader of a token is pinned onto `S[0]`, the CPU no member takes, from
+///   the first outermost section it dispatches without opening a scope (`fork`,
+///   `for_ranges`, `broadcast`) or the first scope it opens, **until the token
+///   drops**; then the thread has its own mask `S` back (threadteam-rs#77). The
+///   entries in between find the leader already home and pin nothing.
 ///   The members sit on CPUs of `S` other than `S[0]` from the acknowledgement scope of
 ///   `into_team` until the team is dropped, so each participant is on its own
-///   CPU. Nothing is pinned between sections: `into_team` returns with the
-///   calling thread's mask unchanged, and a vendor library or a plain thread
-///   started there inherits all of `S`. A token used on another thread places
-///   that thread the same way, inside its own mask.
+///   CPU. `into_team` pins nothing: it returns with the calling thread's mask
+///   unchanged, and a vendor library or a plain thread started there inherits
+///   all of `S` while no token of the team is alive. A token used on another
+///   thread places that thread the same way, inside its own mask.
 /// * `broadcast` runs on the reserved members (a `fork` child may broadcast
 ///   too: its members are its own); `can_broadcast` is always true.
 /// * `team` returns the carried (sub)team at once, without acquisition.
@@ -222,10 +236,11 @@ impl Pool {
                 Err(reason) => return Err(IntoTeamError { pool: self, reason }),
             };
         // Nothing is pinned here. The acknowledgement scope below places the
-        // members on `S` minus `S[0]` (`pin::order`) and records `S[0]` in `placement`, so the sections
-        // a token dispatches afterwards put the leader on that one CPU and give
-        // it its own mask back (`pin::home_pin`), while the calling thread keeps
-        // its mask between sections.
+        // members on `S` minus `S[0]` (`pin::order`) and records `S[0]` in
+        // `placement`, so the first outermost entry of a token afterwards puts
+        // the leader on that one CPU and holds it there until the token drops
+        // (`pin::home_pin`, `pin::release`), while the calling thread keeps its
+        // own mask between tokens.
         let team = Team {
             placement: AtomicUsize::new(0),
             reservation,
@@ -345,13 +360,29 @@ impl Team {
     fn token(&self, budget: usize) -> Exec<'_> {
         let budget = budget.clamp(1, self.size().get());
         let ids = &self.reservation.ids[..budget - 1];
+        // The leader's pin is the token's, not the section's: the first outermost
+        // section or scope of this token pins it (`pin::home_pin`, `pin_scope`) and
+        // records it under `owner`, and dropping the token gives the calling thread
+        // its own set back (`pin::release`). So the leader lands on `S[0]` once and
+        // stays off the CPUs its members hold until the token ends
+        // (threadteam-rs#77). Nothing is pinned here, so a thread that creates a
+        // team keeps its whole set for the vendor code that builds a thread pool
+        // from it (#52).
+        let owner = if self.size().get() > 1 {
+            crate::pin::next_owner()
+        } else {
+            crate::pin::NO_OWNER
+        };
         // Root-scope entry of the token: `exec` is serialized (one leader at a
         // time), so the calling thread's CPU set decides here whether the scope
         // is oversubscribed. When it is, the members' waits get the throttled
         // spin budget; otherwise the pool's. `Exec::team_with` on the minted token repeats
         // this on the thread that enters each scope, so a token that travels to
-        // a thread with a different CPU set is paced by that set. The leader is
-        // not pinned between sections, so its own mask is the set to measure.
+        // a thread with a different CPU set is paced by that set. This mint takes
+        // no pin, so the set it measures is the mask the calling thread has: `S`,
+        // or a narrower mask the caller gave it. `exec` panics when this thread
+        // already holds a token of the team, so the mask is never `{S[0]}` of
+        // another token of the same team.
         let oversubscribed = crate::pin::oversubscribed(budget);
         self.pool
             .awake
@@ -367,8 +398,16 @@ impl Team {
             placement: Some(&self.placement),
             // Read from `placement` while it is set.
             lead_node: crate::pin::NO_NODE,
+            owner,
         };
-        Exec::from_team(&self.pool, auth, LeaderGuard(&self.gate))
+        Exec::from_team(
+            &self.pool,
+            auth,
+            LeaderGuard {
+                gate: &self.gate,
+                owner,
+            },
+        )
     }
 }
 

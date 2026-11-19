@@ -32,6 +32,15 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ### Fixed
 
+- **The leader's pin is held for the life of a team token, not taken again at every outermost section**
+  (threadteam-rs#77). 0.6.0 pinned the leader for each outermost `fork`, `for_ranges` or `broadcast` of a token and
+  gave the caller its whole set back at the end of it: one `sched_getaffinity` and two `sched_setaffinity` per
+  entry, and a leader that sat on a member's CPU in between. The first outermost entry of a token now pins it under
+  the token's own owner id and dropping the token gives the caller its set back; every entry in between reads the
+  mask, finds `{S[0]}` and skips both writes. An empty `reborrow().team(|_| ())` at width 2/4/8 on evo_vpn went from
+  2772/2779/2774 ns to 209/210/210 ns (0.5.1: 6 ns), and an empty `reborrow().for_ranges(..)` from 3286/3440/3809 ns
+  to 626/782/1141 ns (0.5.1: 448/657/1107 ns). A token minted per call still takes one pin per token, so that shape
+  is unchanged (3729/3926/4351 ns against 3747/3925/4291 ns) and `into_team` still pins nothing (#52).
 - **A mint no longer writes the reserved members' spin budget when the value is unchanged**
   (#67). The field shares its cache line with `gen`, which waiting members poll, so the store
   invalidated one line per member per mint: at width 96 with spinning members a mint cost 15.2 µs

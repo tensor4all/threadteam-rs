@@ -813,9 +813,10 @@ How it works:
   of a `Team` that never opens a team scope (`exec.for_ranges(...)`,
   `fork_sized`, directly) is not re-pinned: its members keep the placement of
   the last whole-team root scope, or of `Pool::into_team`, and **its leader is
-  placed by the first outermost entry of the token and kept until the token
-  drops** (0.6.0 placed it again for each outermost section; see "A `Team`'s
-  leader").
+  placed by the first outermost section or scope entry of the token and kept
+  until the token drops on the thread that took it** (a token dropped on another
+  thread releases nothing; 0.6.0 placed it again for each outermost section; see
+  "A `Team`'s leader").
 
 #### Where the placement lives
 

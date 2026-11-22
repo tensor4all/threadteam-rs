@@ -163,10 +163,10 @@ where 0.4.0 left its mask whole. Three things to change:
 built there (MKL, OpenBLAS), a plain `std::thread::spawn` and a second `Pool` all
 inherited one CPU. Since 0.6.0 that thread keeps its own mask: `into_team` pins
 nothing, and the leader is placed when a token of the team first enters a scope
-or a section, until that token drops (unreleased, threadteam-rs#77; 0.6.0 and
-0.6.1 took that pin again at every section). A vendor library or a plain thread
-started from the creating thread before it mints a token is therefore not
-confined to one CPU.
+or a section. 0.6.0 took that pin again at every outermost section; 0.6.1
+(threadteam-rs#77) holds it until the token drops on the thread that took it. A
+vendor library or a plain thread started from the creating thread before it mints
+a token is therefore not confined to one CPU.
 
 [`CHANGELOG.md`](CHANGELOG.md) names every removed item, including the internal
 ones, and lists the behaviour that did not change.

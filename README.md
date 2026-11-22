@@ -164,7 +164,7 @@ built there (MKL, OpenBLAS), a plain `std::thread::spawn` and a second `Pool` al
 inherited one CPU. Since 0.6.0 that thread keeps its own mask: `into_team` pins
 nothing, and the leader is placed when a token of the team first enters a scope
 or a section, until that token drops (0.6.1, threadteam-rs#77; 0.6.0 took that pin
-again at every section). A vendor library or a plain thread
+again at every outermost section). A vendor library or a plain thread
 started from the creating thread before it mints a token is therefore not
 confined to one CPU.
 

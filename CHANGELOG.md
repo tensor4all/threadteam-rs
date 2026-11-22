@@ -9,6 +9,11 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [0.6.1] - 2026-11-22
 
+This is a patch release although it adds API (`width_profile_by`, `WidthCosts::with_multi_node`, `at_nodes`) and
+moves the `x86_64-avx512` transfer row from 41 to 43 ns/KiB, which can change the width a `width_for` call returns.
+Nothing is removed or changed in signature, so every `threadteam = "0.6"` pin takes it, which is why the fixes below
+ship as 0.6.1 and not 0.7.0.
+
 ### Changed
 
 - **The resident-transfer row is the measured one.** `TransferRate::for_class` charges 43 ns/KiB on

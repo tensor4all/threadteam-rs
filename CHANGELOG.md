@@ -7,6 +7,8 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-22
+
 ### Changed
 
 - **The resident-transfer row is the measured one.** `TransferRate::for_class` charges 43 ns/KiB on

@@ -10,7 +10,7 @@ All notable changes to `threadteam` are recorded here. The format follows
 ## [0.6.1] - 2026-11-22
 
 This is a patch release although it adds API (`width_profile_by`, `WidthCosts::with_multi_node`, `at_nodes`) and
-moves the transfer row from 41 to 43 ns/KiB on every host class except `aarch64-apple`, which can change the width a `width_for` call returns.
+moves the transfer row from 41 to 43 ns/KiB on every host class except `aarch64-apple`, which can change the width a `width_for_split` call returns.
 Nothing is removed or changed in signature, so every `threadteam = "0.6"` pin takes it, which is why the fixes below
 ship as 0.6.1 and not 0.7.0.
 

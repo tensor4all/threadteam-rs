@@ -60,10 +60,11 @@ mod calibrate;
 /// **Work submitted from a worker of another pool must not wait, directly or
 /// through another thread (`join`/`scope`/channel), for a job of the caller's
 /// own pool.** The caller runs none of its own pool's jobs while it waits, so
-/// when no other worker of that pool is free, such a job never runs and the call
-/// never returns. This is the price of a bounded stack: waiting inside the
-/// scheduler instead would nest the caller's own pool's jobs on its stack, one
-/// more per pending job, until it overflows.
+/// such a job runs only once another worker of that pool is free; if none
+/// becomes free, the call never returns. This is the price of a bounded stack:
+/// waiting inside the scheduler instead runs the caller's own pool's jobs on
+/// its stack, and when those jobs enter a pool themselves (an outer `par_iter`
+/// whose items each make such a call), they nest until the stack overflows.
 ///
 /// [`broadcast`]: Exec::broadcast
 ///

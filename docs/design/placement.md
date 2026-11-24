@@ -255,9 +255,9 @@ thread run one of its children, which is one of the tasks already counted.
   (https://github.com/tensor4all/threadteam-rs/issues/90).
   **Work submitted from a worker of another pool must not wait, directly or
   through another thread (`join`/`scope`/channel), for a job of the caller's
-  own pool.** With no other worker of that pool free, such a job never runs;
-  a waiting `install` would have run it, at the cost of the unbounded nesting
-  above. No public rayon-core API names the current thread's registry, so the
+  own pool.** Such a job runs only once another worker of that pool is free,
+  and if none becomes free the call never returns; a waiting `install` would
+  run it, at the cost of the nesting above. No public rayon-core API names the current thread's registry, so the
   rule cannot be checked at the entry.
 - In both cases scheduler and budget state are not inherited through
   thread-local storage by work that runs on the waiting thread. The crate's only thread-local

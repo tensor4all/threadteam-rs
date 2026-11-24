@@ -13,10 +13,11 @@
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
 5. Steady-state entries add no allocation of their own. The only allocation
-   an entry makes per call is the one Rayon makes for the call that hands the
-   work to the pool, if the entry makes one: the job `ThreadPool::spawn` boxes
-   when a worker of another pool submits work, or the job list
-   `ThreadPool::broadcast` collects. An allocation amortized over many calls
+   an entry makes per call is the one Rayon makes inside the call that hands
+   the work to the pool. Two of the calls entries make allocate there:
+   `ThreadPool::spawn`, which boxes the job a worker of another pool submits,
+   and `ThreadPool::broadcast`, which collects its job list into a `Vec`.
+   An allocation amortized over many calls
    (a block of Rayon's job queue) is not per call. Acquiring a reservation
    (`Exec::team`, `Pool::into_team`) is not an entry. `tests/alloc_free.rs`
    measures the plain-token entries other than `broadcast` from a plain

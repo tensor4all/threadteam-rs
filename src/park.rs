@@ -1,6 +1,7 @@
 //! The park/wake handshake of reserved members, and the latch a worker of
 //! another pool waits on after submitting work ([`Latch`]), isolated so that
-//! they can be model-checked with `loom` and driven by test hooks.
+//! they can be model-checked with `loom`; the handshake is also driven by test
+//! hooks.
 //!
 //! Members that found no work park here; a leader that changed the state they
 //! wait on (a generation, a reservation state, the lent flag) wakes them. The

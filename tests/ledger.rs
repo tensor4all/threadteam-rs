@@ -134,9 +134,24 @@ fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
 
         let exec = Exec::new(&pool, 3).unwrap();
         let root = exec.ledger_root().unwrap();
+        exec.fork_sized(&[2, 1], |_, _| nap()).unwrap();
+        assert_eq!(ledger::installs(root), 1);
+        assert!(ledger::max_live(root) <= 3);
+
+        let exec = Exec::new(&pool, 3).unwrap();
+        let root = exec.ledger_root().unwrap();
         assert_eq!(exec.external(|w| w.get()), 3);
         assert_eq!(ledger::installs(root), 1);
     });
+}
+
+#[test]
+fn a_broadcast_counts_one_install() {
+    let pool = pool(4);
+    let exec = Exec::new(&pool, 3).unwrap();
+    let root = exec.ledger_root().unwrap();
+    exec.broadcast(|_| {}).unwrap();
+    assert_eq!(ledger::installs(root), 1);
 }
 
 #[test]

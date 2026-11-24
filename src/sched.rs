@@ -117,15 +117,16 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
 /// [`Exec`](crate::Exec)'s placement).
 #[cfg(feature = "parallel")]
 fn submit_wait<F: FnOnce() -> R + Send, R: Send>(pool: &Pool, f: F) -> R {
+    let waiter = thread::current();
     let submit = Submit {
         f: UnsafeCell::new(Some(f)),
         out: UnsafeCell::new(None),
-        latch: Latch::new(),
+        latch: Latch::owned_by(&waiter),
     };
     let job = Job {
         submit: (&submit as *const Submit<F, R>).cast(),
         run: run::<F, R>,
-        waiter: thread::current(),
+        waiter,
     };
     // From here until the wait returns, the job may use `submit`; leaving this
     // frame by unwinding would free it under the job, so it aborts instead.

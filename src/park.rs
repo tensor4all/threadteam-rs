@@ -299,9 +299,20 @@ impl Default for Latch {
 impl Latch {
     /// An unset latch, owned by the calling thread.
     pub fn new() -> Self {
+        Self::owned_by(&thread::current())
+    }
+
+    /// An unset latch owned by `owner`, which must be the calling thread; for a
+    /// caller that already holds its own handle.
+    pub fn owned_by(owner: &thread::Thread) -> Self {
+        debug_assert_eq!(
+            owner.id(),
+            thread::current().id(),
+            "a latch is owned by the thread that creates it"
+        );
         Latch {
             done: AtomicBool::new(false),
-            owner: thread::current().id(),
+            owner: owner.id(),
         }
     }
 

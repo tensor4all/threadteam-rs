@@ -144,7 +144,8 @@ construction:
   elements, the reference lives for one call of `f`, and the borrow of
   `slots` ends after the join (also when a child's panic is re-raised), so
   per-child state needs no lock and the call allocates nothing beyond the one
-  job a worker of another pool submits.
+  job a worker of another pool submits and the amortized blocks of Rayon's job
+  queue.
 
   *Safety argument.* The slice is not split before dispatch. One private
   `SlotBase<S>` wraps `slots.as_mut_ptr()` (`unsafe impl<S: Send> Sync`), and

@@ -53,7 +53,8 @@ mod calibrate;
 /// caller sleeps until the tasks, which run on the target pool, have finished.
 /// The caller is a worker of a different pool: it submits the work, which runs
 /// on the target pool, and blocks without running its own pool's jobs until the
-/// work has finished; this submission allocates one job. [`broadcast`] is the
+/// work has finished; this submission allocates one job, besides the amortized
+/// blocks of Rayon's job queue. [`broadcast`] is the
 /// exception: it waits inside the scheduler, which runs the caller's own pool's
 /// jobs meanwhile.
 ///

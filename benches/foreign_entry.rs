@@ -7,8 +7,9 @@
 //! pool submits the work and blocks on a latch. The pricing row
 //! `DispatchKind::Outside` covers both callers.
 //!
-//! Each row is the median over 9 batches of the mean time per call, after a
-//! warm-up; both rows run back to back on the same pool.
+//! Each printed row is one entry. Each time in it is the median over 9 batches
+//! of the mean time per call, after a warm-up; the plain-thread and the
+//! foreign-worker times are measured one after the other on the same pool.
 //!
 //! `cargo bench --bench foreign_entry`
 

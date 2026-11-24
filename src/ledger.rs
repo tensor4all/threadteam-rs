@@ -107,7 +107,8 @@ pub fn live(root: u64) -> usize {
 
 /// Number of times an entry of `root` had to leave its calling thread to enter
 /// the pool: one count per entry, an install from a plain thread or a
-/// submission from a worker of another pool (`broadcast` counts one as well).
+/// submission from a worker of another pool (a plain token's `broadcast`
+/// counts one as well).
 ///
 /// Entries made from a worker of the target pool never count: they run on
 /// the caller's worker without installing. Inline entries never count either.

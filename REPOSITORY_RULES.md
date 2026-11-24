@@ -16,8 +16,8 @@
    allocated by Rayon inside the call that hands its work to the pool. (In the
    current code those allocations are the job `ThreadPool::spawn` boxes for a
    worker of another pool and the job list `ThreadPool::broadcast` collects,
-   besides the blocks of Rayon's job queue.) Acquiring a reservation is not an
-   entry. `tests/alloc_free.rs` and `tests/team_alloc_free.rs` check it, after
+   besides the blocks of Rayon's job queue.) Acquiring a reservation (the claim of its
+   members) is not an entry; the rest of an `Exec::team` call is. `tests/alloc_free.rs` and `tests/team_alloc_free.rs` check it, after
    warm-up, for the entries they call.
 6. API changes keep the contracts in `README.md` and `docs/design/placement.md`
    in sync.

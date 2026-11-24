@@ -42,7 +42,8 @@ All notable changes to `threadteam` are recorded here. The format follows
   issue's loop of 20 000 items keeps a nesting depth of one. Three consequences:
   - **Precondition.** Work submitted from a worker of another pool must not wait, directly or through another thread
     (`join`/`scope`/channel), for a job of the caller's own pool; with no other worker of that pool free, such a call
-    never returns. Likewise, pools whose workers all enter each other at once never return. No public rayon-core API
+    never returns, and a job queued for the waiting worker itself (one of a `broadcast`'s) never runs while the call
+    waits, even with other workers free. Likewise, pools whose workers all enter each other at once never return. No public rayon-core API
     names the caller's pool, so the rule is documented (`Exec` placement, README, design record), not checked.
   - **One allocation** per entry from a worker of another pool (the job `spawn` boxes), besides the amortized blocks
     of Rayon's job queue; entries from other callers

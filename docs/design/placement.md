@@ -259,8 +259,10 @@ thread run one of its children, which is one of the tasks already counted.
   **Work submitted from a worker of another pool must not wait, directly or
   through another thread (`join`/`scope`/channel), for a job of the caller's
   own pool.** Such a job runs only once another worker of that pool is free,
-  and if none becomes free the call never returns; a waiting `install` would
-  run it, at the cost of the nesting above. The same holds across pools: while
+  and if none becomes free the call never returns; a job queued for the
+  waiting worker itself (one of a `broadcast`'s) never runs while the call
+  waits, even with other workers free. A waiting `install` would run such
+  jobs, at the cost of the nesting above. The same holds across pools: while
   every worker of a pool waits in such calls, that pool runs none of its jobs,
   so pools whose workers all enter each other at once (pool A's into B while
   B's into A) never return. No public rayon-core API names the current thread's registry, so the

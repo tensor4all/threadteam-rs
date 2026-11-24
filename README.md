@@ -100,19 +100,23 @@ the token to kernels by value. Kernels never store a token and never mint one.
 * **Lazy and inline.** A serial token, budget one, or one task runs inline on the
   calling thread and makes no scheduler call, so the process-global Rayon pool is
   never started implicitly.
-* **Placement by caller.** For a plain token, and for `external` on any token
-  (a team token's other entries dispatch on its reserved members): a worker of
-  the target pool runs the work on its own thread (the tasks as a join tree in
-  the current scope) without installing. A plain thread enters the target pool once and
-  sleeps until the work has finished. A worker of another pool submits the work
-  (one allocated job, besides the amortized blocks of Rayon's job queue) and blocks without running its own pool's jobs until the
-  work has finished, so its stack does not grow with that pool's pending jobs;
-  `broadcast` is the exception and waits inside the scheduler, which runs the
-  caller's own pool's jobs meanwhile. **Work submitted from a worker of another
-  pool must not wait, directly or through another thread
-  (`join`/`scope`/channel), for a job of the caller's own pool:** the caller runs
-  none of them while it waits, so such a job runs only once another worker of
-  that pool is free, and if none becomes free the call never returns. The same
+* **Placement by caller.** For the `fork` variants and `for_ranges` of a plain
+  token, and for `external` on any token (a team token's other entries
+  dispatch on its reserved members; `team` places as its own docs say, and
+  `broadcast` is the exception below): a worker of the target pool runs the work on its own thread (the
+  tasks as a join tree in the current scope) without installing. A plain
+  thread enters the target pool once and sleeps until the work has finished. A
+  worker of another pool submits the work (one allocated job, besides the
+  amortized blocks of Rayon's job queue) and blocks without running its own
+  pool's jobs until the work has finished, so its stack does not grow with that
+  pool's pending jobs; `broadcast` from such a worker instead waits inside the
+  scheduler, which runs the caller's own pool's jobs meanwhile. **Work
+  submitted from a worker of another pool must not wait, directly or through
+  another thread (`join`/`scope`/channel), for a job of the caller's own
+  pool:** the caller runs none of them while it waits, so such a job runs only
+  once another worker of that pool is free, and if none becomes free the call
+  never returns; a job queued for the waiting worker itself (one of a
+  `broadcast`'s) never runs while the call waits, even with other workers free. The same
   holds across pools: while every worker of a pool waits in such calls, that
   pool runs none of its jobs, so pools whose workers all enter each other at
   once (pool A's into B while B's into A) never return. The crate keeps no ambient thread-local state: the

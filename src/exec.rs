@@ -61,7 +61,10 @@ mod calibrate;
 /// through another thread (`join`/`scope`/channel), for a job of the caller's
 /// own pool.** The caller runs none of its own pool's jobs while it waits, so
 /// such a job runs only once another worker of that pool is free; if none
-/// becomes free, the call never returns. This is the price of a bounded stack:
+/// becomes free, the call never returns. The same holds across pools: while
+/// every worker of a pool waits in such calls, that pool runs none of its
+/// jobs, so pools whose workers all enter each other at once (pool A's into B
+/// while B's into A) never return. This is the price of a bounded stack:
 /// waiting inside the scheduler instead runs the caller's own pool's jobs on
 /// its stack, and when those jobs enter a pool themselves (an outer `par_iter`
 /// whose items each make such a call), they nest until the stack overflows.

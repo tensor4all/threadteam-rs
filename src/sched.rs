@@ -112,8 +112,9 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
 /// Rayon's job queue that every entry from outside the pool amortizes.
 ///
 /// Because the caller runs nothing while it waits, `f` must not wait, directly
-/// or through another thread, for a job of the caller's pool (the precondition
-/// on [`Exec`](crate::Exec)'s placement).
+/// or through another thread, for a job of the caller's pool, and pools whose
+/// workers all enter each other at once never return (the precondition on
+/// [`Exec`](crate::Exec)'s placement).
 #[cfg(feature = "parallel")]
 fn submit_wait<F: FnOnce() -> R + Send, R: Send>(pool: &Pool, f: F) -> R {
     let submit = Submit {

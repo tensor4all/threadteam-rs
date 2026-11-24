@@ -336,6 +336,11 @@ impl Latch {
             (*this).owner,
             "a latch wakes the thread that created it"
         );
+        // The store goes through `&AtomicBool`, a reference that lives until
+        // `store` returns, after the waiter may have freed the latch: the same
+        // pattern as `Completion::finish` here, rayon-core's `CoreLatch::set`,
+        // and the `Arc::drop` case of
+        // https://github.com/rust-lang/rust/issues/55005.
         (*this).done.store(true, Ordering::Release);
         waiter.unpark();
     }

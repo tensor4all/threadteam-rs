@@ -110,7 +110,10 @@ the token to kernels by value. Kernels never store a token and never mint one.
   pool must not wait, directly or through another thread
   (`join`/`scope`/channel), for a job of the caller's own pool:** the caller runs
   none of them while it waits, so such a job runs only once another worker of
-  that pool is free, and if none becomes free the call never returns. The crate keeps no ambient thread-local state: the
+  that pool is free, and if none becomes free the call never returns. The same
+  holds across pools: while every worker of a pool waits in such calls, that
+  pool runs none of its jobs, so pools whose workers all enter each other at
+  once (pool A's into B while B's into A) never return. The crate keeps no ambient thread-local state: the
   one value it stores per thread is the placement record (`pin::PLACED`, a
   non-allocating `Cell`), and nothing else is inherited by work that runs on the
   calling thread.

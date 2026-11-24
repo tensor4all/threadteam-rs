@@ -258,7 +258,10 @@ thread run one of its children, which is one of the tasks already counted.
   through another thread (`join`/`scope`/channel), for a job of the caller's
   own pool.** Such a job runs only once another worker of that pool is free,
   and if none becomes free the call never returns; a waiting `install` would
-  run it, at the cost of the nesting above. No public rayon-core API names the current thread's registry, so the
+  run it, at the cost of the nesting above. The same holds across pools: while
+  every worker of a pool waits in such calls, that pool runs none of its jobs,
+  so pools whose workers all enter each other at once (pool A's into B while
+  B's into A) never return. No public rayon-core API names the current thread's registry, so the
   rule cannot be checked at the entry.
 - Scheduler and budget state are not inherited through thread-local storage
   by work that runs on a waiting thread. The crate's only thread-local

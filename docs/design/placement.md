@@ -143,7 +143,8 @@ construction:
   pointer of the exclusively borrowed slice. Distinct children get distinct
   elements, the reference lives for one call of `f`, and the borrow of
   `slots` ends after the join (also when a child's panic is re-raised), so
-  per-child state needs no lock and the call allocates nothing.
+  per-child state needs no lock and the call allocates nothing beyond the one
+  job a worker of another pool submits.
 
   *Safety argument.* The slice is not split before dispatch. One private
   `SlotBase<S>` wraps `slots.as_mut_ptr()` (`unsafe impl<S: Send> Sync`), and
@@ -239,9 +240,27 @@ thread run one of its children, which is one of the tasks already counted.
   registry is never touched.
 - **Already in the target pool**: spawn into the current scope, no install
   (cheap re-entry).
-- **Cross-pool or plain thread**: enter the pool once with `ThreadPool::install`
-  and wait. Scheduler and budget state are not inherited through thread-local
-  storage by work that runs on the waiting thread. The crate's only thread-local
+- **Plain thread**: enter the pool once with `ThreadPool::install` and sleep
+  until the work has finished.
+- **Worker of another pool**: submit the work with `ThreadPool::spawn` and block
+  on a latch (`park::Latch`) until it has finished, running none of the
+  caller's own pool's jobs. `install` would wait inside Rayon, which runs those
+  jobs on the caller's stack meanwhile, so an outer `par_iter` whose items each
+  enter the pool would nest until the stack overflows
+  (https://github.com/tensor4all/threadteam-rs/issues/89). Rayon has no entry
+  that borrows the caller's stack and waits without running jobs, so
+  `sched::submit_wait` erases the borrow for `spawn` (the one lifetime
+  extension in the crate) and `spawn` boxes the job: one allocation per entry.
+  `broadcast` keeps Rayon's wait, which still runs the caller's own pool's jobs
+  (https://github.com/tensor4all/threadteam-rs/issues/90).
+  **Work submitted from a worker of another pool must not wait, directly or
+  through another thread (`join`/`scope`/channel), for a job of the caller's
+  own pool.** With no other worker of that pool free, such a job never runs;
+  a waiting `install` would have run it, at the cost of the unbounded nesting
+  above. No public rayon-core API names the current thread's registry, so the
+  rule cannot be checked at the entry.
+- In both cases scheduler and budget state are not inherited through
+  thread-local storage by work that runs on the waiting thread. The crate's only thread-local
   is the placement record (`pin::PLACED`), which says *where this thread was
   placed*; it is read when a nested team places its leader, and only there: a
   nested placement is allowed while the current mask still belongs to that
@@ -276,6 +295,7 @@ thread run one of its children, which is one of the tasks already counted.
 | Serial runs on the calling thread | `std::thread::current().id()` test |
 | Same-pool re-entry does not install | entry counter (test-only) |
 | Cross-pool runs on the target pool | thread identity test from a foreign pool |
+| A worker of another pool waiting in `fork` / `for_ranges` / `external` runs none of its own pool's jobs (not `broadcast`) | `tests/foreign_pool.rs`: nesting depth 1 over 20 000 outer `par_iter` items per entry |
 | Budget clamped once | constructor test; no other clamp sites exist (follows from rule 1) |
 | No Rayon type is public | `cargo public-api` for `threadteam`, `tcontract-exec`, `tenferro-cpu` in CI; output must not contain `rayon::` |
 
@@ -512,7 +532,11 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
   one leader and two members: a published section, a released reservation, a
   member that parks twice, and per-slot parkers; and the exact join and barrier
   code (`Completion`, `Barrier`): a leader asleep in a join, consecutive
-  barrier rounds, and a cancellation waking a sleeper. The correctness argument therefore uses only what loom
+  barrier rounds, and a cancellation waking a sleeper; and the submission
+  `Latch` (`sched::submit_wait`): a setter waking a waiter that frees the
+  latch at once (a lost wake-up only; loom's `unpark` orders the setter's writes
+  before the waiter's reads by itself, so the flag's Release/Acquire pair rests
+  on the argument in `sched`). The correctness argument therefore uses only what loom
   models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a

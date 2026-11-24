@@ -12,6 +12,9 @@
 4. No ambient thread-local state (the placement record `pin::PLACED` is the one
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
-5. Steady-state entries do not allocate.
+5. Steady-state entries do not allocate, with one exception: an entry made from
+   a worker of another Rayon pool allocates the one job that
+   `ThreadPool::spawn` boxes when it submits the work, and nothing else.
+   `tests/alloc_free.rs` pins that count at one per entry.
 6. API changes keep the contracts in `README.md` and `docs/design/placement.md`
    in sync.

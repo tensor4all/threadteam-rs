@@ -1,4 +1,5 @@
-//! Steady-state entries allocate nothing (without the ledger).
+//! Steady-state entries allocate nothing (without the ledger), except the one
+//! job that an entry from a worker of another pool submits.
 #![cfg(all(feature = "parallel", not(feature = "ledger")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -26,33 +27,59 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static A: Counting = Counting;
 
-fn entries(pool: &Pool) {
+fn fork(pool: &Pool) {
     let sink = AtomicUsize::new(0);
-    let grain = NonZeroUsize::new(1).unwrap();
     Exec::new(pool, 3).unwrap().fork(7, |i, _| {
         sink.fetch_add(i, Ordering::Relaxed);
     });
-    Exec::new(pool, 3).unwrap().for_ranges(100, grain, |r| {
-        sink.fetch_add(r.len(), Ordering::Relaxed);
-    });
+    assert_eq!(sink.into_inner(), 21);
+}
+
+fn for_ranges(pool: &Pool) {
+    let sink = AtomicUsize::new(0);
+    Exec::new(pool, 3)
+        .unwrap()
+        .for_ranges(100, NonZeroUsize::MIN, |r| {
+            sink.fetch_add(r.len(), Ordering::Relaxed);
+        });
+    assert_eq!(sink.into_inner(), 100);
+}
+
+fn fork_sized_slots(pool: &Pool) {
     // Per-child state on the stack, no lock: nothing to allocate.
     let mut cursors = [0usize; 3];
     Exec::new(pool, 3)
         .unwrap()
         .fork_sized_slots(&[1, 1, 1], &mut cursors, |i, c, _| *c += i + 1)
         .unwrap();
-    sink.fetch_add(cursors.iter().sum(), Ordering::Relaxed);
+    assert_eq!(cursors, [1, 2, 3]);
+}
+
+fn external(pool: &Pool) {
     let w = Exec::new(pool, 3).unwrap().external(|w| w.get());
     assert_eq!(w, 3);
-    assert!(sink.load(Ordering::Relaxed) > 0);
+}
+
+/// Every parallel entry, each called once with a budget of three.
+const ENTRIES: [(&str, fn(&Pool)); 4] = [
+    ("fork", fork),
+    ("for_ranges", for_ranges),
+    ("fork_sized_slots", fork_sized_slots),
+    ("external", external),
+];
+
+fn entries(pool: &Pool) {
+    for (_, entry) in ENTRIES {
+        entry(pool);
+    }
 }
 
 /// Smallest allocation count over `rounds` windows of one call each, after warm-up.
 ///
 /// From a plain thread every entry pushes one job into rayon's injector queue,
-/// whose block allocation (one per 31 pushes) is amortized and outside this
-/// crate; a per-call allocation shows up in every window, so the minimum
-/// separates the two.
+/// whose block allocation (one per 63 pushes with crossbeam-deque 0.8) is
+/// amortized and outside this crate; a per-call allocation shows up in every
+/// window, so the minimum separates the two.
 fn measure(rounds: usize, f: impl Fn()) -> usize {
     for _ in 0..20 {
         f();
@@ -69,10 +96,37 @@ fn measure(rounds: usize, f: impl Fn()) -> usize {
 
 // One test: the counter is process-global.
 #[test]
-fn fork_for_ranges_slots_external_do_not_allocate() {
+fn entries_allocate_nothing_but_the_job_a_foreign_worker_submits() {
     let pool = Pool::builder().threads(3).build().unwrap();
     let plain = measure(10, || entries(&pool));
     assert_eq!(plain, 0, "plain-thread entries allocated");
+
+    // On a worker of another pool: each entry submits one job, which
+    // `ThreadPool::spawn` boxes, and allocates nothing else. Each entry is
+    // measured on its own, so one allocating twice cannot hide behind another
+    // allocating nothing.
+    let other = Pool::builder()
+        .threads(2)
+        .thread_name(|i| format!("other-{i}"))
+        .build()
+        .unwrap();
+    let foreign: [AtomicUsize; 4] = Default::default();
+    Exec::new(&other, 2).unwrap().fork(2, |i, _| {
+        if i == 0 {
+            let name = std::thread::current().name().map(str::to_owned);
+            assert!(name.is_some_and(|n| n.starts_with("other-")));
+            for ((_, entry), count) in ENTRIES.iter().zip(&foreign) {
+                count.store(measure(10, || entry(&pool)), Ordering::SeqCst);
+            }
+        }
+    });
+    for ((name, _), count) in ENTRIES.iter().zip(&foreign) {
+        assert_eq!(
+            count.load(Ordering::SeqCst),
+            1,
+            "`{name}` from a worker of another pool: one job and nothing else"
+        );
+    }
 
     // Inside the pool: a worker of `pool` enters again, which installs nothing,
     // so every window is strict.

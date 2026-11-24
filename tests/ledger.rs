@@ -108,6 +108,38 @@ fn same_pool_reentry_does_not_install() {
 }
 
 #[test]
+fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
+    let pool = pool(4);
+    let outer = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .build()
+        .unwrap();
+    outer.install(|| {
+        // On a worker of another pool: every entry leaves the calling thread
+        // once, through `run_tasks` (`for_ranges`, `fork`) or `enter`
+        // (`external`).
+        assert!(rayon::current_thread_index().is_some());
+
+        let exec = Exec::new(&pool, 3).unwrap();
+        let root = exec.ledger_root().unwrap();
+        exec.for_ranges(12, NonZeroUsize::MIN, |_| nap());
+        assert_eq!(ledger::installs(root), 1);
+        assert!(ledger::max_live(root) <= 3);
+
+        let exec = Exec::new(&pool, 3).unwrap();
+        let root = exec.ledger_root().unwrap();
+        exec.fork(6, |_, _| nap());
+        assert_eq!(ledger::installs(root), 1);
+        assert!(ledger::max_live(root) <= 3);
+
+        let exec = Exec::new(&pool, 3).unwrap();
+        let root = exec.ledger_root().unwrap();
+        assert_eq!(exec.external(|w| w.get()), 3);
+        assert_eq!(ledger::installs(root), 1);
+    });
+}
+
+#[test]
 fn inline_entries_never_install() {
     let pool = pool(4);
     let exec = Exec::new(&pool, 4).unwrap();

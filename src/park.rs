@@ -1,5 +1,6 @@
-//! The park/wake handshake of reserved members, isolated so that it can be
-//! model-checked with `loom` and driven by test hooks.
+//! The park/wake handshake of reserved members, and the latch a worker of
+//! another pool waits on after submitting work ([`Latch`]), isolated so that
+//! they can be model-checked with `loom` and driven by test hooks.
 //!
 //! Members that found no work park here; a leader that changed the state they
 //! wait on (a generation, a reservation state, the lent flag) wakes them. The
@@ -20,7 +21,7 @@
 //! the latter and the exact code is model-checked. With nobody parked a wake is
 //! one uncontended atomic read-modify-write.
 
-use crate::sync::{AtomicBool, AtomicUsize, Condvar, Mutex, Ordering};
+use crate::sync::{thread, AtomicBool, AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Places where a test can pause a thread (feature `test-hooks`).
 #[doc(hidden)]
@@ -266,6 +267,60 @@ impl Completion {
                 }
             }
         }
+    }
+}
+
+/// A one-shot flag that a single thread sleeps on until another thread sets it.
+///
+/// A worker of another pool that submitted work to a pool waits here, so it
+/// runs nothing while it waits (no job of its own pool, unlike Rayon's
+/// cross-pool wait). The wait is `thread::park` in a loop on the flag: an
+/// `unpark` that comes before the `park` leaves a token, so the `park` returns
+/// and the loop sees the flag; a spurious return only rechecks it. Between
+/// handing out its `Thread` and parking, the waiter runs nothing but atomics, so
+/// it consumes no token meant for another `park` on its thread.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub struct Latch {
+    done: AtomicBool,
+}
+
+impl Default for Latch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl Latch {
+    /// An unset latch.
+    pub fn new() -> Self {
+        Latch {
+            done: AtomicBool::new(false),
+        }
+    }
+
+    /// Sleeps until [`set`](Self::set) has run. Must be called by the thread
+    /// that `set` is given.
+    pub fn wait(&self) {
+        while !self.done.load(Ordering::Acquire) {
+            thread::park();
+        }
+    }
+
+    /// Sets the latch and wakes `waiter`.
+    ///
+    /// Everything the setter wrote before the call is visible to the waiter
+    /// once its `wait` returns (the Release store pairs with the Acquire load).
+    ///
+    /// # Safety
+    ///
+    /// `this` is valid when called. It is not dereferenced after the store,
+    /// because the waiter may free it as soon as it observes the flag; the
+    /// wake uses `waiter`, which the caller owns. `waiter` is the thread that
+    /// waits on `this`.
+    pub unsafe fn set(this: *const Latch, waiter: thread::Thread) {
+        (*this).done.store(true, Ordering::Release);
+        waiter.unpark();
     }
 }
 

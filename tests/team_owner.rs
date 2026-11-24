@@ -297,6 +297,25 @@ fn plain_tokens_are_unchanged_next_to_a_team() {
 
 #[test]
 fn external_on_a_team_token_lends_the_members_to_the_pool_and_takes_them_back() {
+    lend_the_members_through_external_and_take_them_back();
+}
+
+/// The same check with the team held on a worker of another Rayon pool, whose
+/// `external` call submits the work instead of installing it
+/// (https://github.com/tensor4all/threadteam-rs/issues/89).
+#[test]
+fn external_on_a_team_token_from_a_foreign_worker_lends_the_members() {
+    let outer = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    outer.install(|| {
+        assert!(rayon::current_thread_index().is_some());
+        lend_the_members_through_external_and_take_them_back();
+    });
+}
+
+fn lend_the_members_through_external_and_take_them_back() {
     let _w = watchdog();
     let team = pool(4, Duration::from_millis(1)).into_team(4).unwrap(); // 3 members; one worker is free
     std::thread::sleep(Duration::from_millis(20)); // members parked

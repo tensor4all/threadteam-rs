@@ -23,6 +23,26 @@ All notable changes to `threadteam` are recorded here. The format follows
   touching the table. Only the team row is replaced; the default rows are unchanged, and every team-priced read takes
   the effective row once per decision.
 
+### Fixed
+
+- **A plain token used on a worker of another Rayon pool no longer nests that pool's jobs on its stack.** `fork`,
+  `fork_sized`, `fork_sized_slots`, `for_ranges` and `external` called from such a worker entered the target pool with
+  `ThreadPool::install`, whose wait runs the caller's own pool's jobs on the same stack; an outer `par_iter` whose
+  items each made such a call nested until the process aborted with a stack overflow (threadteam-rs#89). The caller
+  now submits the work with `ThreadPool::spawn` and blocks on a latch, running none of its own pool's jobs: the
+  issue's loop of 20 000 items keeps a nesting depth of one. Three consequences:
+  - **Precondition.** Work submitted from a worker of another pool must not wait, directly or through another thread
+    (`join`/`scope`/channel), for a job of the caller's own pool; with no other worker of that pool free, such a call
+    never returns. No public rayon-core API names the caller's pool, so the rule is documented (`Exec` placement,
+    README, design record), not checked.
+  - **One allocation** per entry from a worker of another pool (the job `spawn` boxes); every other caller still
+    allocates nothing.
+  - **Cost.** Such an entry now costs about what the same entry costs from a plain thread, 2 to 2.5 times the old
+    cross-pool `install` on an Apple M2 (`benches/foreign_entry.rs`, budget 4).
+
+  `broadcast` from a worker of another pool, and `Pool::build` on reused workers called from one, still wait inside
+  Rayon and nest (threadteam-rs#90). Plain threads and workers of the target pool are unchanged.
+
 ## [0.6.1] - 2026-11-22
 
 This is a patch release although it adds API (`width_profile_by`, `WidthCosts::with_multi_node`, `at_nodes`) and

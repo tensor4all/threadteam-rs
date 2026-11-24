@@ -45,9 +45,24 @@ mod calibrate;
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
 /// is a worker of the pool: the tasks run as a join tree on the caller, nothing is
-/// installed. The caller is a plain thread or a worker of a different pool: the
-/// pool is entered once and the caller waits; the tasks run on the target pool.
-/// No thread-local state is involved at any point.
+/// installed. The caller is a plain thread: the pool is entered once and the
+/// caller sleeps until the tasks, which run on the target pool, have finished.
+/// The caller is a worker of a different pool: it submits the work, which runs
+/// on the target pool, and blocks without running its own pool's jobs until the
+/// work has finished; this submission allocates one job. [`broadcast`] is the
+/// exception: it waits inside the scheduler, which runs the caller's own pool's
+/// jobs meanwhile. None of the crate's own thread-local state is involved at any
+/// point.
+///
+/// **Work submitted from a worker of another pool must not wait, directly or
+/// through another thread (`join`/`scope`/channel), for a job of the caller's
+/// own pool.** The caller runs none of its own pool's jobs while it waits, so
+/// when no other worker of that pool is free, such a job never runs and the call
+/// never returns. This is the price of a bounded stack: waiting inside the
+/// scheduler instead would nest the caller's own pool's jobs on its stack, one
+/// more per pending job, until it overflows.
+///
+/// [`broadcast`]: Exec::broadcast
 ///
 /// # Examples
 ///

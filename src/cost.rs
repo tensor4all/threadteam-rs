@@ -28,8 +28,10 @@ pub enum DispatchKind {
     /// A plain token used by a worker of its own pool: the join tree runs on the
     /// caller, nothing is installed.
     InPool,
-    /// A plain token used by a thread outside the pool: one install, a wake of
-    /// the workers and a wait.
+    /// A plain token used by a thread outside the pool: one install from a
+    /// plain thread, or one submission from a worker of another pool, then a
+    /// wake of the workers and a wait. The rows are measured from a plain
+    /// thread; `benches/foreign_entry.rs` compares the two callers.
     Outside,
 }
 

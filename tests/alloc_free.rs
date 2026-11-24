@@ -73,8 +73,9 @@ fn external(pool: &Pool) {
     assert_eq!(w, 3);
 }
 
-/// Every parallel entry but `broadcast` (whose Rayon call collects its jobs into
-/// a `Vec`), each called once with a budget of three.
+/// Every parallel entry of a plain token but `broadcast` (whose Rayon call
+/// collects its jobs into a `Vec`) and `team` (measured by the team-scope
+/// window of the test below), each called once with a budget of three.
 const ENTRIES: [(&str, fn(&Pool)); 5] = [
     ("fork", fork),
     ("fork_sized", fork_sized),

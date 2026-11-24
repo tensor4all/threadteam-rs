@@ -249,8 +249,8 @@ thread run one of its children, which is one of the tasks already counted.
   enter the pool would nest until the stack overflows
   (https://github.com/tensor4all/threadteam-rs/issues/89). Rayon has no entry
   that borrows the caller's stack and waits without running jobs, so
-  `sched::submit_wait` erases the borrow for `spawn` (the one lifetime
-  extension in the crate) and `spawn` boxes the job: one allocation per entry.
+  `sched::submit_wait` erases the borrow to a raw pointer for `spawn`, and
+  `spawn` boxes the job: one allocation per entry.
   `broadcast` keeps Rayon's wait, which still runs the caller's own pool's jobs
   (https://github.com/tensor4all/threadteam-rs/issues/90).
   **Work submitted from a worker of another pool must not wait, directly or
@@ -535,8 +535,9 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
   barrier rounds, and a cancellation waking a sleeper; and the submission
   `Latch` (`sched::submit_wait`): a setter waking a waiter that frees the
   latch at once (a lost wake-up only; loom's `unpark` orders the setter's writes
-  before the waiter's reads by itself, so the flag's Release/Acquire pair rests
-  on the argument in `sched`). The correctness argument therefore uses only what loom
+  before the waiter's reads by itself, so the ordering rests on `Latch::set`'s
+  Release store pairing with `Latch::wait`'s Acquire load, which the model
+  does not check). The correctness argument therefore uses only what loom
   models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a

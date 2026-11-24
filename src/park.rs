@@ -276,9 +276,10 @@ impl Completion {
 /// runs nothing while it waits (no job of its own pool, unlike Rayon's
 /// cross-pool wait). The wait is `thread::park` in a loop on the flag: an
 /// `unpark` that comes before the `park` leaves a token, so the `park` returns
-/// and the loop sees the flag; a spurious return only rechecks it. Between
-/// handing out its `Thread` and parking, the waiter runs nothing but atomics, so
-/// it consumes no token meant for another `park` on its thread.
+/// and the loop sees the flag; a spurious return only rechecks it. A waiter
+/// that calls nothing that parks between handing out its `Thread` and parking
+/// consumes no token meant for another `park` on its thread: `sched` only
+/// enqueues the job there, and Rayon never calls `thread::park`.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub struct Latch {
     done: AtomicBool,

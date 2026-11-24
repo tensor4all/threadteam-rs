@@ -45,6 +45,17 @@ fn for_ranges(pool: &Pool) {
     assert_eq!(sink.into_inner(), 100);
 }
 
+fn fork_sized(pool: &Pool) {
+    let sink = AtomicUsize::new(0);
+    Exec::new(pool, 3)
+        .unwrap()
+        .fork_sized(&[2, 1], |_, child| {
+            sink.fetch_add(child.budget().get(), Ordering::Relaxed);
+        })
+        .unwrap();
+    assert_eq!(sink.into_inner(), 3);
+}
+
 fn fork_sized_slots(pool: &Pool) {
     // Per-child state on the stack, no lock: nothing to allocate.
     let mut cursors = [0usize; 3];
@@ -60,9 +71,11 @@ fn external(pool: &Pool) {
     assert_eq!(w, 3);
 }
 
-/// Every parallel entry, each called once with a budget of three.
-const ENTRIES: [(&str, fn(&Pool)); 4] = [
+/// Every parallel entry but `broadcast` (whose Rayon call collects its jobs into
+/// a `Vec`), each called once with a budget of three.
+const ENTRIES: [(&str, fn(&Pool)); 5] = [
     ("fork", fork),
+    ("fork_sized", fork_sized),
     ("for_ranges", for_ranges),
     ("fork_sized_slots", fork_sized_slots),
     ("external", external),
@@ -110,7 +123,7 @@ fn entries_allocate_nothing_but_the_job_a_foreign_worker_submits() {
         .thread_name(|i| format!("other-{i}"))
         .build()
         .unwrap();
-    let foreign: [AtomicUsize; 4] = Default::default();
+    let foreign: [AtomicUsize; ENTRIES.len()] = Default::default();
     Exec::new(&other, 2).unwrap().fork(2, |i, _| {
         if i == 0 {
             let name = std::thread::current().name().map(str::to_owned);

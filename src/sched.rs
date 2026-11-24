@@ -107,9 +107,8 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
 /// entry whose wait runs nothing and that borrows the caller's stack: every
 /// scoped entry (`install`, `scope`, `in_place_scope`, `broadcast`) waits that
 /// way, and `ThreadPool::spawn`, which does not wait, takes only a `'static`
-/// job. So the job is spawned with the borrow erased (the one place this crate
-/// extends a lifetime), and the caller waits for it here. `spawn` boxes the
-/// job: one allocation per call.
+/// job. So the job is spawned with the borrow erased to a raw pointer, and the
+/// caller waits for it here. `spawn` boxes the job: one allocation per call.
 ///
 /// Because the caller runs nothing while it waits, `f` must not wait, directly
 /// or through another thread, for a job of the caller's pool (the precondition

@@ -73,6 +73,19 @@ fn fork_from_a_foreign_worker_does_not_nest() {
 }
 
 #[test]
+fn fork_sized_from_a_foreign_worker_does_not_nest() {
+    let depth = max_nesting(|pool| {
+        Exec::new(pool, WIDTH)
+            .unwrap()
+            .fork_sized(&[2, 1, 1], |i, child| {
+                std::hint::black_box((i, child.budget()));
+            })
+            .unwrap();
+    });
+    assert_eq!(depth, 1);
+}
+
+#[test]
 fn fork_sized_slots_from_a_foreign_worker_does_not_nest() {
     let depth = max_nesting(|pool| {
         let mut slots = [0usize; WIDTH];
@@ -130,6 +143,21 @@ fn a_panic_in_a_foreign_worker_entry_reaches_the_caller() {
         }))
         .unwrap_err();
         assert_eq!(caught.downcast_ref::<Payload>(), Some(&Payload(2)));
+        assert_eq!(finished.load(Ordering::SeqCst), WIDTH - 1);
+
+        // `fork`: the same through the fork path.
+        let finished = AtomicUsize::new(0);
+        let caught = catch_unwind(AssertUnwindSafe(|| {
+            Exec::new(&pool, WIDTH).unwrap().fork(WIDTH, |i, _| {
+                if i == 1 {
+                    panic_any(Payload(1));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                finished.fetch_add(1, Ordering::SeqCst);
+            });
+        }))
+        .unwrap_err();
+        assert_eq!(caught.downcast_ref::<Payload>(), Some(&Payload(1)));
         assert_eq!(finished.load(Ordering::SeqCst), WIDTH - 1);
 
         // `external`: the callback's own panic.

@@ -37,8 +37,9 @@ All notable changes to `threadteam` are recorded here. The format follows
     README, design record), not checked.
   - **One allocation** per entry from a worker of another pool (the job `spawn` boxes); every other caller still
     allocates nothing.
-  - **Cost.** Such an entry now costs about what the same entry costs from a plain thread, 2 to 2.5 times the old
-    cross-pool `install` on an Apple M2 (`benches/foreign_entry.rs`, budget 4).
+  - **Cost.** Such an entry now costs about what the same entry costs from a plain thread, and 2 to 2.5 times what
+    it cost before this change (`benches/foreign_entry.rs`, budget 4, run on this change and on the commit before it
+    on an Apple M2).
 
   `broadcast` from a worker of another pool, and `Pool::build` on reused workers called from one, still wait inside
   Rayon and nest (threadteam-rs#90). Plain threads and workers of the target pool are unchanged.

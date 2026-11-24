@@ -274,8 +274,9 @@ impl Completion {
 /// A one-shot flag that a single thread sleeps on until another thread sets it.
 ///
 /// A worker of another pool that submitted work to a pool waits here, so it
-/// runs nothing while it waits, in particular no job of its own pool. The wait is `thread::park` in a loop on the flag: an
-/// `unpark` that comes before the `park` leaves a token, so the `park` returns
+/// runs nothing while it waits, in particular no job of its own pool. The wait
+/// is `thread::park` in a loop on the flag: an `unpark` that comes before the
+/// `park` leaves a token, so the `park` returns
 /// and the loop sees the flag; a spurious return only rechecks it. A token
 /// left on the thread before the wait makes its first `park` return early,
 /// which the loop treats as spurious; `std::thread::park`'s contract already

@@ -23,6 +23,14 @@ All notable changes to `threadteam` are recorded here. The format follows
   touching the table. Only the team row is replaced; the default rows are unchanged, and every team-priced read takes
   the effective row once per decision.
 
+### Changed
+
+- **Behavior change for callers that are workers of another Rayon pool.** Such a caller of a plain token's `fork`,
+  `fork_sized`, `fork_sized_slots` or `for_ranges`, or of any token's `external`, no longer runs its own pool's jobs
+  while it waits. Code whose
+  submitted work waits, directly or through another thread, for a job of the caller's pool, or pools whose workers
+  all enter each other at once, completed before and can now hang. The fix below states this as a precondition.
+
 ### Fixed
 
 - **A plain token used on a worker of another Rayon pool no longer nests that pool's jobs on its stack.** `fork`,

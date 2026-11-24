@@ -138,7 +138,8 @@ fn entries_allocate_nothing_but_the_job_a_foreign_worker_submits() {
         assert_eq!(
             count.load(Ordering::SeqCst),
             1,
-            "`{name}` from a worker of another pool: one job and nothing else"
+            "`{name}` from a worker of another pool: the one `HeapJob` rayon-core's \
+             `ThreadPool::spawn` boxes, and nothing else"
         );
     }
 

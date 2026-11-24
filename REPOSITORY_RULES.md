@@ -12,24 +12,16 @@
 4. No ambient thread-local state (the placement record `pin::PLACED` is the one
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
-5. Steady-state entries do not allocate per call. An entry is a call that
-   runs work on a token: `Exec::fork`, `fork_sized`, `fork_sized_slots`,
-   `for_ranges`, `external` and `broadcast`, and dispatch inside a
-   reservation; acquiring a reservation (`Exec::team`, `Pool::into_team`) is
-   not one. "Per call" is what `tests/alloc_free.rs` measures, the minimum
-   over warmed windows of one call, so an allocation amortized over many
-   calls (a block of Rayon's job queue) does not count. In two cases an entry
-   allocates per call, and only this:
-   - a `fork`, `fork_sized`, `fork_sized_slots` or `for_ranges` call on a
-     plain token, or an `external` call on any token, made from a worker of
-     another Rayon pool with a budget above one allocates the one job that
-     `ThreadPool::spawn` boxes when it submits the work;
-   - `Exec::broadcast` on a plain token that enters the pool (a budget above
-     one) allocates the job list that Rayon's `ThreadPool::broadcast`
-     collects into a `Vec`.
-
-   `tests/alloc_free.rs` pins the `Exec` entries other than `broadcast`,
-   including the first case at one allocation per entry;
-   `tests/team_alloc_free.rs` pins dispatch inside a reservation.
+5. Steady-state entries add no allocation of their own. The only allocation
+   an entry makes per call is the one Rayon makes for the call that hands the
+   work to the pool, if the entry makes one: the job `ThreadPool::spawn` boxes
+   when a worker of another pool submits work, or the job list
+   `ThreadPool::broadcast` collects. An allocation amortized over many calls
+   (a block of Rayon's job queue) is not per call. Acquiring a reservation
+   (`Exec::team`, `Pool::into_team`) is not an entry. `tests/alloc_free.rs`
+   measures the plain-token entries other than `broadcast` from a plain
+   thread, from a worker of the pool and, one job per entry, from a worker of
+   another pool; `tests/team_alloc_free.rs` measures dispatch inside a
+   reservation.
 6. API changes keep the contracts in `README.md` and `docs/design/placement.md`
    in sync.

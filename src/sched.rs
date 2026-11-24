@@ -105,9 +105,8 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
 /// items each enter `pool` would nest until the stack overflows
 /// (https://github.com/tensor4all/threadteam-rs/issues/89). Rayon offers no
 /// entry whose wait runs nothing and that borrows the caller's stack: every
-/// scoped entry (`install`, `scope`, `in_place_scope`, `broadcast`) waits that
-/// way, and `ThreadPool::spawn`, which does not wait, takes only a `'static`
-/// job. So the job is spawned with the borrow erased to a raw pointer, and the
+/// `ThreadPool` entry that waits for its work waits that way, and the spawn
+/// entries, which do not wait, take only `'static` jobs. So the job is spawned with the borrow erased to a raw pointer, and the
 /// caller waits for it here. `spawn` boxes the job: one allocation per call.
 ///
 /// Because the caller runs nothing while it waits, `f` must not wait, directly

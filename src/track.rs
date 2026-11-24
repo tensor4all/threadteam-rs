@@ -122,8 +122,8 @@ mod on {
         }
 
         /// One entry left its calling thread to enter the pool: an install
-        /// from a plain thread, or a submission from a worker of another pool
-        /// (see `ledger::installs`).
+        /// from a plain thread, a submission from a worker of another pool, or
+        /// a `broadcast` (see `ledger::installs`).
         #[allow(dead_code)] // only called by the parallel scheduler paths
         pub(crate) fn note_install(&self) {
             if let Some(c) = &self.counts {

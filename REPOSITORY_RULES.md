@@ -18,10 +18,11 @@
    reservation; acquiring a reservation (`Exec::team`, `Pool::into_team`) is
    not one. "Per call" is what `tests/alloc_free.rs` measures, the minimum
    over warmed windows of one call, so an allocation amortized over many
-   calls (a block of Rayon's job queue) does not count. Two entries allocate
-   per call, and only this:
-   - a `fork`, `fork_sized`, `fork_sized_slots`, `for_ranges` or `external`
-     call made from a worker of another Rayon pool allocates the one job that
+   calls (a block of Rayon's job queue) does not count. In two cases an entry
+   allocates per call, and only this:
+   - a `fork`, `fork_sized`, `fork_sized_slots` or `for_ranges` call on a
+     plain token, or an `external` call on any token, made from a worker of
+     another Rayon pool with a budget above one allocates the one job that
      `ThreadPool::spawn` boxes when it submits the work;
    - `Exec::broadcast` on a plain token that enters the pool (a budget above
      one) allocates the job list that Rayon's `ThreadPool::broadcast`

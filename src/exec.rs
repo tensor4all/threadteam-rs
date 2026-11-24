@@ -42,6 +42,10 @@ mod calibrate;
 ///
 /// # Placement
 ///
+/// This section is about a plain token (from [`Exec::new`]) and about
+/// [`external`](Exec::external) on any token; the other entries of a token
+/// minted by a [`Team`](crate::Team) dispatch on its reserved members instead.
+///
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
 /// is a worker of the pool: the tasks run as a join tree on the caller, nothing is

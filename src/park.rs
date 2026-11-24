@@ -328,6 +328,11 @@ impl Latch {
     /// wake uses `waiter`, which the caller owns. `waiter` is the thread that
     /// created `this` and waits on it.
     pub unsafe fn set(this: *const Latch, waiter: thread::Thread) {
+        debug_assert_eq!(
+            waiter.id(),
+            (*this).owner,
+            "a latch wakes the thread that created it"
+        );
         (*this).done.store(true, Ordering::Release);
         waiter.unpark();
     }

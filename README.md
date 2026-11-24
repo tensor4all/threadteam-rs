@@ -146,7 +146,7 @@ the token to kernels by value. Kernels never store a token and never mint one.
 | Feature | Effect |
 | --- | --- |
 | `parallel` (default) | run on a private pool. Without it the same types exist, `PoolBuilder::build` returns a width-1 pool and every entry runs inline |
-| `ledger` | test support: `ledger::max_live(root)`, `live`, `installs`, and `Exec::ledger_root`. Records live tasks per root token and the entries that leave the calling thread (an install from a plain thread, a submission from a worker of another pool); compiled out when off |
+| `ledger` | test support: `ledger::max_live(root)`, `live`, `installs`, and `Exec::ledger_root`. Records live tasks per root token and the entries that leave the calling thread (an install from a plain thread, a submission from a worker of another pool, a `broadcast`); compiled out when off |
 
 Consumers assert `ledger::max_live(root) <= budget` in their own tests, and keep
 a test binary that runs serial and pooled work and then checks that

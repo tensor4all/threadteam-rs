@@ -1,6 +1,7 @@
 //! Steady-state entries other than `broadcast` (whose Rayon call collects its
-//! jobs into a `Vec`) allocate nothing (without the ledger), except the one job
-//! that an entry from a worker of another pool submits.
+//! jobs into a `Vec`) allocate nothing per call (without the ledger), except
+//! the one job that an entry from a worker of another pool submits; "per call"
+//! leaves out Rayon's amortized queue blocks, as `measure` explains.
 #![cfg(all(feature = "parallel", not(feature = "ledger")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -116,7 +117,7 @@ fn entries_allocate_nothing_but_the_job_a_foreign_worker_submits() {
     assert_eq!(plain, 0, "plain-thread entries allocated");
 
     // On a worker of another pool: each entry submits one job, which
-    // `ThreadPool::spawn` boxes, and allocates nothing else. Each entry is
+    // `ThreadPool::spawn` boxes, and allocates nothing else per call. Each entry is
     // measured on its own, so one allocating twice cannot hide behind another
     // allocating nothing.
     let other = Pool::builder()
@@ -139,7 +140,7 @@ fn entries_allocate_nothing_but_the_job_a_foreign_worker_submits() {
             count.load(Ordering::SeqCst),
             1,
             "`{name}` from a worker of another pool: the one `HeapJob` rayon-core's \
-             `ThreadPool::spawn` boxes, and nothing else"
+             `ThreadPool::spawn` boxes, and nothing else per call"
         );
     }
 

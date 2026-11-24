@@ -31,7 +31,8 @@ the existing tests.
 3. No ambient fallback: the global Rayon pool is never reached implicitly.
 4. Lazy: small operations never enter a pool.
 5. Correct when the caller is a plain thread, a worker of the target pool, or a
-   worker of a **different** pool.
+   worker of a **different** pool, the last under the precondition in
+   "Behaviour decisions" below.
 6. The number of tasks running at once under a token is at most its budget at
    every nesting depth, by construction and checked by tooling, not by
    convention.

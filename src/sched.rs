@@ -131,8 +131,8 @@ fn submit_wait<F: FnOnce() -> R + Send, R: Send>(pool: &Pool, f: F) -> R {
         let job = job;
         // SAFETY: `job.submit` points to the `Submit<F, R>` of the frame above
         // (the type `job.run` was instantiated with), which stays alive, with
-        // nothing of it touched but the latch's flag (atomically, by `wait`),
-        // until `latch.wait()` below returns; that happens only
+        // nothing of it touched but the latch (whose flag and owner `wait`
+        // only reads), until `latch.wait()` below returns; that happens only
         // after `run` set the latch, its last access to the frame. Nothing in
         // between can unwind out of the frame (`abort`). `job.waiter` is that
         // frame's thread.
@@ -168,8 +168,8 @@ struct Job {
 // SAFETY: `Job` hands the job thread a pointer to a `Submit<F, R>` whose `F`
 // and `R` are `Send` (bounds of `submit_wait`); the job takes `F`, stores an
 // `R` (or a panic payload, which is `Send`) and sets the latch, while the
-// owning thread touches nothing of the `Submit` but the latch's flag until the
-// latch is set.
+// owning thread touches nothing of the `Submit` but the latch, whose fields it
+// only reads, until the latch is set.
 #[cfg(feature = "parallel")]
 unsafe impl Send for Job {}
 

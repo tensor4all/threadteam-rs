@@ -304,8 +304,9 @@ impl Latch {
         }
     }
 
-    /// Sleeps until [`set`](Self::set) has run. Must be called by the thread
-    /// that created the latch, which is the one `set` is given.
+    /// Sleeps until the store of [`set`](Self::set) is visible; `set`'s
+    /// `unpark` may land after this returns. Must be called by the thread that
+    /// created the latch, which is the one `set` is given.
     pub fn wait(&self) {
         debug_assert_eq!(
             thread::current().id(),

@@ -12,18 +12,12 @@
 4. No ambient thread-local state (the placement record `pin::PLACED` is the one
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
-5. The only per-call allocation a steady-state entry may make is one inside
-   the Rayon call that hands its work to the pool; the crate adds no per-call
-   allocation of its own. This allowance is the rule. As a description of the current code, not a limit
-   on the allowance, two of the hand-off calls entries make allocate:
-   `ThreadPool::spawn`, which boxes the job a worker of another pool submits,
-   and `ThreadPool::broadcast`, which collects its job list into a `Vec`.
-   An allocation amortized over many calls
-   (a block of Rayon's job queue) is not per call. Acquiring a reservation
-   (`Exec::team`, `Pool::into_team`) is not an entry. `tests/alloc_free.rs`
-   measures the plain-token entries other than `broadcast` from a plain
-   thread, from a worker of the pool and, one job per entry, from a worker of
-   another pool; `tests/team_alloc_free.rs` measures dispatch inside a
-   reservation.
+5. A steady-state entry allocates nothing of its own: whatever it allocates is
+   allocated by Rayon inside the call that hands its work to the pool. (In the
+   current code those allocations are the job `ThreadPool::spawn` boxes for a
+   worker of another pool and the job list `ThreadPool::broadcast` collects,
+   besides the blocks of Rayon's job queue.) Acquiring a reservation is not an
+   entry. `tests/alloc_free.rs` and `tests/team_alloc_free.rs` check it, after
+   warm-up, for the entries they call.
 6. API changes keep the contracts in `README.md` and `docs/design/placement.md`
    in sync.

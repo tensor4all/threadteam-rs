@@ -225,7 +225,7 @@ struct Submission {
 /// The model does not check the flag's Release/Acquire pair: with both
 /// accesses to the flag made relaxed, it still passes.
 #[test]
-fn a_set_latch_wakes_its_waiter_and_publishes_the_result() {
+fn a_set_latch_wakes_its_waiter() {
     model(|| {
         let submission = Box::into_raw(Box::new(Submission {
             out: UnsafeCell::new(0),

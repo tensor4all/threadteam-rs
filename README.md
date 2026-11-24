@@ -109,7 +109,7 @@ the token to kernels by value. Kernels never store a token and never mint one.
   worker of another pool submits the work (one allocated job, besides the
   amortized blocks of Rayon's job queue) and blocks without running its own
   pool's jobs until the work has finished, so its stack does not grow with that
-  pool's pending jobs; `broadcast` from such a worker instead waits inside the
+  pool's pending jobs; a plain token's `broadcast` from such a worker instead waits inside the
   scheduler, which runs the caller's own pool's jobs meanwhile. **Work
   submitted from a worker of another pool must not wait, directly or through
   another thread (`join`/`scope`/channel), for a job of the caller's own

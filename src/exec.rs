@@ -46,7 +46,7 @@ mod calibrate;
 /// of a plain token (from [`Exec::new`]) and about [`external`](Exec::external)
 /// on any token; the other entries of a token minted by a [`Team`](crate::Team)
 /// dispatch on its reserved members instead, [`team`](Exec::team) places as its
-/// own docs say, and [`broadcast`] is the exception named below.
+/// own docs say, and a plain token's [`broadcast`] is the exception named below.
 ///
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
@@ -57,7 +57,7 @@ mod calibrate;
 /// The caller is a worker of a different pool: it submits the work, which runs
 /// on the target pool, and blocks without running its own pool's jobs until the
 /// work has finished; this submission allocates one job, besides the amortized
-/// blocks of Rayon's job queue. [`broadcast`] is the
+/// blocks of Rayon's job queue. A plain token's [`broadcast`] is the
 /// exception: it waits inside the scheduler, which runs the caller's own pool's
 /// jobs meanwhile.
 ///

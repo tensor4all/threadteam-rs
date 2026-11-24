@@ -26,8 +26,8 @@ All notable changes to `threadteam` are recorded here. The format follows
 ### Changed
 
 - **Behavior change for callers that are workers of another Rayon pool.** Such a caller of a plain token's `fork`,
-  `fork_sized`, `fork_sized_slots` or `for_ranges`, or of any token's `external`, no longer runs its own pool's jobs
-  while it waits. Code whose
+  `fork_sized`, `fork_sized_slots` or `for_ranges`, or of any token's `external`, that enters the pool (more than one
+  task; for `external`, a budget above one) no longer runs its own pool's jobs while it waits. Code whose
   submitted work waits, directly or through another thread, for a job of the caller's pool, or pools whose workers
   all enter each other at once, completed before and can now hang. The fix below states this as a precondition.
 
@@ -45,7 +45,7 @@ All notable changes to `threadteam` are recorded here. The format follows
     never returns, and a job queued for the waiting worker itself (one of a `broadcast`'s) never runs while the call
     waits, even with other workers free. Likewise, pools whose workers all enter each other at once never return. No public rayon-core API
     names the caller's pool, so the rule is documented (`Exec` placement, README, design record), not checked.
-  - **One allocation** per entry from a worker of another pool (the job `spawn` boxes), besides the amortized blocks
+  - **One allocation** per entry from a worker of another pool that enters the pool (the job `spawn` boxes), besides the amortized blocks
     of Rayon's job queue; entries from other callers
     allocate what they did before.
   - **Cost.** Such an entry now costs about what the same entry costs from a plain thread, and 2 to 2.5 times what

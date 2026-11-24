@@ -3,7 +3,7 @@
 //! None of the crate's own thread-local state is read or written here:
 //! placement decisions use only the pool handle and the identity of the calling
 //! thread that the scheduler reports. A worker of another pool that waits for a
-//! submission hands out its std `Thread` handle, so that the job can wake it.
+//! submission hands out its `Thread` handle, so that the job can wake it.
 
 #[cfg(feature = "parallel")]
 use crate::park::Latch;
@@ -206,8 +206,8 @@ impl Drop for AbortOnUnwind {
 /// Runs `f(i)` for every worker index `i < budget` at once, or reports that the
 /// caller already is a worker of `pool`.
 ///
-/// The wait is Rayon's own, unlike [`enter`]'s: a caller that is a worker of
-/// another pool runs its own pool's jobs while it waits
+/// The wait is Rayon's own: a caller that is a worker of another pool runs its
+/// own pool's jobs while it waits
 /// (https://github.com/tensor4all/threadteam-rs/issues/90).
 #[cfg(feature = "parallel")]
 pub(crate) fn broadcast(pool: &Pool, track: &Track, budget: usize, f: impl Fn(usize) + Sync) {

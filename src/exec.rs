@@ -51,8 +51,7 @@ mod calibrate;
 /// on the target pool, and blocks without running its own pool's jobs until the
 /// work has finished; this submission allocates one job. [`broadcast`] is the
 /// exception: it waits inside the scheduler, which runs the caller's own pool's
-/// jobs meanwhile. None of the crate's own thread-local state is involved at any
-/// point.
+/// jobs meanwhile.
 ///
 /// **Work submitted from a worker of another pool must not wait, directly or
 /// through another thread (`join`/`scope`/channel), for a job of the caller's

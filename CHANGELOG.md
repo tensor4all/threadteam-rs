@@ -26,7 +26,8 @@ All notable changes to `threadteam` are recorded here. The format follows
 ### Fixed
 
 - **A plain token used on a worker of another Rayon pool no longer nests that pool's jobs on its stack.** `fork`,
-  `fork_sized`, `fork_sized_slots`, `for_ranges` and `external` called from such a worker entered the target pool with
+  `fork_sized`, `fork_sized_slots`, `for_ranges` and `external` (the last on a team token too) called from such a
+  worker entered the target pool with
   `ThreadPool::install`, whose wait runs the caller's own pool's jobs on the same stack; an outer `par_iter` whose
   items each made such a call nested until the process aborted with a stack overflow (threadteam-rs#89). The caller
   now submits the work with `ThreadPool::spawn` and blocks on a latch, running none of its own pool's jobs: the

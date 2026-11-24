@@ -33,7 +33,8 @@ Design record: `docs/design/placement.md`. Durable invariants:
   inline; the process-global Rayon pool is never started.
 - **No Rayon type is public**: `scripts/check-no-public-rayon.sh` must pass.
 - **Steady-state allocation**: `tests/alloc_free.rs` must pass; do not add
-  allocation to the entry paths beyond what `REPOSITORY_RULES.md` rule 5 allows.
+  allocation to the steady-state entry paths beyond what `REPOSITORY_RULES.md`
+  rule 5 allows.
 - `Exec` stays neither `Clone` nor `Copy` (compile-fail doctests).
 - **Synchronization changes are model-checked**: any change to the park/wake
   core (`src/park.rs`, `src/sync.rs`, member slots, section publication and

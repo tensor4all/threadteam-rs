@@ -14,6 +14,16 @@ fn a_latch_waited_on_by_another_thread_panics() {
     std::panic::resume_unwind(waited.unwrap_err());
 }
 
+/// A latch is owned by the thread that creates it.
+#[test]
+#[should_panic(expected = "a latch is owned by the thread that creates it")]
+fn a_latch_owned_by_another_thread_panics() {
+    let other = std::thread::spawn(|| {});
+    let stranger = other.thread().clone();
+    other.join().unwrap();
+    let _ = Latch::owned_by(&stranger);
+}
+
 /// A latch wakes the thread that created it.
 #[test]
 #[should_panic(expected = "a latch wakes the thread that created it")]

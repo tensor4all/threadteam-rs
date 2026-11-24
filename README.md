@@ -100,8 +100,9 @@ the token to kernels by value. Kernels never store a token and never mint one.
 * **Lazy and inline.** A serial token, budget one, or one task runs inline on the
   calling thread and makes no scheduler call, so the process-global Rayon pool is
   never started implicitly.
-* **Placement by caller.** A worker of the target pool spawns into the current
-  scope without installing. A plain thread enters the target pool once and
+* **Placement by caller.** For a plain token, and for `external` on any token
+  (a team token's other entries dispatch on its reserved members): a worker of
+  the target pool spawns into the current scope without installing. A plain thread enters the target pool once and
   sleeps until the work has finished. A worker of another pool submits the work
   (one allocated job, besides the amortized blocks of Rayon's job queue) and blocks without running its own pool's jobs until the
   work has finished, so its stack does not grow with that pool's pending jobs;

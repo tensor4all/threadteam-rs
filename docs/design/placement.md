@@ -259,8 +259,9 @@ thread run one of its children, which is one of the tasks already counted.
   and if none becomes free the call never returns; a waiting `install` would
   run it, at the cost of the nesting above. No public rayon-core API names the current thread's registry, so the
   rule cannot be checked at the entry.
-- In both cases scheduler and budget state are not inherited through
-  thread-local storage by work that runs on the waiting thread. The crate's only thread-local
+- No scheduler or budget state is inherited through thread-local storage, by
+  the entered work or by any job a waiting thread runs (only a `broadcast`'s
+  wait runs any). The crate's only thread-local
   is the placement record (`pin::PLACED`), which says *where this thread was
   placed*; it is read when a nested team places its leader, and only there: a
   nested placement is allowed while the current mask still belongs to that

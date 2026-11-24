@@ -128,10 +128,10 @@ fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
         .unwrap();
     outer.install(|| {
         // On a worker of another pool: every entry leaves the calling thread
-        // once, through `run_tasks` (`for_ranges`, `fork`, `fork_sized`) or
-        // `enter` (`external`).
+        // once, through `run_tasks` (`for_ranges`, `fork`, `fork_sized`,
+        // `fork_sized_slots`), `enter` (`external`) or Rayon's `broadcast`.
         assert!(rayon::current_thread_index().is_some());
-        let entries: [(&str, Entry); 4] = [
+        let entries: [(&str, Entry); 6] = [
             (
                 "for_ranges",
                 Box::new(|e| e.for_ranges(12, NonZeroUsize::MIN, |_| nap())),
@@ -142,9 +142,19 @@ fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
                 Box::new(|e| e.fork_sized(&[2, 1], |_, _| nap()).unwrap()),
             ),
             (
+                "fork_sized_slots",
+                Box::new(|e| {
+                    let mut slots = [0usize; 2];
+                    e.fork_sized_slots(&[2, 1], &mut slots, |_, slot, _| *slot += 1)
+                        .unwrap();
+                    assert_eq!(slots, [1, 1]);
+                }),
+            ),
+            (
                 "external",
                 Box::new(|e| assert_eq!(e.external(|w| w.get()), 3)),
             ),
+            ("broadcast", Box::new(|e| e.broadcast(|_| nap()).unwrap())),
         ];
         for (name, entry) in entries {
             let (installs, max_live) = counts(&pool, entry);

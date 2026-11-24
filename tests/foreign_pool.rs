@@ -30,8 +30,8 @@ fn target() -> Pool {
 }
 
 /// Runs `entry` once per item of an outer `par_iter` on the global pool and
-/// returns the largest number of items that were open at once on one thread.
-fn max_nesting(entry: impl Fn(&Pool) + Sync) -> usize {
+/// asserts that no thread ever had more than one item open at once.
+fn assert_no_nesting(entry: impl Fn(&Pool) + Sync) {
     let pool = target();
     let max = AtomicUsize::new(0);
     (0..ITEMS).into_par_iter().for_each(|_| {
@@ -47,34 +47,32 @@ fn max_nesting(entry: impl Fn(&Pool) + Sync) -> usize {
         entry(&pool);
         DEPTH.with(|d| d.set(d.get() - 1));
     });
-    max.into_inner()
+    assert_eq!(max.into_inner(), 1, "largest nesting depth on one thread");
 }
 
 #[test]
 fn for_ranges_from_a_foreign_worker_does_not_nest() {
-    let depth = max_nesting(|pool| {
+    assert_no_nesting(|pool| {
         Exec::new(pool, WIDTH)
             .unwrap()
             .for_ranges(64, NonZeroUsize::MIN, |r| {
                 std::hint::black_box(r);
             });
     });
-    assert_eq!(depth, 1);
 }
 
 #[test]
 fn fork_from_a_foreign_worker_does_not_nest() {
-    let depth = max_nesting(|pool| {
+    assert_no_nesting(|pool| {
         Exec::new(pool, WIDTH).unwrap().fork(WIDTH, |i, _| {
             std::hint::black_box(i);
         });
     });
-    assert_eq!(depth, 1);
 }
 
 #[test]
 fn fork_sized_from_a_foreign_worker_does_not_nest() {
-    let depth = max_nesting(|pool| {
+    assert_no_nesting(|pool| {
         Exec::new(pool, WIDTH)
             .unwrap()
             .fork_sized(&[2, 1, 1], |i, child| {
@@ -82,12 +80,11 @@ fn fork_sized_from_a_foreign_worker_does_not_nest() {
             })
             .unwrap();
     });
-    assert_eq!(depth, 1);
 }
 
 #[test]
 fn fork_sized_slots_from_a_foreign_worker_does_not_nest() {
-    let depth = max_nesting(|pool| {
+    assert_no_nesting(|pool| {
         let mut slots = [0usize; WIDTH];
         Exec::new(pool, WIDTH)
             .unwrap()
@@ -95,16 +92,14 @@ fn fork_sized_slots_from_a_foreign_worker_does_not_nest() {
             .unwrap();
         assert_eq!(slots, [1, 2, 3, 4]);
     });
-    assert_eq!(depth, 1);
 }
 
 #[test]
 fn external_from_a_foreign_worker_does_not_nest() {
-    let depth = max_nesting(|pool| {
+    assert_no_nesting(|pool| {
         let width = Exec::new(pool, WIDTH).unwrap().external(|w| w.get());
         assert_eq!(width, WIDTH);
     });
-    assert_eq!(depth, 1);
 }
 
 /// Runs `f` on a worker of a fresh two-thread Rayon pool, which is not a

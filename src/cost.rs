@@ -29,8 +29,8 @@ pub enum DispatchKind {
     /// caller, nothing is installed.
     InPool,
     /// A plain token used by a thread outside the pool: one install from a
-    /// plain thread, or one submission from a worker of another pool, then a
-    /// wake of the workers and a wait. The rows are measured from a plain
+    /// plain thread, one submission from a worker of another pool, or one
+    /// Rayon broadcast, then a wake of the workers and a wait. The rows are measured from a plain
     /// thread; `benches/foreign_entry.rs` compares the two callers.
     Outside,
 }

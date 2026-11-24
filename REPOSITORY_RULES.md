@@ -12,14 +12,20 @@
 4. No ambient thread-local state (the placement record `pin::PLACED` is the one
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
-5. Steady-state entries do not allocate, except in two cases, each allowed
-   exactly the allocation named here and nothing more:
-   - an `Exec::fork`, `fork_sized`, `fork_sized_slots`, `for_ranges` or
-     `external` call made from a worker of another Rayon pool allocates the
-     one job that `ThreadPool::spawn` boxes when it submits the work;
+5. Steady-state entries do not allocate per call. An entry is a call that
+   runs work on a token: `Exec::fork`, `fork_sized`, `fork_sized_slots`,
+   `for_ranges`, `external` and `broadcast`, and dispatch inside a
+   reservation; acquiring a reservation (`Exec::team`, `Pool::into_team`) is
+   not one. "Per call" is what `tests/alloc_free.rs` measures, the minimum
+   over warmed windows of one call, so an allocation amortized over many
+   calls (a block of Rayon's job queue) does not count. Two entries allocate
+   per call, and only this:
+   - a `fork`, `fork_sized`, `fork_sized_slots`, `for_ranges` or `external`
+     call made from a worker of another Rayon pool allocates the one job that
+     `ThreadPool::spawn` boxes when it submits the work;
    - `Exec::broadcast` on a plain token that enters the pool (a budget above
-     one) allocates the job list that Rayon's
-     `ThreadPool::broadcast` collects into a `Vec` on every call.
+     one) allocates the job list that Rayon's `ThreadPool::broadcast`
+     collects into a `Vec`.
 
    `tests/alloc_free.rs` pins the `Exec` entries other than `broadcast`,
    including the first case at one allocation per entry;

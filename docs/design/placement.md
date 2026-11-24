@@ -537,8 +537,8 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
   latch at once (a lost wake-up only; loom's `unpark` orders the setter's writes
   before the waiter's reads by itself, so the ordering rests on `Latch::set`'s
   Release store pairing with `Latch::wait`'s Acquire load, which the model
-  does not check). The correctness argument therefore uses only what loom
-  models (modification order and release sequences of `parked`). CI job `loom`:
+  does not check). The `Parker`'s correctness argument therefore uses only
+  what loom models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a
   test pause the member between raising `parked` and taking the lock, between its

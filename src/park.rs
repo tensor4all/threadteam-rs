@@ -275,13 +275,16 @@ impl Completion {
 /// A worker of another pool that submitted work to a pool waits here, so it
 /// runs nothing while it waits, in particular no job of its own pool. The wait is `thread::park` in a loop on the flag: an
 /// `unpark` that comes before the `park` leaves a token, so the `park` returns
-/// and the loop sees the flag; a spurious return only rechecks it. A waiter
-/// that calls nothing that parks between handing out its `Thread` and parking
-/// consumes no token meant for another `park` on its thread: `sched` only
-/// enqueues the job there, and Rayon never calls `thread::park`.
+/// and the loop sees the flag; a spurious return only rechecks it. A token
+/// left on the thread before the wait makes its first `park` return early,
+/// which the loop treats as spurious; `std::thread::park`'s contract already
+/// forbids calling unknown code, such as an entry of this crate, between
+/// setting up a park and parking, so no such token is owed to a later `park`.
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 pub struct Latch {
     done: AtomicBool,
+    /// The thread that created the latch, the only one that may wait on it.
+    owner: thread::ThreadId,
 }
 
 impl Default for Latch {
@@ -292,16 +295,22 @@ impl Default for Latch {
 
 #[cfg_attr(not(feature = "parallel"), allow(dead_code))]
 impl Latch {
-    /// An unset latch.
+    /// An unset latch, owned by the calling thread.
     pub fn new() -> Self {
         Latch {
             done: AtomicBool::new(false),
+            owner: thread::current().id(),
         }
     }
 
     /// Sleeps until [`set`](Self::set) has run. Must be called by the thread
-    /// that `set` is given.
+    /// that created the latch, which is the one `set` is given.
     pub fn wait(&self) {
+        debug_assert_eq!(
+            thread::current().id(),
+            self.owner,
+            "a latch is waited on by the thread that created it"
+        );
         while !self.done.load(Ordering::Acquire) {
             thread::park();
         }
@@ -317,7 +326,7 @@ impl Latch {
     /// `this` is valid when called. It is not dereferenced after the store,
     /// because the waiter may free it as soon as it observes the flag; the
     /// wake uses `waiter`, which the caller owns. `waiter` is the thread that
-    /// waits on `this`.
+    /// created `this` and waits on it.
     pub unsafe fn set(this: *const Latch, waiter: thread::Thread) {
         (*this).done.store(true, Ordering::Release);
         waiter.unpark();

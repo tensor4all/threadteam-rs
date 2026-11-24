@@ -32,7 +32,7 @@ Design record: `docs/design/placement.md`. Durable invariants:
 - **No implicit global pool**: serial, budget-one and one-task entries run
   inline; the process-global Rayon pool is never started.
 - **No Rayon type is public**: `scripts/check-no-public-rayon.sh` must pass.
-- **No allocation of the crate's own in steady state**: `tests/alloc_free.rs` must pass; do not add
+- **Steady-state allocation**: `tests/alloc_free.rs` must pass; do not add
   allocation to the entry paths beyond what `REPOSITORY_RULES.md` rule 5 allows.
 - `Exec` stays neither `Clone` nor `Copy` (compile-fail doctests).
 - **Synchronization changes are model-checked**: any change to the park/wake

@@ -534,10 +534,10 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
   code (`Completion`, `Barrier`): a leader asleep in a join, consecutive
   barrier rounds, and a cancellation waking a sleeper; and the submission
   `Latch` (`sched::submit_wait`): a setter waking a waiter that frees the
-  latch at once (a lost wake-up only; loom's `unpark` orders the setter's writes
-  before the waiter's reads by itself, so the ordering rests on `Latch::set`'s
-  Release store pairing with `Latch::wait`'s Acquire load, which the model
-  does not check). The `Parker`'s correctness argument therefore uses only
+  latch at once (a lost wake-up only: the model still passes with relaxed
+  accesses to the flag, so the ordering rests on `Latch::set`'s Release store
+  pairing with `Latch::wait`'s Acquire load, which the model does not check).
+  The `Parker`'s correctness argument therefore uses only
   what loom models (modification order and release sequences of `parked`). CI job `loom`:
   `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 * **Forced interleavings.** With the feature `test-hooks`, `test_hooks` lets a

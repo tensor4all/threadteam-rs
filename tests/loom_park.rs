@@ -222,9 +222,8 @@ struct Submission {
 /// yet parked, wakes, reads that result, and frees the state. A lost wake-up
 /// deadlocks (dropping the `unpark` from `Latch::set` fails this model).
 ///
-/// The model does not check the flag's Release/Acquire pair: loom 0.7's
-/// `unpark` joins the setter's clock into the waiter's at once, so the result
-/// is ordered before the read even with relaxed accesses to the flag.
+/// The model does not check the flag's Release/Acquire pair: with both
+/// accesses to the flag made relaxed, it still passes.
 #[test]
 fn a_set_latch_wakes_its_waiter_and_publishes_the_result() {
     model(|| {

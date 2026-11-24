@@ -107,6 +107,18 @@ fn same_pool_reentry_does_not_install() {
     assert_eq!(ledger::installs(outer_root), 1);
 }
 
+/// One parallel entry made on a token it consumes.
+type Entry = Box<dyn FnOnce(Exec<'_>)>;
+
+/// Runs `entry` on a fresh budget-3 root token of `pool` and returns that
+/// root's `(installs, max_live)`.
+fn counts(pool: &Pool, entry: impl FnOnce(Exec<'_>)) -> (usize, usize) {
+    let exec = Exec::new(pool, 3).unwrap();
+    let root = exec.ledger_root().unwrap();
+    entry(exec);
+    (ledger::installs(root), ledger::max_live(root))
+}
+
 #[test]
 fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
     let pool = pool(4);
@@ -116,42 +128,37 @@ fn a_foreign_worker_entry_counts_one_install_and_stays_in_budget() {
         .unwrap();
     outer.install(|| {
         // On a worker of another pool: every entry leaves the calling thread
-        // once, through `run_tasks` (`for_ranges`, `fork`) or `enter`
-        // (`external`).
+        // once, through `run_tasks` (`for_ranges`, `fork`, `fork_sized`) or
+        // `enter` (`external`).
         assert!(rayon::current_thread_index().is_some());
-
-        let exec = Exec::new(&pool, 3).unwrap();
-        let root = exec.ledger_root().unwrap();
-        exec.for_ranges(12, NonZeroUsize::MIN, |_| nap());
-        assert_eq!(ledger::installs(root), 1);
-        assert!(ledger::max_live(root) <= 3);
-
-        let exec = Exec::new(&pool, 3).unwrap();
-        let root = exec.ledger_root().unwrap();
-        exec.fork(6, |_, _| nap());
-        assert_eq!(ledger::installs(root), 1);
-        assert!(ledger::max_live(root) <= 3);
-
-        let exec = Exec::new(&pool, 3).unwrap();
-        let root = exec.ledger_root().unwrap();
-        exec.fork_sized(&[2, 1], |_, _| nap()).unwrap();
-        assert_eq!(ledger::installs(root), 1);
-        assert!(ledger::max_live(root) <= 3);
-
-        let exec = Exec::new(&pool, 3).unwrap();
-        let root = exec.ledger_root().unwrap();
-        assert_eq!(exec.external(|w| w.get()), 3);
-        assert_eq!(ledger::installs(root), 1);
+        let entries: [(&str, Entry); 4] = [
+            (
+                "for_ranges",
+                Box::new(|e| e.for_ranges(12, NonZeroUsize::MIN, |_| nap())),
+            ),
+            ("fork", Box::new(|e| e.fork(6, |_, _| nap()))),
+            (
+                "fork_sized",
+                Box::new(|e| e.fork_sized(&[2, 1], |_, _| nap()).unwrap()),
+            ),
+            (
+                "external",
+                Box::new(|e| assert_eq!(e.external(|w| w.get()), 3)),
+            ),
+        ];
+        for (name, entry) in entries {
+            let (installs, max_live) = counts(&pool, entry);
+            assert_eq!(installs, 1, "{name}");
+            assert!(max_live <= 3, "{name}: {max_live} tasks at once");
+        }
     });
 }
 
 #[test]
 fn a_broadcast_counts_one_install() {
     let pool = pool(4);
-    let exec = Exec::new(&pool, 3).unwrap();
-    let root = exec.ledger_root().unwrap();
-    exec.broadcast(|_| {}).unwrap();
-    assert_eq!(ledger::installs(root), 1);
+    let (installs, _) = counts(&pool, |e| e.broadcast(|_| {}).unwrap());
+    assert_eq!(installs, 1);
 }
 
 #[test]

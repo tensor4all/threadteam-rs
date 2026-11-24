@@ -1,5 +1,6 @@
-//! Steady-state entries allocate nothing (without the ledger), except the one
-//! job that an entry from a worker of another pool submits.
+//! Steady-state entries other than `broadcast` (whose Rayon call collects its
+//! jobs into a `Vec`) allocate nothing (without the ledger), except the one job
+//! that an entry from a worker of another pool submits.
 #![cfg(all(feature = "parallel", not(feature = "ledger")))]
 
 use std::alloc::{GlobalAlloc, Layout, System};

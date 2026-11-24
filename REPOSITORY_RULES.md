@@ -12,9 +12,10 @@
 4. No ambient thread-local state (the placement record `pin::PLACED` is the one
    thread-local, a non-allocating `Cell`) and no implicit global pool; lazy
    inline execution for serial, budget-one and single-task cases.
-5. Steady-state entries add no allocation of their own. The only allocation
-   an entry makes per call is the one Rayon makes inside the call that hands
-   the work to the pool. Two of the calls entries make allocate there:
+5. A steady-state entry may allocate per call only inside the Rayon call that
+   hands its work to the pool; the crate adds no allocation of its own. This
+   allowance is the rule. As a description of the current code, not a limit
+   on the allowance, two of the hand-off calls entries make allocate:
    `ThreadPool::spawn`, which boxes the job a worker of another pool submits,
    and `ThreadPool::broadcast`, which collects its job list into a `Vec`.
    An allocation amortized over many calls

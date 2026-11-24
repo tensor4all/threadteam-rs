@@ -240,8 +240,8 @@ thread run one of its children, which is one of the tasks already counted.
 
 - **Serial / budget one / one task**: runs inline. No Rayon call, so the global
   registry is never touched.
-- **Already in the target pool**: spawn into the current scope, no install
-  (cheap re-entry).
+- **Already in the target pool**: run the work on the caller (the tasks as a
+  join tree in the current scope), no install (cheap re-entry).
 - **Plain thread**: enter the pool once with `ThreadPool::install` and sleep
   until the work has finished.
 - **Worker of another pool**: submit the work with `ThreadPool::spawn` and block

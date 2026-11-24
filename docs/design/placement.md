@@ -250,7 +250,8 @@ thread run one of its children, which is one of the tasks already counted.
   (https://github.com/tensor4all/threadteam-rs/issues/89). Rayon has no entry
   that borrows the caller's stack and waits without running jobs, so
   `sched::submit_wait` erases the borrow to a raw pointer for `spawn`, and
-  `spawn` boxes the job: one allocation per entry.
+  `spawn` boxes the job: one allocation per entry, besides the amortized
+  blocks of Rayon's job queue.
   `broadcast` keeps Rayon's wait, which still runs the caller's own pool's jobs
   (https://github.com/tensor4all/threadteam-rs/issues/90).
   **Work submitted from a worker of another pool must not wait, directly or
@@ -532,8 +533,9 @@ shim (`std`, or `loom` under `--cfg loom`), and checked three ways:
   one leader and two members: a published section, a released reservation, a
   member that parks twice, and per-slot parkers; and the exact join and barrier
   code (`Completion`, `Barrier`): a leader asleep in a join, consecutive
-  barrier rounds, and a cancellation waking a sleeper; and the submission
-  `Latch` (`sched::submit_wait`): a setter waking a waiter that frees the
+  barrier rounds, and a cancellation waking a sleeper. It also runs the
+  submission `Latch` (`sched::submit_wait`) with one setter and one waiter: a
+  setter waking a waiter that frees the
   latch at once (a lost wake-up only: the model still passes with relaxed
   accesses to the flag, so the ordering rests on `Latch::set`'s Release store
   pairing with `Latch::wait`'s Acquire load, which the model does not check).

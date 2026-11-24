@@ -36,7 +36,8 @@ All notable changes to `threadteam` are recorded here. The format follows
     (`join`/`scope`/channel), for a job of the caller's own pool; with no other worker of that pool free, such a call
     never returns. No public rayon-core API names the caller's pool, so the rule is documented (`Exec` placement,
     README, design record), not checked.
-  - **One allocation** per entry from a worker of another pool (the job `spawn` boxes); entries from other callers
+  - **One allocation** per entry from a worker of another pool (the job `spawn` boxes), besides the amortized blocks
+    of Rayon's job queue; entries from other callers
     allocate what they did before.
   - **Cost.** Such an entry now costs about what the same entry costs from a plain thread, and 2 to 2.5 times what
     it cost before this change (`benches/foreign_entry.rs`, budget 4, run on this change and on the commit before it

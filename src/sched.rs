@@ -108,7 +108,8 @@ pub(crate) fn enter<R: Send>(pool: &Pool, track: &Track, f: impl FnOnce() -> R +
 /// `ThreadPool` entry that waits for its work waits that way, and the spawn
 /// entries, which do not wait, take only `'static` jobs. So the job is spawned
 /// with the borrow erased to a raw pointer, and the caller waits for it here.
-/// `spawn` boxes the job: one allocation per call.
+/// `spawn` boxes the job: one allocation per call, besides the blocks of
+/// Rayon's job queue that every entry from outside the pool amortizes.
 ///
 /// Because the caller runs nothing while it waits, `f` must not wait, directly
 /// or through another thread, for a job of the caller's pool (the precondition

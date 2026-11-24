@@ -90,10 +90,10 @@ fn entries(pool: &Pool) {
 
 /// Smallest allocation count over `rounds` windows of one call each, after warm-up.
 ///
-/// From a plain thread every entry pushes one job into rayon's injector queue,
-/// whose block allocation (one per 63 pushes with crossbeam-deque 0.8) is
-/// amortized and outside this crate; a per-call allocation shows up in every
-/// window, so the minimum separates the two.
+/// From a plain thread or a worker of another pool every entry pushes one job
+/// into rayon's injector queue, whose block allocation (one per 63 pushes with
+/// crossbeam-deque 0.8) is amortized and outside this crate; a per-call
+/// allocation shows up in every window, so the minimum separates the two.
 fn measure(rounds: usize, f: impl Fn()) -> usize {
     for _ in 0..20 {
         f();

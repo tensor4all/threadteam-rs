@@ -48,8 +48,9 @@ mod calibrate;
 ///
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
-/// is a worker of the pool: the tasks run as a join tree on the caller, nothing is
-/// installed. The caller is a plain thread: the pool is entered once and the
+/// is a worker of the pool: the work runs on the caller (the tasks as a join
+/// tree there), nothing is installed. The caller is a plain thread: the pool is
+/// entered once and the
 /// caller sleeps until the tasks, which run on the target pool, have finished.
 /// The caller is a worker of a different pool: it submits the work, which runs
 /// on the target pool, and blocks without running its own pool's jobs until the

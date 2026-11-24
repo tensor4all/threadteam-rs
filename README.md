@@ -102,7 +102,8 @@ the token to kernels by value. Kernels never store a token and never mint one.
   never started implicitly.
 * **Placement by caller.** For a plain token, and for `external` on any token
   (a team token's other entries dispatch on its reserved members): a worker of
-  the target pool spawns into the current scope without installing. A plain thread enters the target pool once and
+  the target pool runs the work on its own thread (the tasks as a join tree in
+  the current scope) without installing. A plain thread enters the target pool once and
   sleeps until the work has finished. A worker of another pool submits the work
   (one allocated job, besides the amortized blocks of Rayon's job queue) and blocks without running its own pool's jobs until the
   work has finished, so its stack does not grow with that pool's pending jobs;

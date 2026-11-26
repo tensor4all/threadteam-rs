@@ -72,7 +72,7 @@ pub use cost::{
     pays_at, width_for_by, width_for_split_by, width_profile_by, DispatchCosts, DispatchKind,
     HostClass, SplitCost, TransferRate, WidthCosts, PAYS,
 };
-pub use error::{Error, Refused};
+pub use error::{CalibrationError, Error, Refused};
 pub use exec::Exec;
 #[cfg(loom)]
 #[doc(hidden)]

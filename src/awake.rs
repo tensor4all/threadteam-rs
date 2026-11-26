@@ -30,7 +30,8 @@
 //!
 //! No thread-local state is used: a member's identity is its slot index.
 
-use crate::error::Refused;
+use crate::cost::{DispatchCosts, DispatchKind, WidthCosts};
+use crate::error::{CalibrationError, Refused};
 use crate::park::Parker;
 use crate::policy::WaitPolicy;
 use core::num::NonZeroUsize;
@@ -38,6 +39,7 @@ use core::sync::atomic::{
     AtomicBool, AtomicPtr, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
 };
 use std::any::Any;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Records a trace event for a member (`Some(slot)`) or a leader (`None`);
@@ -142,7 +144,15 @@ pub(crate) struct Awake {
     /// Bumped by `Pool::release_idle`; members that started earlier leave when idle.
     pub(crate) release_epoch: AtomicUsize,
     pub(crate) defaults: WaitPolicy,
-    pub(crate) costs: crate::cost::DispatchCosts,
+    /// The costs the pool was built with: the owner's
+    /// (`PoolBuilder::dispatch_costs`) or the host default.
+    costs: DispatchCosts,
+    /// The owner installed `costs`; such a pool is never calibrated.
+    explicit_costs: bool,
+    /// The team row `Exec::calibrate_dispatch_costs` measured, set at most once.
+    /// One `OnceLock` publishes the whole row at once: a reader sees the old row
+    /// or the new one, never a mix, with one acquire load and no lock.
+    calibrated_team: OnceLock<WidthCosts>,
     /// Participant pinning (`PoolBuilder::pin_participants`, on by default).
     pub(crate) pin: bool,
     /// Which CPUs of the caller's set the participants take
@@ -174,7 +184,7 @@ impl Awake {
         width: usize,
         defaults: WaitPolicy,
         acquire_timeout: Duration,
-        costs: crate::cost::DispatchCosts,
+        costs: Option<DispatchCosts>,
         pin: bool,
         pin_strategy: crate::pin::PinStrategy,
         spin_polls: u32,
@@ -191,7 +201,9 @@ impl Awake {
             shutdown: AtomicBool::new(false),
             release_epoch: AtomicUsize::new(0),
             defaults,
-            costs,
+            explicit_costs: costs.is_some(),
+            costs: costs.unwrap_or_else(DispatchCosts::host_default),
+            calibrated_team: OnceLock::new(),
             pin,
             pin_strategy,
             pin_skips: AtomicU64::new(0),
@@ -206,6 +218,54 @@ impl Awake {
             #[cfg(feature = "trace")]
             trace: crate::trace::Trace::new(width),
         }
+    }
+
+    /// The team row this pool's team sections are priced from: the calibrated
+    /// row once one is installed, else the built one. A decision reads it once.
+    /// Both rows agree on `WidthCosts::has_multi_node`: only a pool without
+    /// owner costs is calibrated, no default row has a multi-node term and a
+    /// calibrated row has none, so the node records and the topology load keep
+    /// the value the pool was built with.
+    #[inline]
+    pub(crate) fn team_row(&self) -> &WidthCosts {
+        self.calibrated_team
+            .get()
+            .unwrap_or_else(|| self.costs.team_row())
+    }
+
+    /// The row of `kind` this pool prices from ([`team_row`](Self::team_row)
+    /// for the team kind).
+    #[inline]
+    pub(crate) fn row(&self, kind: DispatchKind) -> &WidthCosts {
+        match kind {
+            DispatchKind::Team => self.team_row(),
+            DispatchKind::InPool | DispatchKind::Outside => self.costs.row(kind),
+        }
+    }
+
+    /// The effective costs (`Pool::dispatch_costs`): the built ones with the
+    /// calibrated team row, if any.
+    pub(crate) fn dispatch_costs(&self) -> DispatchCosts {
+        self.costs.with(DispatchKind::Team, *self.team_row())
+    }
+
+    /// The default team row a calibration is checked against, or why this pool
+    /// cannot be calibrated.
+    pub(crate) fn calibration_base(&self) -> Result<&WidthCosts, CalibrationError> {
+        if self.explicit_costs {
+            return Err(CalibrationError::ExplicitCosts);
+        }
+        if self.calibrated_team.get().is_some() {
+            return Err(CalibrationError::AlreadyCalibrated);
+        }
+        Ok(self.costs.team_row())
+    }
+
+    /// Installs a calibrated team row; `AlreadyCalibrated` if another call won.
+    pub(crate) fn install_team_row(&self, row: WidthCosts) -> Result<(), CalibrationError> {
+        self.calibrated_team
+            .set(row)
+            .map_err(|_| CalibrationError::AlreadyCalibrated)
     }
 
     /// Records the node of each member's CPU in a placement: member `k >= 1`, on
@@ -236,7 +296,7 @@ impl Awake {
     /// multi-node term distinguishes nothing more). 1 without reading anything
     /// when the team row has no multi-node term, so the default costs one branch.
     pub(crate) fn team_nodes(&self, lead: impl FnOnce() -> u16, ids: &[usize]) -> NonZeroUsize {
-        if !self.costs.team_row().has_multi_node() {
+        if !self.team_row().has_multi_node() {
             return NonZeroUsize::MIN;
         }
         let span = crate::pin::spans_nodes(

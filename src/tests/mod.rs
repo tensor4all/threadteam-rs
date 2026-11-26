@@ -17,7 +17,7 @@ fn default_child_construction_reads_no_node_slot() {
         .acquire_timeout(Duration::from_secs(10))
         .build()
         .unwrap();
-    assert!(!pool.awake.costs.team_row().has_multi_node());
+    assert!(!pool.awake.team_row().has_multi_node());
     let team = pool.into_team(4).expect("an idle pool");
     let reads = || {
         team.pool()

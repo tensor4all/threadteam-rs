@@ -7,6 +7,18 @@ All notable changes to `threadteam` are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- `Exec::calibrate_dispatch_costs(budget)` and `CalibrationError`: a library that holds only a token measures the
+  team row of a running pool and installs it for every token of that pool, tokens minted before the call included
+  (#92). The method is the shipped `team/load10us-minus-10us` probe of `benches/dispatch_cost.rs` at widths 2, 4
+  and 6 up to the token's budget plus the budget, a warm-up and the median of 9 batches per width, bounded by the
+  wall-time `budget`. Install is all or nothing and one-shot: a width outside `0 < measured <= 10 * default`, a
+  budget too small (refused before any section runs) or exhausted, or members that cannot be reserved install
+  nothing. `Exec::serial()`, a token of one slot and a pool built with `PoolBuilder::dispatch_costs` fail without
+  touching the table. Only the team row is replaced; the default rows are unchanged, and `Pool::dispatch_costs`,
+  `dispatch_cost`, `pays` and `width_for*` read the effective row once per decision.
+
 ## [0.6.1] - 2026-11-22
 
 This is a patch release although it adds API (`width_profile_by`, `WidthCosts::with_multi_node`, `at_nodes`) and

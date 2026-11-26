@@ -292,6 +292,8 @@ impl Exec<'_> {
     pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration;  // MAX: serial or width < 2
     pub fn pays(&self, estimate: Duration, sections: u32, width: NonZeroUsize) -> bool;
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize;
+    // One-shot measurement of the team row, installed for every token of the pool (#92).
+    pub fn calibrate_dispatch_costs(&mut self, budget: Duration) -> Result<WidthCosts, CalibrationError>;
 }
 impl TeamExec<'_> { dispatch_cost, pays, width_for, dispatch_costs() }
 pub fn pays_at(estimate: Duration, sections: u32, dispatch_cost: Duration) -> bool;

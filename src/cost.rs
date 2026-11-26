@@ -570,6 +570,16 @@ impl DispatchCosts {
         &self.team
     }
 
+    /// The row of `kind`.
+    #[inline]
+    pub(crate) fn row(&self, kind: DispatchKind) -> &WidthCosts {
+        match kind {
+            DispatchKind::Team => &self.team,
+            DispatchKind::InPool => &self.in_pool,
+            DispatchKind::Outside => &self.outside,
+        }
+    }
+
     /// The cheapest cost of `kind` over all widths ([`WidthCosts::min`]): a
     /// region below `PAYS * min_cost(kind)` pays at no width of that kind.
     pub fn min_cost(&self, kind: DispatchKind) -> Duration {
@@ -599,6 +609,22 @@ impl DispatchCosts {
 impl Default for DispatchCosts {
     fn default() -> Self {
         DispatchCosts::host_default()
+    }
+}
+
+/// The cost of one section of `width` participants from a row and node count
+/// the caller read once for its whole decision, so that a scan over widths never
+/// mixes two rows (`Exec::calibrate_dispatch_costs` may install one meanwhile).
+/// `Duration::MAX` without a row or below width 2: no section. The caller clamps
+/// `width` to its budget.
+#[inline]
+pub(crate) fn section_cost(
+    priced: Option<(&WidthCosts, NonZeroUsize)>,
+    width: NonZeroUsize,
+) -> Duration {
+    match priced {
+        Some((row, nodes)) if width.get() >= 2 => row.at_nodes(width, nodes),
+        _ => Duration::MAX,
     }
 }
 

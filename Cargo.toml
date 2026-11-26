@@ -93,3 +93,26 @@ required-features = ["parallel"]
 name = "resident_split"
 harness = false
 required-features = ["parallel"]
+
+# No default profile carries debug info (tensor4all-agent-rules, rules/rust/performance.md,
+# "Build Profiles And Target Hygiene"); `debug-assertions` and `overflow-checks` stay on.
+[profile.dev]
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+[profile.test]
+debug = 0
+debug-assertions = true
+overflow-checks = true
+
+# CI builds and tests with this profile (tensor4all-agent-rules, rules/common/repository.md,
+# "Build Profiles"). It inherits `test`, not `release`: the work split and the team's budget
+# arithmetic state their invariants as `debug_assert!`s (`src/split.rs`), the park/wake and
+# participant code is `unsafe` concurrency, and the standard library's unsafe-precondition checks
+# and integer overflow checks only run with `debug-assertions` and `overflow-checks` on. The loom
+# job keeps its own `--release`.
+[profile.ci]
+inherits = "test"
+incremental = false
+strip = "symbols"

@@ -13,13 +13,13 @@ This file only records what is specific to `threadteam-rs`:
 - **MSRV**: none is declared — no `rust-version` in `Cargo.toml` and no `rust-toolchain.toml`. CI pins `stable`, and
   `nightly` only in the `placement` lane that runs `cargo-public-api`, so there is no MSRV claim for CI to hold and
   no `msrv` job.
-- **Feature combinations CI builds**: `cargo test` (default, which is `parallel`), `cargo test --all-features` and
-  `cargo test --no-default-features`, each on Linux and macOS; `clippy --all-targets` with `--all-features` and with
+- **Feature combinations CI builds**: `cargo test --profile ci` (default, which is `parallel`), `cargo test --profile ci --all-features` and
+  `cargo test --profile ci --no-default-features`, each on Linux and macOS; `clippy --all-targets` with `--all-features` and with
   `--no-default-features`; and a `loom` lane running `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
   The `ledger`, `test-hooks` and `trace` features are test support and are enabled only by the test lanes.
 - **Platforms claimed**: `ubuntu-latest` and `macos-latest`. The crate has Linux-only (`sched_getaffinity`) and
   Apple-only (`pthread_set_qos_class_self_np`) code; no other target is built.
-- **Local gate**: `cargo test --all-features`.
+- **Local gate**: `cargo test --profile ci --all-features` (`[profile.ci]` in `Cargo.toml`; it inherits `test`).
 
 ## Anything here that departs from the shared rules
 

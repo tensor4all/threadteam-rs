@@ -46,11 +46,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Default features
-        run: cargo test
+        run: cargo test --profile ci
       - name: All features
-        run: cargo test --all-features
+        run: cargo test --profile ci --all-features
       - name: No default features
-        run: cargo test --no-default-features
+        run: cargo test --profile ci --no-default-features
 
   placement:
     name: placement rules

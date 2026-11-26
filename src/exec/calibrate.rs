@@ -2,11 +2,12 @@
 //! team probe of `benches/dispatch_cost.rs` (`team/load10us-minus-10us`), run
 //! inside the library under a wall-time budget.
 
-use super::Exec;
+use super::{Exec, TeamAuth};
 use crate::cost::WidthCosts;
 use crate::error::CalibrationError;
-use crate::team::{spread_raw, TeamExec};
+use crate::policy::WaitOverride;
 use core::num::NonZeroUsize;
+use core::sync::atomic::AtomicUsize;
 use core::time::Duration;
 use std::time::Instant;
 
@@ -30,9 +31,10 @@ const LADDER: [usize; 3] = [2, 4, 6];
 pub(crate) trait Sampler {
     /// Time since the calibration started.
     fn elapsed(&self) -> Duration;
-    /// Runs `iters` back-to-back sections of `width` participants on `team`,
-    /// each share spinning for [`LOAD_NS`], and returns their total time.
-    fn batch(&mut self, team: &mut TeamExec<'_>, width: NonZeroUsize, iters: u32) -> Duration;
+    /// Runs `iters` back-to-back sections of `width` participants on the team
+    /// token `token`, each share spinning for [`LOAD_NS`], and returns their
+    /// total time.
+    fn batch(&mut self, token: &mut Exec<'_>, width: NonZeroUsize, iters: u32) -> Duration;
 }
 
 /// The wall clock and real sections.
@@ -43,17 +45,13 @@ impl Sampler for Wall {
         self.0.elapsed()
     }
 
-    fn batch(&mut self, team: &mut TeamExec<'_>, width: NonZeroUsize, iters: u32) -> Duration {
-        // The section of `Exec::for_ranges(w, 1, ..)` on a team token, called
-        // through `spread_raw` directly: without `for_ranges`' home pin (the
-        // `team` scope already placed the leader) and without its per-share
-        // ledger tracking.
-        let ids = &team.ids[..width.get() - 1];
+    fn batch(&mut self, token: &mut Exec<'_>, width: NonZeroUsize, iters: u32) -> Duration {
         let start = Instant::now();
         for _ in 0..iters {
-            spread_raw(team.awake, ids, width.get(), team.over, |_| {
-                spin_for(LOAD_NS)
-            });
+            token
+                .reborrow()
+                .limit(width)
+                .for_ranges(width.get(), NonZeroUsize::MIN, |_| spin_for(LOAD_NS));
         }
         start.elapsed()
     }
@@ -86,6 +84,35 @@ fn per_call(default: &WidthCosts, width: NonZeroUsize) -> Duration {
     Duration::from_nanos(LOAD_NS).saturating_add(default.at(width))
 }
 
+/// Measures every width of `widths` on the team token `token` and checks it
+/// against `default`: the anchors of the row, in ladder order.
+fn ladder_anchors(
+    sampler: &mut impl Sampler,
+    token: &mut Exec<'_>,
+    widths: &[NonZeroUsize],
+    default: &WidthCosts,
+    budget: Duration,
+) -> Result<[(usize, Duration); LADDER.len() + 1], CalibrationError> {
+    // One batch is at most budget / (widths * (batches + 1)).
+    let slot = budget / (widths.len() as u32 * (BATCHES + 1));
+    let mut anchors = [(0usize, Duration::ZERO); LADDER.len() + 1];
+    for (anchor, &w) in anchors.iter_mut().zip(widths) {
+        let iters = slot.as_nanos() / per_call(default, w).as_nanos().max(1);
+        let iters = u32::try_from(iters).unwrap_or(u32::MAX).max(MIN_ITERS);
+        let measured = measure(&mut *sampler, &mut *token, w, iters, budget)?;
+        let limit = default.at(w).saturating_mul(K);
+        if measured.is_zero() || measured > limit {
+            return Err(CalibrationError::Rejected {
+                width: w,
+                measured,
+                limit,
+            });
+        }
+        *anchor = (w.get(), measured);
+    }
+    Ok(anchors)
+}
+
 /// The median over [`BATCHES`] of the mean cost per section minus the load,
 /// after a warm-up of `iters / 10 + 10` sections (as `per_call_ns` in the
 /// bench). The deadline is checked before every batch, warm-up included, so
@@ -93,7 +120,7 @@ fn per_call(default: &WidthCosts, width: NonZeroUsize) -> Duration {
 /// below zero.
 fn measure(
     sampler: &mut impl Sampler,
-    team: &mut TeamExec<'_>,
+    token: &mut Exec<'_>,
     width: NonZeroUsize,
     iters: u32,
     budget: Duration,
@@ -102,13 +129,13 @@ fn measure(
     if sampler.elapsed() >= budget {
         return Err(exhausted);
     }
-    sampler.batch(team, width, iters / 10 + 10);
+    sampler.batch(token, width, iters / 10 + 10);
     let mut ns = [0f64; BATCHES as usize];
     for slot in &mut ns {
         if sampler.elapsed() >= budget {
             return Err(exhausted);
         }
-        let t = sampler.batch(team, width, iters);
+        let t = sampler.batch(token, width, iters);
         *slot = t.as_nanos() as f64 / f64::from(iters) - LOAD_NS as f64;
     }
     ns.sort_by(f64::total_cmp);
@@ -123,7 +150,7 @@ fn measure(
 impl Exec<'_> {
     /// Measures this pool's team row at the ladder widths up to
     /// [`budget`](Self::budget) within the wall time `budget` and installs it
-    /// for every token of the pool.
+    /// for every team-priced read of the pool.
     ///
     /// For a library that holds only a token: the class row of
     /// [`DispatchCosts::host_default`](crate::DispatchCosts::host_default) can
@@ -133,13 +160,22 @@ impl Exec<'_> {
     /// # Method
     ///
     /// The shipped team probe (`benches/dispatch_cost.rs`,
-    /// `team/load10us-minus-10us`): back-to-back team sections of `w`
-    /// participants whose shares each spin for 10 us, minus those 10 us, at the
-    /// widths 2, 4 and 6 up to the token's budget plus the budget itself. Per
-    /// width a warm-up, then the median of 9 batches of the mean nanoseconds
-    /// per section. The sections run under [`team`](Self::team), so a plain
-    /// token reserves its members for the call and a token that carries a team
-    /// uses it. Above the largest measured width the row extrapolates as
+    /// `team/load10us-minus-10us`): back-to-back
+    /// `reborrow().limit(w).for_ranges(w, 1, ..)` calls on a team token, whose
+    /// `w` shares each spin for 10 us, minus those 10 us, at the widths 2, 4
+    /// and 6 up to the token's budget plus the budget itself. Per width a
+    /// warm-up, then the median of 9 batches of the mean nanoseconds per call.
+    /// Each call is the full [`for_ranges`](Self::for_ranges) entry a consumer
+    /// pays: the leader's home check, the section and its join, and the
+    /// ledger bookkeeping when that feature is on.
+    ///
+    /// A token that carries a team measures on itself. A plain token reserves
+    /// its members for the call as [`team`](Self::team) does (the root scope
+    /// places them when pinning is on) and measures on a team token over that
+    /// reservation, which records the scope's placement the way a
+    /// [`Team`](crate::Team)'s whole-team scope does, so each call takes the
+    /// path of a placed team token. Above the largest measured width the row
+    /// extrapolates as
     /// [`WidthCosts`] documents; calibrate from a token whose budget is the
     /// pool's width to cover the whole pool.
     ///
@@ -156,11 +192,13 @@ impl Exec<'_> {
     /// # What is installed
     ///
     /// All or nothing: on `Ok` the returned row replaces the team row of
-    /// [`Pool::dispatch_costs`](crate::Pool::dispatch_costs) and of every
-    /// token's [`dispatch_cost`](Self::dispatch_cost), [`pays`](Self::pays) and
-    /// `width_for*`, including tokens that existed before the call and those of
-    /// a [`TeamExec`]; on `Err` nothing is installed. The in-pool and outside
-    /// rows are not calibrated. A decision already in flight finishes on the
+    /// [`Pool::dispatch_costs`](crate::Pool::dispatch_costs) and every
+    /// team-priced read of the pool: [`dispatch_cost`](Self::dispatch_cost),
+    /// [`pays`](Self::pays) and `width_for*` of team tokens (tokens with team
+    /// authority, including those that existed before the call) and of every
+    /// [`TeamExec`](crate::TeamExec); on `Err` nothing is installed. A plain
+    /// token's own reads price from the in-pool and outside rows, which are not
+    /// calibrated and do not move. A decision already in flight finishes on the
     /// row it read; a decision never mixes the two rows.
     ///
     /// A measurement is accepted when `0 < measured <= 10 * default` at every
@@ -226,34 +264,48 @@ impl Exec<'_> {
         if budget < needed {
             return Err(CalibrationError::BudgetTooSmall { needed });
         }
-        // One batch is at most budget / (widths * (batches + 1)).
-        let slot = budget / (len as u32 * (BATCHES + 1));
-        let top = self.budget;
-        let measured = self.team(|mut team| {
-            if team.size() != top {
-                return Err(CalibrationError::TeamUnavailable);
-            }
-            let mut anchors = [(0usize, Duration::ZERO); LADDER.len() + 1];
-            for (anchor, &w) in anchors.iter_mut().zip(widths) {
-                let iters = slot.as_nanos() / per_call(&default, w).as_nanos().max(1);
-                let iters = u32::try_from(iters).unwrap_or(u32::MAX).max(MIN_ITERS);
-                let measured = measure(&mut *sampler, &mut team, w, iters, budget)?;
-                let limit = default.at(w).saturating_mul(K);
-                if measured.is_zero() || measured > limit {
-                    return Err(CalibrationError::Rejected {
-                        width: w,
-                        measured,
-                        limit,
-                    });
-                }
-                *anchor = (w.get(), measured);
-            }
-            Ok(anchors)
-        });
-        let anchors = measured.map_err(|_| CalibrationError::TeamUnavailable)??;
-        let Some(row) = WidthCosts::from_anchors(&anchors[..len]) else {
-            unreachable!("the ladder is strictly increasing from 2 and at most u16::MAX");
+        let anchors = if self.team.is_some() {
+            // A token with team authority measures on itself: the sections are
+            // the ones its own consumers dispatch.
+            ladder_anchors(sampler, self, widths, &default, budget)?
+        } else {
+            // A plain token reserves members for the call, and the sections run
+            // on a team token over that reservation. The scope records its home
+            // as a `Team`'s root scope over the whole budget does, so the token's
+            // `for_ranges` takes the path of a placed team token.
+            let home = AtomicUsize::new(0);
+            let top = self.budget;
+            self.team_scope(WaitOverride::new(), Some(&home), |team| {
+                let awake = match team.awake {
+                    Some(awake) if team.size() == top => awake,
+                    _ => return Err(CalibrationError::TeamUnavailable),
+                };
+                let mut token = Exec {
+                    pool: Some(pool),
+                    budget: top,
+                    child: false,
+                    track: team.track.alias(),
+                    team: Some(TeamAuth {
+                        awake,
+                        ids: team.ids,
+                        policy: team.policy,
+                        over: team.over,
+                        reserved: team.ids.len(),
+                        placement: Some(&home),
+                        lead_node: crate::pin::NO_NODE,
+                        owner: crate::pin::NO_OWNER,
+                    }),
+                    _leader: None,
+                };
+                ladder_anchors(sampler, &mut token, widths, &default, budget)
+            })
+            .map_err(|_| CalibrationError::TeamUnavailable)??
         };
+        // The ladder is 2, 4, 6 below the budget and then the budget, capped at
+        // u16::MAX, with the budget at least 2: at most four strictly increasing
+        // widths in 2..=u16::MAX, which `from_anchors` always accepts.
+        let row = WidthCosts::from_anchors(&anchors[..len])
+            .expect("a ladder of at most four strictly increasing widths from 2 to u16::MAX");
         awake.install_team_row(row)?;
         Ok(row)
     }

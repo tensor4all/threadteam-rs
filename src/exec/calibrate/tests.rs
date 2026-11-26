@@ -74,7 +74,7 @@ impl<F: Fn(usize) -> i64> Sampler for Scripted<F> {
         self.clock
     }
 
-    fn batch(&mut self, _team: &mut TeamExec<'_>, width: NonZeroUsize, iters: u32) -> Duration {
+    fn batch(&mut self, _token: &mut Exec<'_>, width: NonZeroUsize, iters: u32) -> Duration {
         self.batches += 1;
         if self.exhaust_at == Some(width.get()) {
             self.clock = Duration::MAX;
@@ -504,14 +504,23 @@ fn reads_after_an_install_do_not_allocate() {
         .expect("carried members");
 }
 
-/// Test 8: the wall clock, any outcome; only the install invariant is checked.
+/// Test 8: the wall clock, any outcome; only the install invariant is checked,
+/// from a plain token and from a team token.
 #[test]
 fn a_real_calibration_installs_what_it_returns_or_nothing() {
-    let pool = pool(4);
-    let mut exec = Exec::new(&pool, 4).unwrap();
     let default = DispatchCosts::host_default();
-    match exec.calibrate_dispatch_costs(Duration::from_millis(300)) {
+    let installs = |pool: &Pool, r: Result<WidthCosts, CalibrationError>| match r {
         Ok(row) => assert_eq!(pool.dispatch_costs(), default.with(DispatchKind::Team, row)),
         Err(_) => assert_eq!(pool.dispatch_costs(), default),
-    }
+    };
+    let pool = pool(4);
+    let r = Exec::new(&pool, 4)
+        .unwrap()
+        .calibrate_dispatch_costs(Duration::from_millis(300));
+    installs(&pool, r);
+    let team = pool_team(4);
+    let r = team
+        .exec(4)
+        .calibrate_dispatch_costs(Duration::from_millis(300));
+    installs(team.pool(), r);
 }

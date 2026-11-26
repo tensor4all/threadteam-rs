@@ -262,7 +262,8 @@ impl<'p> Exec<'p> {
     /// The numbers come from the pool's [`DispatchCosts`](crate::DispatchCosts) (see
     /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)), with
     /// the team row a [`calibrate_dispatch_costs`](Self::calibrate_dispatch_costs)
-    /// on any token of the pool installed, read once per call. The
+    /// on any token of the pool installed (team tokens only; the plain kinds are
+    /// not calibrated), read once per call. The
     /// call allocates nothing and reads no thread-local state of this crate.
     /// The answer depends on the calling thread, so ask it on the thread that
     /// will dispatch.
@@ -1101,6 +1102,21 @@ impl<'p> Exec<'p> {
         over: WaitOverride,
         f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
     ) -> Result<R, Refused> {
+        self.team_scope(over, None, f)
+    }
+
+    /// [`team_with`](Exec::team_with), where the root scope of a plain token
+    /// records the home of its placement in `placement` as a
+    /// [`Team`](crate::Team)'s whole-team root scope records its own (`0` when it
+    /// placed nobody), so that a team token over the reservation dispatches as
+    /// a placed one. A token that carries a team keeps its own placement and
+    /// ignores `placement`.
+    pub(crate) fn team_scope<R>(
+        &mut self,
+        over: WaitOverride,
+        placement: Option<&AtomicUsize>,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
         if let Some(t) = self.team {
             // Carried members: the (sub)team is available without acquisition.
             let mut team = TeamExec {
@@ -1209,7 +1225,7 @@ impl<'p> Exec<'p> {
         // pinning the participants acknowledge as before. The guard gives the
         // leader its mask back when the scope ends or unwinds.
         let pin = if team.size().get() > 1 {
-            pin_scope(&mut team, None, crate::pin::NO_OWNER)
+            pin_scope(&mut team, placement, crate::pin::NO_OWNER)
         } else {
             None
         };

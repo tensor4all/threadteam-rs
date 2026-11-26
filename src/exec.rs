@@ -278,7 +278,11 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().dispatch_cost(two), Duration::MAX);
     /// ```
     pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
-        section_cost(self.priced(), width.min(self.budget))
+        let width = width.min(self.budget);
+        if width.get() < 2 {
+            return Duration::MAX;
+        }
+        section_cost(self.priced(), width)
     }
 
     /// The row and node count this token's sections are priced at, read once
@@ -332,6 +336,9 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for(Duration::from_secs(1), 1).get(), 1);
     /// ```
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
+        if self.budget.get() < 2 {
+            return NonZeroUsize::MIN;
+        }
         let priced = self.priced();
         width_for_by(estimate, sections, self.budget, |k| {
             section_cost(priced, k.min(self.budget))
@@ -362,6 +369,9 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for_split(split).get(), 1);
     /// ```
     pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
+        if self.budget.get() < 2 {
+            return NonZeroUsize::MIN;
+        }
         let priced = self.priced();
         width_for_split_by(
             split,
@@ -708,7 +718,7 @@ impl<'p> Exec<'p> {
                     // slot `ids[start - 1]`; its node is read only with a
                     // multi-node term (unknown otherwise, and never priced).
                     lead_node: match start.checked_sub(1) {
-                        Some(lead) if k > 0 && t.awake.team_row().has_multi_node() => t
+                        Some(lead) if k > 0 && t.awake.multi_node() => t
                             .ids
                             .get(lead)
                             .map_or(crate::pin::NO_NODE, |&id| t.awake.node(id)),
@@ -1101,7 +1111,7 @@ impl<'p> Exec<'p> {
                 over: t.over,
                 // Only with a multi-node term: the home's node is a topology
                 // lookup, which a pool without one may not have loaded.
-                lead_node: if t.awake.team_row().has_multi_node() {
+                lead_node: if t.awake.multi_node() {
                     t.lead()
                 } else {
                     crate::pin::NO_NODE
@@ -1294,7 +1304,7 @@ fn pin_scope(
     let Some(here) = crate::pin::read_here() else {
         // Nothing is placed; the members are wherever an earlier reservation
         // left them, which is not this team's placement.
-        if awake.team_row().has_multi_node() {
+        if awake.multi_node() {
             awake.record_nodes(team.ids, None);
         }
         return None;
@@ -1309,7 +1319,7 @@ fn pin_scope(
     // The nodes the members are pinned onto, for the multi-node term of the
     // team row (`WidthCosts::with_multi_node`); recorded only when one is
     // installed, so the default path does nothing more.
-    let nodes = awake.team_row().has_multi_node();
+    let nodes = awake.multi_node();
     if cpus < team.size().get() {
         if nodes {
             awake.record_nodes(team.ids, None);

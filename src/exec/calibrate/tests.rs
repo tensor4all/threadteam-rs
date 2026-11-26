@@ -329,24 +329,57 @@ fn calibration_is_one_shot_and_never_replaces_owner_costs() {
     assert_eq!(s.batches, 0);
 }
 
+/// `width_for(est, 1)` on a team of three priced at `D(2) = d2`, `D(3) = d3`.
+fn answer(est: Duration, d2: Duration, d3: Duration) -> NonZeroUsize {
+    width_for_by(est, 1, nz(3), |k| match k.get() {
+        2 => d2,
+        3 => d3,
+        _ => Duration::MAX,
+    })
+}
+
 /// Test 6: readers on other threads see the old row or the new one, never a
 /// mix, and the new one once the install is published.
+///
+/// The new row flips the default row's `D(2)` / `D(3)` ordering, so that at
+/// the chosen estimate the old row, the new row and a scan that read `D(2)`
+/// from one row and `D(3)` from the other give different widths.
 #[test]
 fn readers_never_mix_the_rows() {
     let pool = pool(8);
     let default = DispatchCosts::host_default();
     let old = *default.row(DispatchKind::Team);
-    let new = row_of(4, twice);
-    let est = Duration::from_micros(20);
-    let width = |row: &WidthCosts| {
-        width_for_by(est, 1, nz(3), |k| {
-            if k.get() < 2 {
-                Duration::MAX
-            } else {
-                row.at(k.min(nz(3)))
-            }
-        })
+    let (a, b) = (
+        old.at(nz(2)).as_nanos() as i64,
+        old.at(nz(3)).as_nanos() as i64,
+    );
+    // Anchors at widths 2 and 4 (a budget-4 ladder), so D(3) interpolates.
+    // D(2) <= D(3): D(2) = 2a and D(4) = 2 give D(3) = a + 1. D(2) > D(3):
+    // D(2) = b and D(4) = 4a give D(3) = (b + 4a) / 2 > a. Both are within
+    // (0, K * default].
+    let flip = move |w: usize| match (a <= b, w) {
+        (true, 2) => 2 * a,
+        (true, _) => 2,
+        (false, 2) => b,
+        (false, _) => 4 * a,
     };
+    let new = row_of(4, flip);
+    let at = |row: &WidthCosts, k: usize| row.at(nz(k));
+    let est = (1..=30 * a as u64)
+        .map(Duration::from_nanos)
+        .find(|&est| {
+            let o = answer(est, at(&old, 2), at(&old, 3));
+            let n = answer(est, at(&new, 2), at(&new, 3));
+            let mixes = [
+                answer(est, at(&old, 2), at(&new, 3)),
+                answer(est, at(&new, 2), at(&old, 3)),
+            ];
+            o != n && mixes.iter().any(|&m| m != o && m != n)
+        })
+        .expect("an estimate where a mixed read answers neither row");
+    let old_width = answer(est, at(&old, 2), at(&old, 3));
+    let new_width = answer(est, at(&new, 2), at(&new, 3));
+    assert_ne!(old_width, new_width);
     let installed = AtomicBool::new(false);
     std::thread::scope(|s| {
         for _ in 0..2 {
@@ -365,11 +398,11 @@ fn readers_never_mix_the_rows() {
                         if done {
                             after += 1;
                             assert_eq!(c, new.at(nz(3)));
-                            assert_eq!(w, width(&new));
+                            assert_eq!(w, new_width);
                             assert_eq!(costs, default.with(DispatchKind::Team, new));
                         } else {
                             assert!(c == old.at(nz(3)) || c == new.at(nz(3)));
-                            assert!(w == width(&old) || w == width(&new));
+                            assert!(w == old_width || w == new_width, "mixed width {w}");
                             assert!(
                                 costs == default || costs == default.with(DispatchKind::Team, new)
                             );
@@ -381,7 +414,7 @@ fn readers_never_mix_the_rows() {
         }
         let r = Exec::new(&pool, 4)
             .unwrap()
-            .calibrate_by(BUDGET, &mut scripted(twice));
+            .calibrate_by(BUDGET, &mut scripted(flip));
         installed.store(true, Ordering::Release);
         assert_eq!(r, Ok(new));
     });

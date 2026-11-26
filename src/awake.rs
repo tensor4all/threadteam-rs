@@ -222,15 +222,22 @@ impl Awake {
 
     /// The team row this pool's team sections are priced from: the calibrated
     /// row once one is installed, else the built one. A decision reads it once.
-    /// Both rows agree on `WidthCosts::has_multi_node`: only a pool without
-    /// owner costs is calibrated, no default row has a multi-node term and a
-    /// calibrated row has none, so the node records and the topology load keep
-    /// the value the pool was built with.
+    /// For pricing only; whether a multi-node term exists is
+    /// [`multi_node`](Self::multi_node).
     #[inline]
     pub(crate) fn team_row(&self) -> &WidthCosts {
         self.calibrated_team
             .get()
             .unwrap_or_else(|| self.costs.team_row())
+    }
+
+    /// Whether the team row has a multi-node term, read from the built row: the
+    /// calibrated row agrees (only a pool without owner costs is calibrated, no
+    /// default row has a term and a calibrated row has none), so the dispatch
+    /// paths that only need this flag never load the calibrated row.
+    #[inline]
+    pub(crate) fn multi_node(&self) -> bool {
+        self.costs.team_row().has_multi_node()
     }
 
     /// The row of `kind` this pool prices from ([`team_row`](Self::team_row)
@@ -296,7 +303,7 @@ impl Awake {
     /// multi-node term distinguishes nothing more). 1 without reading anything
     /// when the team row has no multi-node term, so the default costs one branch.
     pub(crate) fn team_nodes(&self, lead: impl FnOnce() -> u16, ids: &[usize]) -> NonZeroUsize {
-        if !self.team_row().has_multi_node() {
+        if !self.multi_node() {
             return NonZeroUsize::MIN;
         }
         let span = crate::pin::spans_nodes(

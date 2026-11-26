@@ -44,7 +44,10 @@ impl Sampler for Wall {
     }
 
     fn batch(&mut self, team: &mut TeamExec<'_>, width: NonZeroUsize, iters: u32) -> Duration {
-        // The section `Exec::for_ranges(w, 1, ..)` runs on a team token.
+        // The section of `Exec::for_ranges(w, 1, ..)` on a team token, called
+        // through `spread_raw` directly: without `for_ranges`' home pin (the
+        // `team` scope already placed the leader) and without its per-share
+        // ledger tracking.
         let ids = &team.ids[..width.get() - 1];
         let start = Instant::now();
         for _ in 0..iters {
@@ -142,9 +145,11 @@ impl Exec<'_> {
     ///
     /// # Budget
     ///
-    /// `budget` bounds the whole call. A budget below the minimum measurement
-    /// (every width, 10 batches of at least 100 sections at the default row's
-    /// cost) is refused before any section runs. Otherwise every width gets an
+    /// `budget` bounds the whole call. The minimum reserves, at every width, 10
+    /// slots of 100 sections at the default row's cost: the 9 timed batches of
+    /// at least 100 sections and the warm-up (which runs `iters / 10 + 10`
+    /// sections, 20 at the minimum). A budget below it is refused before any
+    /// section runs. Otherwise every width gets an
     /// equal share; the deadline is checked before every batch, so the call
     /// overruns by at most one batch.
     ///

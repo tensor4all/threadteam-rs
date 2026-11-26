@@ -204,7 +204,9 @@ impl Pool {
         self.awake.release_epoch.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// The [`DispatchCosts`] of this pool's tokens.
+    /// The [`DispatchCosts`] of this pool's tokens: the built ones, with the
+    /// team row an [`Exec::calibrate_dispatch_costs`](crate::Exec::calibrate_dispatch_costs)
+    /// installed, if one did.
     ///
     /// # Examples
     ///
@@ -215,7 +217,7 @@ impl Pool {
     /// # Ok::<(), threadteam::Error>(())
     /// ```
     pub fn dispatch_costs(&self) -> DispatchCosts {
-        self.awake.costs
+        self.awake.dispatch_costs()
     }
 
     /// Whether the pool places the participants of a root team scope (see
@@ -462,7 +464,9 @@ pub struct PoolBuilder {
     wait: WaitPolicy,
     acquire_timeout: Duration,
     qos: Option<Qos>,
-    costs: DispatchCosts,
+    /// `Some` once the owner installed costs (`dispatch_costs`); `None` takes
+    /// the host default and leaves the pool open to calibration.
+    costs: Option<DispatchCosts>,
     pin_participants: bool,
     pin_strategy: PinStrategy,
     spin_polls: u32,
@@ -478,7 +482,7 @@ impl PoolBuilder {
             wait: WaitPolicy::DEFAULT,
             acquire_timeout: DEFAULT_ACQUIRE_TIMEOUT,
             qos: None,
-            costs: DispatchCosts::host_default(),
+            costs: None,
             pin_participants: PIN_PARTICIPANTS_DEFAULT,
             pin_strategy: PinStrategy::Spread,
             spin_polls: SPIN_POLLS_DEFAULT,
@@ -645,7 +649,11 @@ impl PoolBuilder {
     ///
     /// Defaults to [`DispatchCosts::host_default`]. The costs feed
     /// [`Exec::dispatch_cost`](crate::Exec::dispatch_cost) and everything built on
-    /// it (`pays`, `width_for`); they never change how work is placed.
+    /// it (`pays`, `width_for`); they never change how work is placed. A pool
+    /// built with this override keeps the owner's costs:
+    /// [`Exec::calibrate_dispatch_costs`](crate::Exec::calibrate_dispatch_costs)
+    /// refuses it with
+    /// [`CalibrationError::ExplicitCosts`](crate::CalibrationError::ExplicitCosts).
     ///
     /// # Examples
     ///
@@ -665,7 +673,7 @@ impl PoolBuilder {
     /// ```
     #[must_use]
     pub fn dispatch_costs(mut self, costs: DispatchCosts) -> Self {
-        self.costs = costs;
+        self.costs = Some(costs);
         self
     }
 
@@ -883,7 +891,12 @@ impl PoolBuilder {
             return Err(Error::ZeroThreads);
         }
         if self.pin_participants
-            && (self.pin_strategy == PinStrategy::Spread || self.costs.team_row().has_multi_node())
+            && (self.pin_strategy == PinStrategy::Spread
+                || self
+                    .costs
+                    .unwrap_or_else(DispatchCosts::host_default)
+                    .team_row()
+                    .has_multi_node())
         {
             // Read the NUMA topology now (once per process), so a root scope
             // never touches sysfs or allocates for it: a spreading pool places

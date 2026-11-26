@@ -4,7 +4,8 @@ use crate::awake::Awake;
 #[cfg(feature = "parallel")]
 use crate::awake::LendGuard;
 use crate::cost::{
-    pays_at, width_for_by, width_for_split_by, DispatchKind, SplitCost, TransferRate,
+    pays_at, section_cost, width_for_by, width_for_split_by, DispatchKind, SplitCost, TransferRate,
+    WidthCosts,
 };
 use crate::error::{Error, Refused};
 use crate::policy::{WaitOverride, WaitPolicy};
@@ -19,6 +20,8 @@ use core::num::NonZeroUsize;
 use core::ops::Range;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::time::Duration;
+
+mod calibrate;
 
 /// `budget` slots of a [`Pool`], or the calling thread alone.
 ///
@@ -257,7 +260,10 @@ impl<'p> Exec<'p> {
     /// installed, the default, nothing is read.
     ///
     /// The numbers come from the pool's [`DispatchCosts`](crate::DispatchCosts) (see
-    /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)). The
+    /// [`PoolBuilder::dispatch_costs`](crate::PoolBuilder::dispatch_costs)), with
+    /// the team row a [`calibrate_dispatch_costs`](Self::calibrate_dispatch_costs)
+    /// on any token of the pool installed (team tokens only; the plain kinds are
+    /// not calibrated), read once per call. The
     /// call allocates nothing and reads no thread-local state of this crate.
     /// The answer depends on the calling thread, so ask it on the thread that
     /// will dispatch.
@@ -273,34 +279,31 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().dispatch_cost(two), Duration::MAX);
     /// ```
     pub fn dispatch_cost(&self, width: NonZeroUsize) -> Duration {
-        self.dispatch_cost_on(width, self.nodes())
-    }
-
-    /// [`dispatch_cost`](Self::dispatch_cost) with the node count of a team
-    /// token already read, so a search over widths reads it once.
-    fn dispatch_cost_on(&self, width: NonZeroUsize, nodes: NonZeroUsize) -> Duration {
         let width = width.min(self.budget);
         if width.get() < 2 {
             return Duration::MAX;
         }
+        section_cost(self.priced(), width)
+    }
+
+    /// The row and node count this token's sections are priced at, read once
+    /// per decision so that a search over widths never mixes the row before
+    /// and after a calibration: the pool's effective team row for a token with
+    /// team authority, the in-pool or outside row (at one node) for a plain
+    /// token, nothing for a serial one.
+    fn priced(&self) -> Option<(&'p WidthCosts, NonZeroUsize)> {
         match (self.team, self.pool) {
-            (Some(t), _) => t.awake.costs.team_row().at_nodes(width, nodes),
+            (Some(t), _) => Some((t.awake.team_row(), t.nodes())),
             (None, Some(pool)) => {
                 let kind = if sched::in_pool(pool) {
                     DispatchKind::InPool
                 } else {
                     DispatchKind::Outside
                 };
-                pool.awake.costs.cost(kind, width)
+                Some((pool.awake.row(kind), NonZeroUsize::MIN))
             }
-            (None, None) => Duration::MAX,
+            (None, None) => None,
         }
-    }
-
-    /// The node count [`dispatch_cost`](Self::dispatch_cost) prices this token
-    /// at: 1 for a plain token.
-    fn nodes(&self) -> NonZeroUsize {
-        self.team.map_or(NonZeroUsize::MIN, |t| t.nodes())
     }
 
     /// Whether a region of serial time `estimate` that opens `sections` parallel
@@ -334,9 +337,12 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for(Duration::from_secs(1), 1).get(), 1);
     /// ```
     pub fn width_for(&self, estimate: Duration, sections: u32) -> NonZeroUsize {
-        let nodes = self.nodes();
+        if self.budget.get() < 2 {
+            return NonZeroUsize::MIN;
+        }
+        let priced = self.priced();
         width_for_by(estimate, sections, self.budget, |k| {
-            self.dispatch_cost_on(k, nodes)
+            section_cost(priced, k.min(self.budget))
         })
     }
 
@@ -364,11 +370,14 @@ impl<'p> Exec<'p> {
     /// assert_eq!(Exec::serial().width_for_split(split).get(), 1);
     /// ```
     pub fn width_for_split(&self, split: SplitCost) -> NonZeroUsize {
-        let nodes = self.nodes();
+        if self.budget.get() < 2 {
+            return NonZeroUsize::MIN;
+        }
+        let priced = self.priced();
         width_for_split_by(
             split,
             self.budget,
-            |k| self.dispatch_cost_on(k, nodes),
+            |k| section_cost(priced, k.min(self.budget)),
             TransferRate::host_default(),
         )
     }
@@ -710,7 +719,7 @@ impl<'p> Exec<'p> {
                     // slot `ids[start - 1]`; its node is read only with a
                     // multi-node term (unknown otherwise, and never priced).
                     lead_node: match start.checked_sub(1) {
-                        Some(lead) if k > 0 && t.awake.costs.team_row().has_multi_node() => t
+                        Some(lead) if k > 0 && t.awake.multi_node() => t
                             .ids
                             .get(lead)
                             .map_or(crate::pin::NO_NODE, |&id| t.awake.node(id)),
@@ -1093,6 +1102,21 @@ impl<'p> Exec<'p> {
         over: WaitOverride,
         f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
     ) -> Result<R, Refused> {
+        self.team_scope(over, None, f)
+    }
+
+    /// [`team_with`](Exec::team_with), where the root scope of a plain token
+    /// records the home of its placement in `placement` as a
+    /// [`Team`](crate::Team)'s whole-team root scope records its own (`0` when it
+    /// placed nobody), so that a team token over the reservation dispatches as
+    /// a placed one. A token that carries a team keeps its own placement and
+    /// ignores `placement`.
+    pub(crate) fn team_scope<R>(
+        &mut self,
+        over: WaitOverride,
+        placement: Option<&AtomicUsize>,
+        f: impl for<'team> FnOnce(TeamExec<'team>) -> R,
+    ) -> Result<R, Refused> {
         if let Some(t) = self.team {
             // Carried members: the (sub)team is available without acquisition.
             let mut team = TeamExec {
@@ -1103,7 +1127,7 @@ impl<'p> Exec<'p> {
                 over: t.over,
                 // Only with a multi-node term: the home's node is a topology
                 // lookup, which a pool without one may not have loaded.
-                lead_node: if t.awake.costs.team_row().has_multi_node() {
+                lead_node: if t.awake.multi_node() {
                     t.lead()
                 } else {
                     crate::pin::NO_NODE
@@ -1201,7 +1225,7 @@ impl<'p> Exec<'p> {
         // pinning the participants acknowledge as before. The guard gives the
         // leader its mask back when the scope ends or unwinds.
         let pin = if team.size().get() > 1 {
-            pin_scope(&mut team, None, crate::pin::NO_OWNER)
+            pin_scope(&mut team, placement, crate::pin::NO_OWNER)
         } else {
             None
         };
@@ -1296,7 +1320,7 @@ fn pin_scope(
     let Some(here) = crate::pin::read_here() else {
         // Nothing is placed; the members are wherever an earlier reservation
         // left them, which is not this team's placement.
-        if awake.costs.team_row().has_multi_node() {
+        if awake.multi_node() {
             awake.record_nodes(team.ids, None);
         }
         return None;
@@ -1311,7 +1335,7 @@ fn pin_scope(
     // The nodes the members are pinned onto, for the multi-node term of the
     // team row (`WidthCosts::with_multi_node`); recorded only when one is
     // installed, so the default path does nothing more.
-    let nodes = awake.costs.team_row().has_multi_node();
+    let nodes = awake.multi_node();
     if cpus < team.size().get() {
         if nodes {
             awake.record_nodes(team.ids, None);

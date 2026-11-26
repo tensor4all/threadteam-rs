@@ -1096,6 +1096,26 @@ serial_estimate >= PAYS * sections * D(width)        (PAYS = 3)
   few percent (`faer-benchmark` `raw-exec3-boost`, `tables-*-exec3-boost.md`). Each crate carries an identical
   `HostClass` and `detect()`, kept in sync with `threadteam`'s by hand.
   `PoolBuilder::dispatch_costs` overrides it.
+* `Exec::calibrate_dispatch_costs(budget)` replaces the team row of a running
+  pool whose owner installed no costs, for a library that holds only a token
+  (threadteam-rs#92). It runs the shipped probe (`benches/dispatch_cost.rs`,
+  `team/load10us-minus-10us`): back-to-back `for_ranges(w, 1, ..)` calls on a
+  team token, the full entry a consumer pays, at widths 2, 4 and 6 up to the
+  token's budget plus the budget. A token with team authority measures on
+  itself; a plain token reserves members for the call and measures on a team
+  token over them whose scope records its placement as a `Team`'s whole-team
+  scope does. It takes the median of 9 batches per width and accepts the
+  ladder only when `0 < measured <= 10 * default` at every width. The row is
+  published once (`OnceLock` on the pool's shared state) and every
+  team-priced read (`Pool::dispatch_costs`, and `dispatch_cost`, `pays`,
+  `width_for*` of team tokens, existing ones included, and of a `TeamExec`)
+  uses it, reading it once per decision, so a search over widths never mixes
+  the two rows; a plain token's own reads keep the in-pool and outside rows.
+  All or nothing, one-shot, bounded by `budget` (refused before any section
+  when too small; the deadline is checked before every batch). `Exec::serial()`, a token of one slot and a pool built with
+  `PoolBuilder::dispatch_costs` fail without touching the table. The in-pool
+  and outside rows are not calibrated, and the calibrated row has no
+  multi-node term, as no default row does.
 * `pays_at(estimate, sections, cost)` is the one rule; `Exec::pays` and
   `TeamExec::pays` apply it to the token's cost. `Exec::width_for(estimate,
   sections)` (and `width_for_by` / `width_profile_by` for a consumer's own cost function; the

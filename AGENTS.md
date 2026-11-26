@@ -47,9 +47,9 @@ Design record: `docs/design/placement.md`. Durable invariants:
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo clippy --all-targets --no-default-features -- -D warnings
-cargo test
-cargo test --all-features
-cargo test --no-default-features
+cargo test --profile ci
+cargo test --profile ci --all-features
+cargo test --profile ci --no-default-features
 RUSTFLAGS="--cfg loom" cargo test --release --test loom_park
 cargo deny check bans
 scripts/check-no-public-rayon.sh      # needs cargo-public-api and a nightly toolchain

@@ -98,9 +98,13 @@ required-features = ["parallel"]
 # "Build Profiles And Target Hygiene"); `debug-assertions` and `overflow-checks` stay on.
 [profile.dev]
 debug = 0
+debug-assertions = true
+overflow-checks = true
 
 [profile.test]
 debug = 0
+debug-assertions = true
+overflow-checks = true
 
 # CI builds and tests with this profile (tensor4all-agent-rules, rules/common/repository.md,
 # "Build Profiles"). It inherits `test`, not `release`: the work split and the team's budget

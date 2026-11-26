@@ -14,10 +14,11 @@ This file only records what is specific to `threadteam-rs`:
   `nightly` only in the `placement` lane that runs `cargo-public-api`, so there is no MSRV claim for CI to hold and
   no `msrv` job.
 - **Feature combinations CI builds**: `cargo test --profile ci` (default, which is `parallel`), `cargo test --profile ci --all-features` and
-  `cargo test --profile ci --no-default-features`, each on Linux and macOS; `clippy --all-targets` with `--all-features` and with
+  `cargo test --profile ci --no-default-features`, each on Linux per PR and on macOS nightly (`macos-nightly.yml`); `clippy --all-targets` with `--all-features` and with
   `--no-default-features`; and a `loom` lane running `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
   The `ledger`, `test-hooks` and `trace` features are test support and are enabled only by the test lanes.
-- **Platforms claimed**: `ubuntu-latest` and `macos-latest`. The crate has Linux-only (`sched_getaffinity`) and
+- **Platforms claimed**: `ubuntu-latest` and `macos-latest`. `ubuntu-latest` runs per PR (`ci.yml`); macOS is validated
+  nightly, and on demand via `workflow_dispatch`, not per PR: `macos-nightly.yml` runs them daily and on manual dispatch (`workflow_dispatch`), not per PR, because macOS runners are costly and limited to five concurrent jobs across the organization. The crate has Linux-only (`sched_getaffinity`) and
   Apple-only (`pthread_set_qos_class_self_np`) code; no other target is built.
 - **Local gate**: `cargo test --profile ci --all-features` (`[profile.ci]` in `Cargo.toml`; it inherits `test`).
 

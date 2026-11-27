@@ -94,6 +94,11 @@ name = "resident_split"
 harness = false
 required-features = ["parallel"]
 
+[[bench]]
+name = "foreign_entry"
+harness = false
+required-features = ["parallel"]
+
 # No default profile carries debug info (tensor4all-agent-rules, rules/rust/performance.md,
 # "Build Profiles And Target Hygiene"); `debug-assertions` and `overflow-checks` stay on.
 [profile.dev]

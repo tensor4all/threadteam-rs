@@ -121,7 +121,7 @@ A member that slept is woken by the leader's publish on its slot. That wake only
 ### The spare worker (threadteam-rs#12): not in this change
 
 A pool of `w` workers gives a team of at most `w` participants: the leader counts as one, and `w - 1` workers are reserved, so one worker is a spare that only Rayon uses. Letting `into_team(width)` reach `w + 1` from an outside thread would reserve every worker. The pre-review found that this breaks `Exec::external` on a team token:
-- `external` lends the token's `budget - 1` members and installs the callback on a pool worker.
+- `external` lends the token's `budget - 1` members and runs the callback on a pool worker (inline when the caller already is one, installed from a plain thread, submitted from a worker of another pool).
 - Today the spare is the worker that hosts it. Without a spare, the callback occupies one of the lent members, so a callback that waits for `width` Rayon jobs at once deadlocks, and a full-width token advertises `w + 1` threads to a pool of `w`.
 
 Removing the spare therefore needs a new contract for `external`'s width and lending, covering full-width and narrowed tokens. broccoli also showed that the spare is not what separates the slow arms (faer#107, 13:10Z): `team_per_call` runs the same 65 threads and is fast. The spare stays, and threadteam-rs#12 carries the `external` constraint.

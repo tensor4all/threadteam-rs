@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex};
 use std::time::{Duration, Instant};
 use threadteam::{Exec, Pool, Refused, WaitOverride};
@@ -297,6 +297,50 @@ fn plain_tokens_are_unchanged_next_to_a_team() {
 
 #[test]
 fn external_on_a_team_token_lends_the_members_to_the_pool_and_takes_them_back() {
+    lend_the_members_through_external_and_take_them_back();
+}
+
+/// The same check with the team held on a worker of another Rayon pool, whose
+/// `external` call submits the work instead of installing it
+/// (https://github.com/tensor4all/threadteam-rs/issues/89).
+#[test]
+fn external_on_a_team_token_from_a_foreign_worker_lends_the_members() {
+    let outer = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    outer.install(|| {
+        assert!(rayon::current_thread_index().is_some());
+        lend_the_members_through_external_and_take_them_back();
+    });
+}
+
+/// A worker of another pool waiting in a team token's `external` runs none of
+/// its own pool's jobs: the outer pool's only worker queues a job of that pool,
+/// and the job has not run when `external` returns.
+#[test]
+fn external_on_a_team_token_from_a_foreign_worker_runs_none_of_its_pools_jobs() {
+    let _w = watchdog();
+    let outer = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .unwrap();
+    outer.install(|| {
+        let team = pool(4, Duration::from_millis(1)).into_team(4).unwrap();
+        let ran = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = ran.clone();
+        // Queued on the outer pool, whose only worker is this thread.
+        rayon::spawn(move || flag.store(true, Ordering::SeqCst));
+        team.exec(4)
+            .external(|_| std::thread::sleep(Duration::from_millis(20)));
+        assert!(
+            !ran.load(Ordering::SeqCst),
+            "the caller ran a job of its own pool while it waited"
+        );
+    });
+}
+
+fn lend_the_members_through_external_and_take_them_back() {
     let _w = watchdog();
     let team = pool(4, Duration::from_millis(1)).into_team(4).unwrap(); // 3 members; one worker is free
     std::thread::sleep(Duration::from_millis(20)); // members parked

@@ -1,4 +1,6 @@
-//! Model check of the park/wake handshake of reserved members.
+//! Model check of the park/wake handshake of reserved members, of the staged
+//! waits of a section, and of the latch a worker of another pool waits on after
+//! submitting work.
 //!
 //! Run with `RUSTFLAGS="--cfg loom" cargo test --release --test loom_park`.
 //! The model is the real `Parker` (compiled against `loom` primitives): one
@@ -201,5 +203,48 @@ fn a_cancellation_wakes_a_participant_asleep_in_a_barrier() {
         cancelled.store(true, Ordering::SeqCst);
         sync.wake();
         assert!(!waiter.join().unwrap());
+    });
+}
+
+// The submission latch (`sched::submit_wait`): the exact `Latch` code. The
+// waiter frees the shared state as soon as its wait returns, as the caller's
+// frame does.
+
+use loom::cell::UnsafeCell;
+use threadteam::Latch;
+
+struct Submission {
+    out: UnsafeCell<usize>,
+    latch: Latch,
+}
+
+/// The setter writes a result and sets the latch; the waiter, asleep or not
+/// yet parked, wakes, reads that result, and frees the state. A lost wake-up
+/// deadlocks (dropping the `unpark` from `Latch::set` fails this model).
+///
+/// The model does not check the flag's Release/Acquire pair: with both
+/// accesses to the flag made relaxed, it still passes.
+#[test]
+fn a_set_latch_wakes_its_waiter() {
+    model(|| {
+        let submission = Box::into_raw(Box::new(Submission {
+            out: UnsafeCell::new(0),
+            latch: Latch::new(),
+        }));
+        let addr = submission as usize;
+        let waiter = thread::current();
+        let setter = thread::spawn(move || {
+            let submission = addr as *const Submission;
+            unsafe {
+                (*submission).out.with_mut(|out| *out = 42);
+                Latch::set(std::ptr::addr_of!((*submission).latch), waiter);
+            }
+        });
+        unsafe {
+            (*submission).latch.wait();
+            assert_eq!((*submission).out.with(|out| *out), 42);
+            drop(Box::from_raw(submission));
+        }
+        setter.join().unwrap();
     });
 }

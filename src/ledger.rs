@@ -105,8 +105,10 @@ pub fn live(root: u64) -> usize {
     lookup(root).map_or(0, |c| c.live.load(Ordering::SeqCst))
 }
 
-/// Number of times an entry of `root` had to leave its calling thread to
-/// install work into the pool (a plain thread or a worker of another pool).
+/// Number of times an entry of `root` had to leave its calling thread to enter
+/// the pool: one count per entry, an install from a plain thread or a
+/// submission from a worker of another pool (a plain token's `broadcast`
+/// counts one as well).
 ///
 /// Entries made from a worker of the target pool never count: they run on
 /// the caller's worker without installing. Inline entries never count either.

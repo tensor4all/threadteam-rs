@@ -42,12 +42,40 @@ mod calibrate;
 ///
 /// # Placement
 ///
+/// This section is about the `fork` variants and [`for_ranges`](Exec::for_ranges)
+/// of a plain token (from [`Exec::new`]) and about [`external`](Exec::external)
+/// on any token; the other entries of a token minted by a [`Team`](crate::Team)
+/// dispatch on its reserved members instead, [`team`](Exec::team) places as its
+/// own docs say, and a plain token's [`broadcast`] is the exception named below.
+///
 /// Serial, budget one, or one task: the work runs inline on the calling thread
 /// and the scheduler is never called, so no global pool is started. The caller
-/// is a worker of the pool: the tasks run as a join tree on the caller, nothing is
-/// installed. The caller is a plain thread or a worker of a different pool: the
-/// pool is entered once and the caller waits; the tasks run on the target pool.
-/// No thread-local state is involved at any point.
+/// is a worker of the pool: the work runs on the caller (the tasks as a join
+/// tree there), nothing is installed. The caller is a plain thread: the pool is
+/// entered once and the
+/// caller sleeps until the tasks, which run on the target pool, have finished.
+/// The caller is a worker of a different pool: it submits the work, which runs
+/// on the target pool, and blocks without running its own pool's jobs until the
+/// work has finished; this submission allocates one job, besides the amortized
+/// blocks of Rayon's job queue. A plain token's [`broadcast`] is the
+/// exception: it waits inside the scheduler, which runs the caller's own pool's
+/// jobs meanwhile.
+///
+/// **Work submitted from a worker of another pool must not wait, directly or
+/// through another thread (`join`/`scope`/channel), for a job of the caller's
+/// own pool.** The caller runs none of its own pool's jobs while it waits, so
+/// such a job runs only once another worker of that pool is free, and if none
+/// becomes free, the call never returns. A job queued for the waiting worker
+/// itself (one of a `broadcast`'s) never runs while the call waits, even with
+/// other workers free. The same holds across pools: while
+/// every worker of a pool waits in such calls, that pool runs none of its
+/// jobs, so pools whose workers all enter each other at once (pool A's into B
+/// while B's into A) never return. This is the price of a bounded stack:
+/// waiting inside the scheduler instead runs the caller's own pool's jobs on
+/// its stack, and when those jobs enter a pool themselves (an outer `par_iter`
+/// whose items each make such a call), they nest until the stack overflows.
+///
+/// [`broadcast`]: Exec::broadcast
 ///
 /// # Examples
 ///

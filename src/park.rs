@@ -1,5 +1,7 @@
-//! The park/wake handshake of reserved members, isolated so that it can be
-//! model-checked with `loom` and driven by test hooks.
+//! The park/wake handshake of reserved members, and the latch a worker of
+//! another pool waits on after submitting work ([`Latch`]), isolated so that
+//! they can be model-checked with `loom`; the handshake is also driven by test
+//! hooks.
 //!
 //! Members that found no work park here; a leader that changed the state they
 //! wait on (a generation, a reservation state, the lent flag) wakes them. The
@@ -20,7 +22,7 @@
 //! the latter and the exact code is model-checked. With nobody parked a wake is
 //! one uncontended atomic read-modify-write.
 
-use crate::sync::{AtomicBool, AtomicUsize, Condvar, Mutex, Ordering};
+use crate::sync::{thread, AtomicBool, AtomicUsize, Condvar, Mutex, Ordering};
 
 /// Places where a test can pause a thread (feature `test-hooks`).
 #[doc(hidden)]
@@ -266,6 +268,92 @@ impl Completion {
                 }
             }
         }
+    }
+}
+
+/// A one-shot flag that a single thread sleeps on until another thread sets it.
+///
+/// A worker of another pool that submitted work to a pool waits here, so it
+/// runs nothing while it waits, in particular no job of its own pool. The wait
+/// is `thread::park` in a loop on the flag: an `unpark` that comes before the
+/// `park` leaves a token, so the `park` returns
+/// and the loop sees the flag; a spurious return only rechecks it. A token
+/// left on the thread before the wait makes its first `park` return early,
+/// which the loop treats as spurious; `std::thread::park`'s contract already
+/// forbids calling unknown code, such as an entry of this crate, between
+/// setting up a park and parking, so no such token is owed to a later `park`.
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+pub struct Latch {
+    done: AtomicBool,
+    /// The thread that created the latch, the only one that may wait on it.
+    owner: thread::ThreadId,
+}
+
+impl Default for Latch {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg_attr(not(feature = "parallel"), allow(dead_code))]
+impl Latch {
+    /// An unset latch, owned by the calling thread.
+    pub fn new() -> Self {
+        Self::owned_by(&thread::current())
+    }
+
+    /// An unset latch owned by `owner`, which must be the calling thread; for a
+    /// caller that already holds its own handle.
+    pub fn owned_by(owner: &thread::Thread) -> Self {
+        debug_assert_eq!(
+            owner.id(),
+            thread::current().id(),
+            "a latch is owned by the thread that creates it"
+        );
+        Latch {
+            done: AtomicBool::new(false),
+            owner: owner.id(),
+        }
+    }
+
+    /// Sleeps until the store of [`set`](Self::set) is visible; `set`'s
+    /// `unpark` may land after this returns. Must be called by the thread that
+    /// created the latch, which is the one `set` is given.
+    pub fn wait(&self) {
+        debug_assert_eq!(
+            thread::current().id(),
+            self.owner,
+            "a latch is waited on by the thread that created it"
+        );
+        while !self.done.load(Ordering::Acquire) {
+            thread::park();
+        }
+    }
+
+    /// Sets the latch and wakes `waiter`.
+    ///
+    /// Everything the setter wrote before the call is visible to the waiter
+    /// once its `wait` returns (the Release store pairs with the Acquire load).
+    ///
+    /// # Safety
+    ///
+    /// `this` is valid when called. It is not dereferenced after the store,
+    /// because the waiter may free it as soon as it observes the flag; the
+    /// wake uses `waiter`, which the caller owns. `waiter` is the thread that
+    /// created `this` and waits on it.
+    pub unsafe fn set(this: *const Latch, waiter: thread::Thread) {
+        debug_assert_eq!(
+            waiter.id(),
+            (*this).owner,
+            "a latch wakes the thread that created it"
+        );
+        // The store goes through `&AtomicBool`, a reference that lives until
+        // `store` returns, after the waiter may have freed the latch: the same
+        // pattern as `Completion::finish` here, rayon-core's `CoreLatch::set`,
+        // and the `Arc::drop` case of
+        // https://github.com/rust-lang/rust/issues/55005.
+        (*this).done.store(true, Ordering::Release);
+        waiter.unpark();
     }
 }
 
